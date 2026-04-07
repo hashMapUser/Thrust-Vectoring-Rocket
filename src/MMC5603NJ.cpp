@@ -45,11 +45,4 @@ bool MMC5603NJ_init() {
     if (!read_registers(MMC5603NJ_REG_PROD_ID, 1, &chip_id)) return false;
     if (chip_id != MMC5603NJ_CHIP_ID) return false;
 
-
-    // Set ODR to 1-75Hz 
-    // 4. Enable pressure + temperature in normal (continuous) mode
-    uint8_t pwr = BMP390_PRESS_EN | BMP390_TEMP_EN | BMP390_MODE_NORMAL;
-    if (!write_register(BMP390_REG_PWR_CTRL, pwr)) return false;
-
-    return true;
 }
