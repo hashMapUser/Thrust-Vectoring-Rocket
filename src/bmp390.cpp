@@ -50,7 +50,7 @@ static void parse_calibration(const uint8_t *raw, BMP390_Calib *cal) {
     uint16_t par_t2 = (uint16_t)((raw[3] << 8) | raw[2]);
     int8_t   par_t3 = (int8_t)raw[4];
 
-    cal->t1 = (float)par_t1 / 2.56e2f;          // / 2^8
+    cal->t1 = (float)par_t1 * 2.56e2f;          // * 2^8  (Bosch ref: NVM / 2^-8)
     cal->t2 = (float)par_t2 / 1.073741824e9f;   // / 2^30
     cal->t3 = (float)par_t3 / 2.81474977e14f;   // / 2^48
 
