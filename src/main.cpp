@@ -13,14 +13,15 @@ void setup() {
     Serial.begin(115200);
     while (!Serial) {}
 
-    Wire.begin();
-    SPI.begin();
-    delay(100);
+    // --- CS pin MUST be driven HIGH before SPI.begin() ---
+    // If CS floats during bus init the LSM6DSOX receives garbage
+    // and will return 0x00 on WHO_AM_I regardless of mode or clock.
+    pinMode(LSM6DSOX_CS_PIN, OUTPUT);
+    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
 
-    Serial.println("\n========================================");
-    Serial.println("  FLIGHT COMPUTER SENSOR TEST SUITE");
-    Serial.println("  Teensy 4.0 / BMP390 + LSM6DSOX");
-    Serial.println("========================================\n");
+    SPI.begin();
+    Wire.begin();
+    delay(100);
 
     run_imu_tests();
     run_baro_tests(&bmp_cal);
@@ -28,6 +29,4 @@ void setup() {
     Serial.println("All tests complete. Reboot to run again.");
 }
 
-void loop() {
-    // Tests run once in setup() — nothing to do here
-}
+void loop() {}
