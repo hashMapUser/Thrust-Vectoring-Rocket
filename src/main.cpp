@@ -1,20 +1,33 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "bmp390.cpp" // Include your custom driver!
+#include <SPI.h>
+
+#include "bmp390.h"
+#include "lsm6dsox.h"
+#include "test_imu.h"
+#include "test_baro.h"
+
+static BMP390_Calib bmp_cal;
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin(); 
-  delay(100); 
+    Serial.begin(115200);
+    while (!Serial) {}
 
-  // You can now use the functions exactly as if they were written in this file
-  uint8_t chip_id_buffer[1];
-  read_registers(0x00, 1, chip_id_buffer); 
+    Wire.begin();
+    SPI.begin();
+    delay(100);
 
-  Serial.print("BMP390 Chip ID: 0x");
-  Serial.println(chip_id_buffer[0], HEX);
+    Serial.println("\n========================================");
+    Serial.println("  FLIGHT COMPUTER SENSOR TEST SUITE");
+    Serial.println("  Teensy 4.0 / BMP390 + LSM6DSOX");
+    Serial.println("========================================\n");
+
+    run_imu_tests();
+    run_baro_tests(&bmp_cal);
+
+    Serial.println("All tests complete. Reboot to run again.");
 }
 
 void loop() {
-  // Main flight loop
+    // Tests run once in setup() — nothing to do here
 }
