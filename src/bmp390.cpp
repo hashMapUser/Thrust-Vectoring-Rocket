@@ -94,7 +94,7 @@ static float compensate_temperature(uint32_t raw, BMP390_Calib *cal) {
     float pd1   = (float)raw - cal->t1;
     float pd2   = pd1 * cal->t2;
     cal->t_lin  = pd2 + (pd1 * pd1) * cal->t3;
-    return cal-> t_lin;
+    return cal->t_lin;
 }
 
 /**
@@ -131,6 +131,11 @@ static float compensate_pressure(uint32_t raw, const BMP390_Calib *cal) {
 // --------------------------------------------------------
 
 bool bmp390_init(BMP390_Calib *cal) {
+    // Set pins explicitly so the wiring is defined in one place (bmp390.h)
+    // rather than relying on Wire defaults
+    Wire.setSDA(BMP390_PIN_SDA);
+    Wire.setSCL(BMP390_PIN_SCL);
+    Wire.begin();
     Wire.setClock(BMP390_I2C_CLOCK);
 
     // 1. Verify chip ID

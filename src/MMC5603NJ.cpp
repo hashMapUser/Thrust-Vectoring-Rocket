@@ -45,4 +45,7 @@ bool MMC5603NJ_init() {
     if (!read_registers(MMC5603NJ_REG_PROD_ID, 1, &chip_id)) return false;
     if (chip_id != MMC5603NJ_CHIP_ID) return false;
 
+    
+
 }
+
