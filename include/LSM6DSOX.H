@@ -8,11 +8,16 @@
 // SPI CONFIG
 // --------------------------------------------------------
 
-// Chip-select pin — change to match your wiring
-#define LSM6DSOX_CS_PIN       10
+// --------------------------------------------------------
+// PIN ASSIGNMENTS (Teensy 4.0 default SPI bus)
+// --------------------------------------------------------
+#define LSM6DSOX_CS_PIN       10   // Chip select — your wiring
+#define LSM6DSOX_PIN_MOSI     11   // MOSI        — Teensy 4.0 hardware SPI default
+#define LSM6DSOX_PIN_MISO     12   // MISO        — Teensy 4.0 hardware SPI default
+#define LSM6DSOX_PIN_SCK      13   // Clock       — Teensy 4.0 hardware SPI default
 
-// LSM6DSOX max SPI clock: 10 MHz
-// Mode 3 (CPOL=1, CPHA=1) — sensor supports modes 0 and 3; 3 is preferred
+// SPI Mode 3 (CPOL=1, CPHA=1) — confirmed working on Teensy 4.0
+// 10 MHz is the sensor max and works reliably on the Teensy at this speed
 #define LSM6DSOX_SPI_CLOCK    10000000UL
 #define LSM6DSOX_SPI_SETTINGS SPISettings(LSM6DSOX_SPI_CLOCK, MSBFIRST, SPI_MODE3)
 
@@ -39,20 +44,27 @@
 // --------------------------------------------------------
 #define LSM6DSOX_CHIP_ID          0x6C
 
-// CTRL1_XL: ODR_XL=0100 (104 Hz), FS_XL=10 (±4 g), LPF2=0
-#define LSM6DSOX_XL_104HZ_4G     0x48
+// CTRL3_C: BDU (0x40) + IF_INC (0x04) = 0x44
+//   BDU  — block data update: output registers not updated until both
+//           high and low bytes have been read; prevents stale half-reads
+//   IF_INC — auto-increment register address during burst reads
+#define LSM6DSOX_CTRL3_INIT   0x44
 
-// CTRL2_G:  ODR_G=0100 (104 Hz), FS_G=11 (±2000 dps)
-#define LSM6DSOX_G_104HZ_2000DPS  0x4C
+// Software reset bit in CTRL3_C — write this first, wait 50 ms, then configure
+#define LSM6DSOX_SW_RESET     0x01
 
-// CTRL3_C:  IF_INC=1 — enable register auto-increment during burst reads
-#define LSM6DSOX_IF_INC           0x04
+// CTRL1_XL: ODR_XL=0111 (833 Hz), FS_XL=01 (±16 g), LPF2=0
+// ±16 g chosen for flight — rockets exceed ±4 g during thrust
+#define LSM6DSOX_XL_833HZ_16G    0x74
+
+// CTRL2_G: ODR_G=0111 (833 Hz), FS_G=11 (±2000 dps)
+#define LSM6DSOX_G_833HZ_2000DPS 0x7C
 
 // --------------------------------------------------------
 // SENSITIVITY
 // --------------------------------------------------------
 #define LSM6DSOX_GYRO_SCALE   0.070f     // dps per LSB  (±2000 dps)
-#define LSM6DSOX_ACCEL_SCALE  0.000122f  // g   per LSB  (±4 g)
+#define LSM6DSOX_ACCEL_SCALE  0.000488f  // g   per LSB  (±16 g)
 
 // --------------------------------------------------------
 // DATA STRUCT
@@ -75,10 +87,15 @@ typedef struct {
 // --------------------------------------------------------
 
 /**
- * Configure the CS pin, verify chip ID, and set up accel + gyro.
- * SPI.begin() must be called before this.
+ * IMPORTANT — call this before SPI.begin():
+ *   pinMode(LSM6DSOX_CS_PIN, OUTPUT);
+ *   digitalWrite(LSM6DSOX_CS_PIN, HIGH);
  *
- * @return true on success; false if sensor absent or WHO_AM_I mismatch.
+ * If CS floats during SPI.begin() the sensor receives garbage and won't respond.
+ *
+ * Issues a software reset, verifies WHO_AM_I, then configures accel + gyro.
+ *
+ * @return true on success; false if WHO_AM_I mismatches.
  */
 bool lsm6dsox_init();
 
