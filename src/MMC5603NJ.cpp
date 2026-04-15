@@ -1,16 +1,12 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
-#include "MMC5603NJ.h"
-
+#include "mmc5603nj.h"
 
 // --------------------------------------------------------
-// PRIVATE HELPERS — I2C
+// PRIVATE — I2C HELPERS
 // --------------------------------------------------------
 
-/**
- * Write a single byte to a register.
- * Returns true on success.
- */
 static bool write_register(uint8_t reg, uint8_t value) {
     Wire.beginTransmission(MMC5603NJ_ADDRESS);
     Wire.write(reg);
@@ -18,9 +14,18 @@ static bool write_register(uint8_t reg, uint8_t value) {
     return Wire.endTransmission() == 0;
 }
 
+static bool read_register(uint8_t reg, uint8_t *value) {
+    Wire.beginTransmission(MMC5603NJ_ADDRESS);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)MMC5603NJ_ADDRESS, (uint8_t)1) != 1) return false;
+    *value = Wire.read();
+    return true;
+}
+
 /**
  * Burst-read `length` bytes starting at `reg` into `buf`.
- * Returns true on success.
+ * MMC5603NJ auto-increments the register address on I2C — no extra config needed.
  */
 static bool read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
     Wire.beginTransmission(MMC5603NJ_ADDRESS);
@@ -33,19 +38,105 @@ static bool read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
     for (uint8_t i = 0; i < length; i++) {
         buf[i] = Wire.read();
     }
+    return true;
+}
+
+// --------------------------------------------------------
+// PRIVATE — 18-BIT ASSEMBLY
+// --------------------------------------------------------
+
+/**
+ * Assemble one 18-bit axis reading from three raw bytes.
+ *
+ * Register layout (from datasheet):
+ *   OUT0 = bits [19:12]  (8 bits, MSB portion)
+ *   OUT1 = bits [11:4]   (8 bits, middle portion)
+ *   OUT2 = bits [3:0]    (4 bits, packed into [7:4] of the shared byte)
+ *
+ * Assembly:
+ *   raw = (OUT0 << 12) | (OUT1 << 4) | (OUT2 >> 4)
+ *
+ * The output is offset binary — zero field = 2^17 = 131072.
+ * Subtract MMC5603NJ_ZERO_OFFSET before scaling to get a signed value.
+ */
+static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
+    uint32_t raw = ((uint32_t)out0 << 12)
+                 | ((uint32_t)out1 <<  4)
+                 | ((uint32_t)out2 >>  4);
+
+    int32_t signed_raw = (int32_t)raw - MMC5603NJ_ZERO_OFFSET;
+    return (float)signed_raw * MMC5603NJ_SCALE;
+}
+
+// --------------------------------------------------------
+// PUBLIC API
+// --------------------------------------------------------
+
+bool mmc5603nj_init() {
+    // Wire bus already initialized by bmp390_init() on the same I2C bus.
+    // Both sensors share pins 18/19 — no need to call Wire.begin() again.
+
+    // 1. Verify chip ID
+    uint8_t chip_id = 0;
+    if (!read_register(MMC5603NJ_REG_PROD_ID, &chip_id)) return false;
+    if (chip_id != MMC5603NJ_CHIP_ID) return false;
+
+    // 2. Fire SET coil — removes residual magnetization that builds up
+    //    over time or after exposure to strong fields. The datasheet
+    //    recommends running SET once at startup before the first measurement.
+    //    SET drives a large current pulse through the sensor coil to
+    //    align internal magnetic domains to a known polarity.
+    if (!write_register(MMC5603NJ_REG_CTRL0, MMC5603NJ_SET_COIL)) return false;
+    delay(1);   // SET pulse completes in < 1 ms
 
     return true;
 }
 
-bool MMC5603NJ_init() {
-    Wire.setClock(MMC5603NJ_I2C_CLOCK);
+void mmc5603nj_read(MMC5603NJ_Data *out) {
+    // 1. Trigger a single measurement
+    if (!write_register(MMC5603NJ_REG_CTRL0, MMC5603NJ_TM_M)) {
+        out->valid = false;
+        out->mag_x = out->mag_y = out->mag_z = NAN;
+        return;
+    }
 
-    // 1. Verify chip ID
-    uint8_t chip_id = 0;
-    if (!read_registers(MMC5603NJ_REG_PROD_ID, 1, &chip_id)) return false;
-    if (chip_id != MMC5603NJ_CHIP_ID) return false;
+    // 2. Poll STATUS1 until Meas_M_Done (bit 6) is set.
+    //    Typical measurement time is ~8 ms at default bandwidth.
+    //    Bail out after MMC5603NJ_MEAS_TIMEOUT_MS to avoid blocking forever.
+    uint32_t start = millis();
+    uint8_t  status = 0;
 
-    
+    while (true) {
+        if (!read_register(MMC5603NJ_REG_STATUS1, &status)) {
+            out->valid = false;
+            out->mag_x = out->mag_y = out->mag_z = NAN;
+            return;
+        }
+        if (status & MMC5603NJ_MEAS_M_DONE) break;
 
+        if ((millis() - start) > MMC5603NJ_MEAS_TIMEOUT_MS) {
+            out->valid = false;
+            out->mag_x = out->mag_y = out->mag_z = NAN;
+            return;
+        }
+        delay(1);
+    }
+
+    // 3. Burst-read all 9 output bytes starting at XOUT0 (0x00)
+    //    Layout:
+    //      data[0] = XOUT0   data[1] = XOUT1   data[2] = YOUT0
+    //      data[3] = YOUT1   data[4] = ZOUT0   data[5] = ZOUT1
+    //      data[6] = XOUT2   data[7] = YOUT2   data[8] = ZOUT2
+    uint8_t data[9];
+    if (!read_registers(MMC5603NJ_REG_XOUT0, 9, data)) {
+        out->valid = false;
+        out->mag_x = out->mag_y = out->mag_z = NAN;
+        return;
+    }
+
+    // 4. Assemble 18-bit values and scale to Gauss
+    out->mag_x = assemble_axis(data[0], data[1], data[6]);
+    out->mag_y = assemble_axis(data[2], data[3], data[7]);
+    out->mag_z = assemble_axis(data[4], data[5], data[8]);
+    out->valid = true;
 }
-
