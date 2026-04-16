@@ -19,9 +19,9 @@ void setup() {
     pinMode(LSM6DSOX_CS_PIN, OUTPUT);
     digitalWrite(LSM6DSOX_CS_PIN, HIGH);
 
-    SPI.begin();   // LSM6DSOX
-    // bmp390_init() and mmc5603nj_init() call Wire.begin() internally
-    // Both sensors share the same I2C bus (pins 18/19) — no conflict
+    SPI.begin();
+    // Wire  (pins 18/19) — BMP390      — initialized inside bmp390_init()
+    // Wire1 (pins 16/17) — MMC5603NJ   — initialized inside mmc5603nj_init()
 
     delay(100);
 

@@ -8,18 +8,18 @@
 // --------------------------------------------------------
 
 static bool write_register(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(MMC5603NJ_ADDRESS);
-    Wire.write(reg);
-    Wire.write(value);
-    return Wire.endTransmission() == 0;
+    Wire1.beginTransmission(MMC5603NJ_ADDRESS);
+    Wire1.write(reg);
+    Wire1.write(value);
+    return Wire1.endTransmission() == 0;
 }
 
 static bool read_register(uint8_t reg, uint8_t *value) {
-    Wire.beginTransmission(MMC5603NJ_ADDRESS);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((uint8_t)MMC5603NJ_ADDRESS, (uint8_t)1) != 1) return false;
-    *value = Wire.read();
+    Wire1.beginTransmission(MMC5603NJ_ADDRESS);
+    Wire1.write(reg);
+    if (Wire1.endTransmission(false) != 0) return false;
+    if (Wire1.requestFrom((uint8_t)MMC5603NJ_ADDRESS, (uint8_t)1) != 1) return false;
+    *value = Wire1.read();
     return true;
 }
 
@@ -28,15 +28,15 @@ static bool read_register(uint8_t reg, uint8_t *value) {
  * MMC5603NJ auto-increments the register address on I2C — no extra config needed.
  */
 static bool read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
-    Wire.beginTransmission(MMC5603NJ_ADDRESS);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
+    Wire1.beginTransmission(MMC5603NJ_ADDRESS);
+    Wire1.write(reg);
+    if (Wire1.endTransmission(false) != 0) return false;
 
-    uint8_t received = Wire.requestFrom((uint8_t)MMC5603NJ_ADDRESS, length);
+    uint8_t received = Wire1.requestFrom((uint8_t)MMC5603NJ_ADDRESS, length);
     if (received != length) return false;
 
     for (uint8_t i = 0; i < length; i++) {
-        buf[i] = Wire.read();
+        buf[i] = Wire1.read();
     }
     return true;
 }
@@ -73,12 +73,20 @@ static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
 // --------------------------------------------------------
 
 bool mmc5603nj_init() {
-    // Wire bus already initialized by bmp390_init() on the same I2C bus.
-    // Both sensors share pins 18/19 — no need to call Wire.begin() again.
+    // Explicitly set pins and clock in case this runs before bmp390_init().
+    // Calling Wire1.begin() more than once is safe on Teensy.
+    Wire1.setSDA(MMC5603NJ_PIN_SDA);
+    Wire1.setSCL(MMC5603NJ_PIN_SCL);
+    Wire1.begin();
+    Wire1.setClock(MMC5603NJ_I2C_CLOCK);
 
-    // 1. Verify chip ID
+    // 1. Verify chip ID — print raw value so a mismatch is diagnosable
     uint8_t chip_id = 0;
-    if (!read_register(MMC5603NJ_REG_PROD_ID, &chip_id)) return false;
+    if (!read_register(MMC5603NJ_REG_PROD_ID, &chip_id)) {
+        Serial.println("    MMC5603NJ: I2C read failed — check wiring");
+        return false;
+    }
+    Serial.print("    MMC5603NJ PROD_ID: 0x"); Serial.println(chip_id, HEX);
     if (chip_id != MMC5603NJ_CHIP_ID) return false;
 
     // 2. Fire SET coil — removes residual magnetization that builds up

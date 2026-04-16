@@ -166,6 +166,11 @@ static bool test_mag_response() {
     Serial.print(" mz="); Serial.println(stimulated.mag_z, 4);
     Serial.print("    Delta magnitude: "); Serial.println(delta, 4);
 
+    // Guard against NaN propagating from failed reads
+    if (isnan(delta) || !baseline.valid || !stimulated.valid) {
+        mag_print_fail("Axis response", "one or both reads invalid — fix init first");
+        return false;
+    }
     if (delta < MAG_RESPONSE_MIN) {
         mag_print_fail("Axis response", "no response to stimulus — sensor may be returning stale data");
         return false;
