@@ -23,7 +23,7 @@
 
 // SPI R/W flags (applied to bit 7 of the register address byte)
 #define LSM6DSOX_SPI_READ     0x80   // bit 7 high  = read
-#define LSM6DSOX_SPI_WRITE    0x00   // bit 7 low   = write
+#define LSM6DSOX_SPI_WRITE    0x00   // bit 7 low   = writeFspi
 
 // --------------------------------------------------------
 // REGISTER MAP
@@ -45,9 +45,9 @@
 #define LSM6DSOX_CHIP_ID          0x6C
 
 // CTRL3_C: BDU (0x40) + IF_INC (0x04) = 0x44
-//   BDU  — block data update: output registers not updated until both
-//           high and low bytes have been read; prevents stale half-reads
+//   BDU    — block data update: prevents stale half-reads
 //   IF_INC — auto-increment register address during burst reads
+//   SIM left 0 → standard 4-wire SPI (MOSI + MISO + SCK + CS)
 #define LSM6DSOX_CTRL3_INIT   0x44
 
 // Software reset bit in CTRL3_C — write this first, wait 50 ms, then configure
@@ -67,12 +67,43 @@
 #define LSM6DSOX_ACCEL_SCALE  0.000488f  // g   per LSB  (±16 g)
 
 // --------------------------------------------------------
-// DATA STRUCT
+// CALIBRATION CONFIG
+// --------------------------------------------------------
+
+// Number of samples averaged during gyro bias calibration.
+// At 833 Hz, 2000 samples = ~2.4 seconds of data.
+#define GYRO_CALIB_SAMPLES      2000
+
+// Any single sample exceeding this rate [deg/s] during calibration
+// is treated as motion — calibration aborts and returns false.
+// Typical bench vibration is < 1 deg/s; this catches accidental knocks.
+#define GYRO_MOTION_THRESHOLD   3.0f
+
+// EEPROM address where the bias struct is stored.
+// Teensy 4.0 has 1080 bytes of emulated EEPROM.
+// Leave address 0 free in case other code uses it; start at 10.
+#define GYRO_BIAS_EEPROM_ADDR   10
+
+// Magic number written alongside the bias — if EEPROM contains a different
+// value the data is stale or uninitialized and should not be used.
+#define GYRO_BIAS_MAGIC         0xB1A5u
+
+// --------------------------------------------------------
+// DATA STRUCTS
 // --------------------------------------------------------
 
 /**
+ * Gyro zero-rate offset — one-time calibration result.
+ * Subtract from every raw gyro reading to remove static bias.
+ * Units: deg/s
+ */
+typedef struct {
+    float x, y, z;
+} GyroBias;
+
+/**
  * One complete IMU sample.
- *   gx/gy/gz — angular rate  [deg/s]   (NOT roll/pitch/yaw angles)
+ *   gx/gy/gz — angular rate  [deg/s]   bias-corrected if calibrated
  *   ax/ay/az — linear accel  [g]
  *   valid    — false if any SPI error occurred
  */
@@ -91,8 +122,6 @@ typedef struct {
  *   pinMode(LSM6DSOX_CS_PIN, OUTPUT);
  *   digitalWrite(LSM6DSOX_CS_PIN, HIGH);
  *
- * If CS floats during SPI.begin() the sensor receives garbage and won't respond.
- *
  * Issues a software reset, verifies WHO_AM_I, then configures accel + gyro.
  *
  * @return true on success; false if WHO_AM_I mismatches.
@@ -100,9 +129,41 @@ typedef struct {
 bool lsm6dsox_init();
 
 /**
- * Burst-read 12 output bytes (gyro then accel) in a single SPI transaction.
- * Scales results to deg/s and g.
+ * Collect GYRO_CALIB_SAMPLES readings with the board perfectly still
+ * and compute the mean offset on each axis.
  *
- * @param out  Populated on return.  Always check out->valid.
+ * Aborts and returns false if motion is detected during sampling
+ * (any sample exceeds GYRO_MOTION_THRESHOLD deg/s).
+ * Prints progress to Serial so you can watch it run.
+ *
+ * @param bias   Output — populated with x/y/z offsets [deg/s].
+ * @return true on success; false if motion detected or read failure.
  */
-void lsm6dsox_read(LSM6DSOX_Data *out);
+bool lsm6dsox_calibrate_gyro(GyroBias *bias);
+
+/**
+ * Save gyro bias to EEPROM so it survives reboot.
+ * Writes a magic number alongside the data for validity checking.
+ *
+ * @param bias  Bias values to persist.
+ */
+void lsm6dsox_save_bias(const GyroBias *bias);
+
+/**
+ * Load gyro bias from EEPROM.
+ * Returns false if EEPROM has never been written or data is corrupt —
+ * in that case *bias is zeroed and you must run lsm6dsox_calibrate_gyro().
+ *
+ * @param bias  Output — populated from EEPROM on success.
+ * @return true if valid data found; false if EEPROM is blank/corrupt.
+ */
+bool lsm6dsox_load_bias(GyroBias *bias);
+
+/**
+ * Burst-read 12 output bytes (gyro then accel) in a single SPI transaction,
+ * then subtract the gyro bias if provided.
+ *
+ * @param out   Populated on return. Always check out->valid.
+ * @param bias  Pointer to calibrated bias, or nullptr to skip correction.
+ */
+void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias = nullptr);

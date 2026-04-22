@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <EEPROM.h>
 #include "lsm6dsox.h"
 
 // --------------------------------------------------------
@@ -83,8 +84,7 @@ bool lsm6dsox_init() {
     return true;
 }
 
-void lsm6dsox_read(LSM6DSOX_Data *out) {
-    // Burst-read 12 bytes: gyro X/Y/Z then accel X/Y/Z, low byte first per axis
+void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias) {
     uint8_t data[12];
     read_registers(LSM6DSOX_REG_OUTX_L_G, 12, data);
 
@@ -96,5 +96,65 @@ void lsm6dsox_read(LSM6DSOX_Data *out) {
     out->ay = to_int16(data[8],  data[9])  * LSM6DSOX_ACCEL_SCALE;
     out->az = to_int16(data[10], data[11]) * LSM6DSOX_ACCEL_SCALE;
 
+    if (bias) {
+        out->gx -= bias->x;
+        out->gy -= bias->y;
+        out->gz -= bias->z;
+    }
+
     out->valid = true;
+}
+
+bool lsm6dsox_calibrate_gyro(GyroBias *bias) {
+    Serial.println("  Calibrating gyro — keep still...");
+    float sx = 0, sy = 0, sz = 0;
+
+    for (int i = 0; i < GYRO_CALIB_SAMPLES; i++) {
+        LSM6DSOX_Data d;
+        lsm6dsox_read(&d, nullptr);
+        if (!d.valid) return false;
+
+        if (fabsf(d.gx) > GYRO_MOTION_THRESHOLD ||
+            fabsf(d.gy) > GYRO_MOTION_THRESHOLD ||
+            fabsf(d.gz) > GYRO_MOTION_THRESHOLD) {
+            Serial.println("  Motion detected — calibration aborted");
+            return false;
+        }
+
+        sx += d.gx;
+        sy += d.gy;
+        sz += d.gz;
+
+        if (i % 200 == 0) {
+            Serial.print("  ... sample "); Serial.print(i);
+            Serial.print("/"); Serial.println(GYRO_CALIB_SAMPLES);
+        }
+        delay(2);
+    }
+
+    bias->x = sx / GYRO_CALIB_SAMPLES;
+    bias->y = sy / GYRO_CALIB_SAMPLES;
+    bias->z = sz / GYRO_CALIB_SAMPLES;
+
+    Serial.print("  Bias: x="); Serial.print(bias->x, 4);
+    Serial.print(" y="); Serial.print(bias->y, 4);
+    Serial.print(" z="); Serial.println(bias->z, 4);
+
+    return true;
+}
+
+void lsm6dsox_save_bias(const GyroBias *bias) {
+    EEPROM.put(GYRO_BIAS_EEPROM_ADDR, (uint16_t)GYRO_BIAS_MAGIC);
+    EEPROM.put(GYRO_BIAS_EEPROM_ADDR + sizeof(uint16_t), *bias);
+}
+
+bool lsm6dsox_load_bias(GyroBias *bias) {
+    uint16_t magic;
+    EEPROM.get(GYRO_BIAS_EEPROM_ADDR, magic);
+    if (magic != GYRO_BIAS_MAGIC) {
+        bias->x = bias->y = bias->z = 0.0f;
+        return false;
+    }
+    EEPROM.get(GYRO_BIAS_EEPROM_ADDR + sizeof(uint16_t), *bias);
+    return true;
 }
