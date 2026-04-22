@@ -47,16 +47,7 @@ static bool read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
 
 /**
  * Assemble one 18-bit axis reading from three raw bytes.
- *
- * Register layout (from datasheet):
- *   OUT0 = bits [19:12]  (8 bits, MSB portion)
- *   OUT1 = bits [11:4]   (8 bits, middle portion)
- *   OUT2 = bits [3:0]    (4 bits, packed into [7:4] of the shared byte)
- *
- * Assembly:
- *   raw = (OUT0 << 12) | (OUT1 << 4) | (OUT2 >> 4)
- *
- * The output is offset binary — zero field = 2^17 = 131072.
+ * Output is offset binary — zero field = 2^17 = 131072.
  * Subtract MMC5603NJ_ZERO_OFFSET before scaling to get a signed value.
  */
 static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
@@ -78,7 +69,7 @@ bool mmc5603nj_init() {
     Wire1.setSDA(MMC5603NJ_PIN_SDA);
     Wire1.setSCL(MMC5603NJ_PIN_SCL);
     Wire1.begin();
-    Wire1.setClock(MMC5603NJ_I2C_CLOCK);
+    Wire1.setClock(MMC5603NJ_I2C_CLOCK);    
 
     // 1. Verify chip ID — print raw value so a mismatch is diagnosable
     uint8_t chip_id = 0;
@@ -89,11 +80,8 @@ bool mmc5603nj_init() {
     Serial.print("    MMC5603NJ PROD_ID: 0x"); Serial.println(chip_id, HEX);
     if (chip_id != MMC5603NJ_CHIP_ID) return false;
 
-    // 2. Fire SET coil — removes residual magnetization that builds up
-    //    over time or after exposure to strong fields. The datasheet
+    // 2. Fire SET coil — removes residual magnetization datasheet
     //    recommends running SET once at startup before the first measurement.
-    //    SET drives a large current pulse through the sensor coil to
-    //    align internal magnetic domains to a known polarity.
     if (!write_register(MMC5603NJ_REG_CTRL0, MMC5603NJ_SET_COIL)) return false;
     delay(1);   // SET pulse completes in < 1 ms
 
