@@ -1,0 +1,346 @@
+"""
+TVC Simulator - PID Tuning Tool
+================================
+Forked from fszewczyk's "TVC Simulator" project
+https://github.com/fszewczyk/tvc-simulator
+
+2D pitch-axis simulator for tuning the PID controller on a thrust-vector-controlled
+model rocket. Models servo rate/angle limits, actuator delay, TVC noise/bias,
+gyro noise/bias, Estes F-15 thrust curve, atmospheric drag, gravity, and altitude.
+
+Usage:
+    python TVCSim.py
+
+Tweak the parameters in the "CONFIG" block below, then run. A matplotlib window
+opens with six plots. Iterate on kp/ki/kd until the rocket angle settles quickly
+with acceptable overshoot and the commanded TVC angle isn't saturating.
+"""
+
+import math
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================================
+# CONFIG - tune these
+# ============================================================================
+
+# --- PID gains (what you're tuning) ---
+kp = 0.34
+ki = 0.21
+kd = 0.05
+alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter)
+
+# --- Rocket physical parameters ---
+mass = 0.900                        # kg
+MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia)
+distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM)
+distanceCPToCOM = 0.230             # m       (CP aft of CoM -> stabilizing/destabilizing)
+rocketCrossSectionalArea = 0.006207 # m^2     (pi * (3 in / 2)^2 ~ 3" airframe)
+dragCoefficient = 0.45              # C_d
+
+# --- TVC / servo parameters ---
+PIDDT = 0.005                       # s       (controller update period)
+servoDelay = 0.005                  # s       (command -> motion delay)
+maxTVCSpeed = 250                   # deg/s   (slew rate limit)
+absMaxTVCAngle = 6                  # deg     (mechanical limit)
+TVCBias = 0.02                       # deg     (constant TVC misalignment)
+TVCNoiseAmplitude = 1.5             # deg     (peak TVC jitter)
+
+# --- Sensor parameters (gyro/IMU) ---
+angleSensorBias = 0.0               # deg
+angleSensorNoiseAmplitude = 0.5     # deg
+
+# --- Simulation parameters ---
+dt = 0.005                          # s       (physics step)
+simLength = 7.0                     # s
+initAngle = 5.0                     # deg     (initial pitch disturbance)
+initSetpoint = 0.0                  # deg
+finalSetpoint = 0.0                 # deg
+timeToFinalSetpoint = 0.0           # s       (ramp end time; 0 = step)
+
+# --- Environment ---
+useThrustCurve = True               # True = Estes F-15, False = constant `thrustValue`
+thrustValue = 15.0                  # N (used only if useThrustCurve = False)
+windFx = 0.0                        # N (steady crosswind force)
+windGustFx = 0.0                    # N (peak gust magnitude, randomized)
+airDensity = 1.225                  # kg/m^3
+gravity = 9.81                      # m/s^2
+
+# --- Reproducibility ---
+randomSeed = 42                     # set to None for different noise each run
+
+# ============================================================================
+# Estes F-15 thrust curve (from thrustcurve.org)
+# ============================================================================
+F15_CURVE = np.array([
+    [0.000,  0.000],
+    [0.148,  7.638],
+    [0.228, 12.253],
+    [0.294, 16.391],
+    [0.353, 20.210],
+    [0.382, 22.756],
+    [0.419, 25.260],
+    [0.477, 23.074],
+    [0.520, 20.845],
+    [0.593, 19.093],
+    [0.688, 17.500],
+    [0.855, 16.225],
+    [1.037, 15.427],
+    [1.205, 15.268],
+    [1.423, 15.140],
+    [1.452, 14.500],
+    [1.503,  6.663],
+    [1.736,  0.000],
+])
+
+def getThrust(t):
+    """Thrust (N) at time t (s)."""
+    if not useThrustCurve:
+        return thrustValue if t < simLength else 0.0
+    if t <= 0.0 or t >= F15_CURVE[-1, 0]:
+        return 0.0
+    return float(np.interp(t, F15_CURVE[:, 0], F15_CURVE[:, 1]))
+
+
+# ============================================================================
+# Simulation
+# ============================================================================
+
+def run():
+    if randomSeed is not None:
+        random.seed(randomSeed)
+        np.random.seed(randomSeed)
+
+    steps = int(simLength / dt)
+    delaySteps = max(int(servoDelay / dt), 1)
+
+    # State histories
+    t        = np.zeros(steps)
+    theta    = np.zeros(steps)   # true rocket pitch (deg)
+    omega    = np.zeros(steps)   # angular velocity (deg/s)
+    alpha_a  = np.zeros(steps)   # angular accel (deg/s^2)
+
+    thetaMeas    = np.zeros(steps)   # what the gyro reports
+    tvcCmd       = np.zeros(steps)   # PID output (before limiting)
+    tvcCmdLim    = np.zeros(steps)   # after clamp + slew-rate limit
+    tvcActual    = np.zeros(steps)   # what the nozzle actually points at (after delay + noise + bias)
+    setpoint_hist = np.zeros(steps)
+
+    altitude = np.zeros(steps)
+    vz       = np.zeros(steps)
+    vx       = np.zeros(steps)
+    x_pos    = np.zeros(steps)
+    thrust_hist = np.zeros(steps)
+    fx_hist     = np.zeros(steps)  # lateral force on rocket
+
+    # Initial conditions
+    theta[0] = initAngle
+
+    # PID state
+    integral = 0.0
+    prev_err = initSetpoint - (initAngle + angleSensorBias)
+    d_filt = 0.0
+    last_pid_t = 0.0
+    pid_output = 0.0
+
+    for i in range(steps - 1):
+        t[i] = i * dt
+        now = t[i]
+
+        # --- Setpoint (ramp from init to final) ---
+        if timeToFinalSetpoint <= 0.0 or now >= timeToFinalSetpoint:
+            sp = finalSetpoint
+        else:
+            sp = initSetpoint + (finalSetpoint - initSetpoint) * (now / timeToFinalSetpoint)
+        setpoint_hist[i] = sp
+
+        # --- Sensor: measured angle with bias + noise ---
+        thetaMeas[i] = (theta[i]
+                        + angleSensorBias
+                        + random.uniform(-angleSensorNoiseAmplitude,
+                                          angleSensorNoiseAmplitude))
+
+        # --- PID (runs at PIDDT, not every physics step) ---
+        if now - last_pid_t >= PIDDT - 1e-9:
+            pid_dt = now - last_pid_t if last_pid_t > 0 else PIDDT
+            err = sp - thetaMeas[i]
+            integral += err * pid_dt
+            d_raw = (err - prev_err) / pid_dt
+            d_filt = alpha * d_raw + (1.0 - alpha) * d_filt
+            pid_output = kp * err + ki * integral + kd * d_filt
+            prev_err = err
+            last_pid_t = now
+        tvcCmd[i] = pid_output
+
+        # --- Clamp to mechanical limit ---
+        cmd_clamped = max(-absMaxTVCAngle, min(absMaxTVCAngle, pid_output))
+
+        # --- Slew-rate limit (servo can't snap instantly) ---
+        max_step = maxTVCSpeed * dt
+        prev_lim = tvcCmdLim[i - 1] if i > 0 else 0.0
+        delta = cmd_clamped - prev_lim
+        if delta >  max_step: delta =  max_step
+        if delta < -max_step: delta = -max_step
+        tvcCmdLim[i] = prev_lim + delta
+
+        # --- Delay: actual nozzle angle reflects a command from `delaySteps` ago ---
+        cmd_delayed = tvcCmdLim[i - delaySteps] if i >= delaySteps else 0.0
+        tvcActual[i] = (cmd_delayed
+                        + TVCBias
+                        + random.uniform(-TVCNoiseAmplitude, TVCNoiseAmplitude))
+
+        # --- Dynamics ---
+        T = getThrust(now)
+        thrust_hist[i] = T
+
+        # Thrust component along rocket axis -> vertical accel (simplified, rocket ~ vertical)
+        theta_rad = math.radians(theta[i])
+        tvc_rad   = math.radians(tvcActual[i])
+
+        # Axial thrust component (along rocket body) and lateral (perp to body)
+        T_axial   = T * math.cos(tvc_rad)
+        T_lateral = T * math.sin(tvc_rad)
+
+        # Drag on the body (opposes velocity). Use total speed.
+        v_total = math.hypot(vx[i], vz[i])
+        q = 0.5 * airDensity * v_total * v_total
+        drag = q * dragCoefficient * rocketCrossSectionalArea  # N
+
+        # Accelerations in world frame (rocket points ~upward; small angle approximation
+        # for world-frame projection is fine for typical TVC tuning scenarios)
+        # Vertical:  T_axial*cos(theta) - lateral*sin(theta) - mg - drag_z
+        # Horizontal: T_axial*sin(theta) + lateral*cos(theta) + wind - drag_x
+        drag_z = drag * (vz[i] / v_total) if v_total > 1e-6 else 0.0
+        drag_x = drag * (vx[i] / v_total) if v_total > 1e-6 else 0.0
+
+        gust = random.uniform(-windGustFx, windGustFx) if windGustFx > 0 else 0.0
+        Fx_world = (T_axial * math.sin(theta_rad)
+                    + T_lateral * math.cos(theta_rad)
+                    + windFx + gust - drag_x)
+        Fz_world = (T_axial * math.cos(theta_rad)
+                    - T_lateral * math.sin(theta_rad)
+                    - mass * gravity - drag_z)
+
+        fx_hist[i] = Fx_world
+
+        # Translational integration
+        vx[i + 1] = vx[i] + (Fx_world / mass) * dt
+        vz[i + 1] = vz[i] + (Fz_world / mass) * dt
+        x_pos[i + 1]    = x_pos[i]    + vx[i + 1] * dt
+        altitude[i + 1] = max(0.0, altitude[i] + vz[i + 1] * dt)
+
+        # --- Rotational dynamics ---
+        # Moment from TVC: positive tvc angle -> positive torque -> positive theta rate.
+        # Classical PID with err = sp - theta then commands negative TVC when theta > sp,
+        # producing a restoring torque. Sign convention matches a conventional controller.
+        M_tvc = T * math.sin(tvc_rad) * distanceTVCToCOM
+
+        # Aerodynamic restoring moment (simple normal-force model).
+        # Side force ~ q * A * C_N_alpha * sin(theta) acting at CP aft of CoM -> restoring.
+        # C_N_alpha ~ 2.0/rad is a reasonable estimate for a slender rocket.
+        q_dyn = 0.5 * airDensity * (vz[i] * vz[i] + vx[i] * vx[i])
+        M_aero = -q_dyn * rocketCrossSectionalArea * 2.0 * math.sin(theta_rad) * distanceCPToCOM
+
+        M_total = M_tvc + M_aero
+
+        alpha_a[i + 1] = math.degrees(M_total / MOI)
+        omega[i + 1]   = omega[i] + alpha_a[i + 1] * dt
+        theta[i + 1]   = theta[i] + omega[i + 1] * dt
+
+    # last sample
+    t[-1] = (steps - 1) * dt
+    thetaMeas[-1]    = thetaMeas[-2]
+    tvcCmd[-1]       = tvcCmd[-2]
+    tvcCmdLim[-1]    = tvcCmdLim[-2]
+    tvcActual[-1]    = tvcActual[-2]
+    setpoint_hist[-1] = setpoint_hist[-2]
+    thrust_hist[-1]  = thrust_hist[-2]
+
+    return {
+        't': t, 'theta': theta, 'omega': omega, 'alpha': alpha_a,
+        'thetaMeas': thetaMeas,
+        'tvcCmd': tvcCmd, 'tvcCmdLim': tvcCmdLim, 'tvcActual': tvcActual,
+        'setpoint': setpoint_hist,
+        'altitude': altitude, 'vz': vz, 'vx': vx, 'x': x_pos,
+        'thrust': thrust_hist,
+    }
+
+
+# ============================================================================
+# Plotting
+# ============================================================================
+
+def plot(r):
+    fig = plt.figure('TVC Simulator - PID Tuning', figsize=(13, 8))
+    g = plt.GridSpec(3, 2, hspace=0.45, wspace=0.25)
+
+    ax = fig.add_subplot(g[0, 0])
+    ax.plot(r['t'], r['theta'],     label='True angle',     color='#d62728', linewidth=1.6)
+    ax.plot(r['t'], r['thetaMeas'], label='Measured',       color='#1f77b4', linewidth=0.7, alpha=0.6)
+    ax.plot(r['t'], r['setpoint'],  label='Setpoint',       color='black',   linewidth=0.8, linestyle='--')
+    ax.set_title('Rocket Pitch Angle')
+    ax.set_xlabel('time (s)'); ax.set_ylabel('angle (deg)')
+    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
+
+    ax = fig.add_subplot(g[0, 1])
+    ax.plot(r['t'], r['tvcCmd'],    label='PID command',    color='#ff7f0e', linewidth=0.9)
+    ax.plot(r['t'], r['tvcCmdLim'], label='After limits',   color='#2ca02c', linewidth=1.2)
+    ax.plot(r['t'], r['tvcActual'], label='Actual (w/ noise)', color='#9467bd', linewidth=0.6, alpha=0.6)
+    ax.axhline( absMaxTVCAngle, color='red', linestyle=':', linewidth=0.8)
+    ax.axhline(-absMaxTVCAngle, color='red', linestyle=':', linewidth=0.8)
+    ax.set_title('TVC Angle')
+    ax.set_xlabel('time (s)'); ax.set_ylabel('angle (deg)')
+    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
+
+    ax = fig.add_subplot(g[1, 0])
+    ax.plot(r['t'], r['omega'], color='#d62728')
+    ax.set_title('Angular Velocity')
+    ax.set_xlabel('time (s)'); ax.set_ylabel('deg/s'); ax.grid(alpha=0.3)
+
+    ax = fig.add_subplot(g[1, 1])
+    ax.plot(r['t'], r['thrust'], color='#d62728')
+    ax.set_title('Thrust')
+    ax.set_xlabel('time (s)'); ax.set_ylabel('N'); ax.grid(alpha=0.3)
+
+    ax = fig.add_subplot(g[2, 0])
+    ax.plot(r['t'], r['altitude'], label='Altitude', color='#1f77b4')
+    ax.plot(r['t'], r['vz'],       label='V_z',      color='#ff7f0e')
+    ax.set_title('Altitude & Vertical Speed')
+    ax.set_xlabel('time (s)'); ax.set_ylabel('m  /  m/s')
+    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
+
+    ax = fig.add_subplot(g[2, 1])
+    ax.plot(r['x'], r['altitude'], color='#2ca02c')
+    ax.set_title('Trajectory (x vs altitude)')
+    ax.set_xlabel('x (m)'); ax.set_ylabel('altitude (m)')
+    ax.grid(alpha=0.3); ax.set_aspect('equal', adjustable='datalim')
+
+    # Summary stats in the window title
+    theta = r['theta']
+    overshoot = abs(theta).max()
+    # Settling time: first t where |theta| stays under 5% of initAngle for 0.25s
+    band = 0.05 * max(abs(initAngle), 1.0)
+    settle_t = None
+    window = int(0.25 / dt)
+    for i in range(len(theta) - window):
+        if np.all(np.abs(theta[i:i + window]) < band):
+            settle_t = r['t'][i]
+            break
+    ss_err = abs(theta[-1] - r['setpoint'][-1])
+    sat_pct = 100.0 * np.mean(np.abs(r['tvcCmd']) > absMaxTVCAngle)
+
+    fig.suptitle(
+        f"kp={kp}  ki={ki}  kd={kd}    |    "
+        f"max |θ|={overshoot:.2f}°   "
+        f"settle={'n/a' if settle_t is None else f'{settle_t:.2f}s'}   "
+        f"ss err={ss_err:.2f}°   "
+        f"saturation={sat_pct:.1f}%",
+        fontsize=11)
+
+    plt.show()
+
+
+if __name__ == '__main__':
+    results = run()
+    plot(results)
