@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 
 # --- PID gains (what you're tuning) ---
 kp = 0.34
-ki = 0.21
+ki = 0.215
 kd = 0.05
 alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter)
 
@@ -35,7 +35,9 @@ alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no f
 mass = 0.900                        # kg
 MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia)
 distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM)
-distanceCPToCOM = 0.230             # m       (CP aft of CoM -> stabilizing/destabilizing)
+distanceCPToCOM = 0.126             # m       (|distance| between CP and CoM)
+isAerodynamicallyUnstable = True    # True = CP fwd of CoM (destabilizing), False = CP aft (stabilizing)
+C_N_alpha = 2.0                     # 1/rad   (normal force slope; ~2 for slender rockets)
 rocketCrossSectionalArea = 0.006207 # m^2     (pi * (3 in / 2)^2 ~ 3" airframe)
 dragCoefficient = 0.45              # C_d
 
@@ -43,8 +45,8 @@ dragCoefficient = 0.45              # C_d
 PIDDT = 0.005                       # s       (controller update period)
 servoDelay = 0.005                  # s       (command -> motion delay)
 maxTVCSpeed = 250                   # deg/s   (slew rate limit)
-absMaxTVCAngle = 6                  # deg     (mechanical limit)
-TVCBias = 0.02                       # deg     (constant TVC misalignment)
+absMaxTVCAngle = 7                  # deg     (mechanical limit)
+TVCBias = 0.0                       # deg     (constant TVC misalignment)
 TVCNoiseAmplitude = 1.5             # deg     (peak TVC jitter)
 
 # --- Sensor parameters (gyro/IMU) ---
@@ -62,7 +64,7 @@ timeToFinalSetpoint = 0.0           # s       (ramp end time; 0 = step)
 # --- Environment ---
 useThrustCurve = True               # True = Estes F-15, False = constant `thrustValue`
 thrustValue = 15.0                  # N (used only if useThrustCurve = False)
-windFx = 0.0                        # N (steady crosswind force)
+windFx = 10.0                        # N (steady crosswind force)
 windGustFx = 0.0                    # N (peak gust magnitude, randomized)
 airDensity = 1.225                  # kg/m^3
 gravity = 9.81                      # m/s^2
@@ -119,7 +121,7 @@ def run():
     t        = np.zeros(steps)
     theta    = np.zeros(steps)   # true rocket pitch (deg)
     omega    = np.zeros(steps)   # angular velocity (deg/s)
-    alpha_a  = np.zeros(steps)   # angular accel (deg/s^2)
+    ang_accel = np.zeros(steps)  # angular accel (deg/s^2)
 
     thetaMeas    = np.zeros(steps)   # what the gyro reports
     tvcCmd       = np.zeros(steps)   # PID output (before limiting)
@@ -132,7 +134,6 @@ def run():
     vx       = np.zeros(steps)
     x_pos    = np.zeros(steps)
     thrust_hist = np.zeros(steps)
-    fx_hist     = np.zeros(steps)  # lateral force on rocket
 
     # Initial conditions
     theta[0] = initAngle
@@ -222,13 +223,17 @@ def run():
                     - T_lateral * math.sin(theta_rad)
                     - mass * gravity - drag_z)
 
-        fx_hist[i] = Fx_world
-
         # Translational integration
         vx[i + 1] = vx[i] + (Fx_world / mass) * dt
         vz[i + 1] = vz[i] + (Fz_world / mass) * dt
-        x_pos[i + 1]    = x_pos[i]    + vx[i + 1] * dt
-        altitude[i + 1] = max(0.0, altitude[i] + vz[i + 1] * dt)
+        new_alt = altitude[i] + vz[i + 1] * dt
+        if new_alt <= 0.0:
+            altitude[i + 1] = 0.0
+            vz[i + 1] = 0.0
+            vx[i + 1] = 0.0
+        else:
+            altitude[i + 1] = new_alt
+        x_pos[i + 1] = x_pos[i] + vx[i + 1] * dt
 
         # --- Rotational dynamics ---
         # Moment from TVC: positive tvc angle -> positive torque -> positive theta rate.
@@ -236,16 +241,19 @@ def run():
         # producing a restoring torque. Sign convention matches a conventional controller.
         M_tvc = T * math.sin(tvc_rad) * distanceTVCToCOM
 
-        # Aerodynamic restoring moment (simple normal-force model).
-        # Side force ~ q * A * C_N_alpha * sin(theta) acting at CP aft of CoM -> restoring.
-        # C_N_alpha ~ 2.0/rad is a reasonable estimate for a slender rocket.
+        # Aerodynamic moment from normal force at CP.
+        # Side force ~ q * A * C_N_alpha * sin(theta) acting at CP.
+        # If CP is aft of CoM (stable):   moment is restoring  -> negative sign
+        # If CP is fwd of CoM (unstable): moment is destabilizing -> positive sign
         q_dyn = 0.5 * airDensity * (vz[i] * vz[i] + vx[i] * vx[i])
-        M_aero = -q_dyn * rocketCrossSectionalArea * 2.0 * math.sin(theta_rad) * distanceCPToCOM
+        aero_sign = +1.0 if isAerodynamicallyUnstable else -1.0
+        M_aero = aero_sign * q_dyn * rocketCrossSectionalArea * C_N_alpha \
+                 * math.sin(theta_rad) * distanceCPToCOM
 
         M_total = M_tvc + M_aero
 
-        alpha_a[i + 1] = math.degrees(M_total / MOI)
-        omega[i + 1]   = omega[i] + alpha_a[i + 1] * dt
+        ang_accel[i + 1] = math.degrees(M_total / MOI)
+        omega[i + 1]   = omega[i] + ang_accel[i + 1] * dt
         theta[i + 1]   = theta[i] + omega[i + 1] * dt
 
     # last sample
@@ -258,7 +266,7 @@ def run():
     thrust_hist[-1]  = thrust_hist[-2]
 
     return {
-        't': t, 'theta': theta, 'omega': omega, 'alpha': alpha_a,
+        't': t, 'theta': theta, 'omega': omega, 'alpha': ang_accel,
         'thetaMeas': thetaMeas,
         'tvcCmd': tvcCmd, 'tvcCmdLim': tvcCmdLim, 'tvcActual': tvcActual,
         'setpoint': setpoint_hist,
@@ -316,27 +324,49 @@ def plot(r):
     ax.set_xlabel('x (m)'); ax.set_ylabel('altitude (m)')
     ax.grid(alpha=0.3); ax.set_aspect('equal', adjustable='datalim')
 
-    # Summary stats in the window title
+    # Summary stats computed ONLY during powered flight (when TVC has authority).
+    # After motor burnout, an unstable rocket will tumble — that's expected, not a tuning problem.
+    thrust_arr = r['thrust']
+    powered = thrust_arr > 0.1
+    if powered.any():
+        last_powered = int(np.where(powered)[0][-1])
+    else:
+        last_powered = len(r['t']) - 1
+    burn_end_t = r['t'][last_powered]
+
     theta = r['theta']
-    overshoot = abs(theta).max()
-    # Settling time: first t where |theta| stays under 5% of initAngle for 0.25s
+    theta_p = theta[:last_powered + 1]
+    t_p = r['t'][:last_powered + 1]
+    sp_arr = r['setpoint']
+
+    # Overshoot: peak exceedance past the setpoint after initial correction.
+    # For a positive initial disturbance targeting 0, this is how far below 0 theta went.
+    sp_sign = np.sign(initAngle - finalSetpoint)
+    exceedance = sp_sign * (sp_arr[:last_powered + 1] - theta_p)
+    overshoot = float(max(0.0, exceedance.max()))
+    # Settling time: first t (within powered phase) where |theta - sp| stays under 5% of initAngle for 0.25s
     band = 0.05 * max(abs(initAngle), 1.0)
     settle_t = None
     window = int(0.25 / dt)
-    for i in range(len(theta) - window):
-        if np.all(np.abs(theta[i:i + window]) < band):
-            settle_t = r['t'][i]
+    for i in range(len(theta_p) - window):
+        if np.all(np.abs(theta_p[i:i + window] - sp_arr[i:i + window]) < band):
+            settle_t = t_p[i]
             break
-    ss_err = abs(theta[-1] - r['setpoint'][-1])
-    sat_pct = 100.0 * np.mean(np.abs(r['tvcCmd']) > absMaxTVCAngle)
+    ss_err = abs(theta_p[-1] - sp_arr[last_powered])
+    sat_pct = 100.0 * np.mean(np.abs(r['tvcCmd'][:last_powered + 1]) > absMaxTVCAngle)
+
+    # Shade coast phase on pitch plot
+    axs = fig.axes
+    for ax_ in axs[:4]:
+        ax_.axvspan(burn_end_t, r['t'][-1], color='gray', alpha=0.08, zorder=0)
 
     fig.suptitle(
-        f"kp={kp}  ki={ki}  kd={kd}    |    "
-        f"max |θ|={overshoot:.2f}°   "
+        f"kp={kp}  ki={ki}  kd={kd}    |    (powered phase, 0–{burn_end_t:.2f}s)    "
+        f"overshoot={overshoot:.2f}°   "
         f"settle={'n/a' if settle_t is None else f'{settle_t:.2f}s'}   "
         f"ss err={ss_err:.2f}°   "
         f"saturation={sat_pct:.1f}%",
-        fontsize=11)
+        fontsize=10)
 
     plt.show()
 
