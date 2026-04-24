@@ -9,8 +9,8 @@
 
 // Output pins — use Teensy 4.0 digital pins rated for the FET drive circuit
 // These drive logic-level MOSFETs, NOT the e-match directly
-#define PYRO_DROGUE_PIN       5    // drogue ejection charge (apogee)
-#define PYRO_MAIN_PIN         6    // main ejection charge (low altitude)
+#define PYRO_DROGUE_PIN       6    // drogue ejection charge (apogee)
+#define PYRO_MAIN_PIN         8    // main ejection charge (low altitude)
 
 // Continuity check pins — measure resistance across e-match
 // Uses Teensy analog input with a voltage divider on the PCB
