@@ -13,21 +13,32 @@ static SPISettings _spi_settings(LSM6DSOX_SPI_CLOCK, MSBFIRST, SPI_MODE3);
 // PRIVATE — SPI HELPERS
 // --------------------------------------------------------
 
+// CS_SETTLE_NS — IMXRT1062 issues SPI clocks faster than the CS line
+// physically settles at the sensor. Without this, the first bit of the
+// register byte can be clocked while CS is still mid-transition, giving
+// garbled reads that look like SPI mode/wiring problems.
+// 125 ns matches bolderflight's invensense-imu reference driver.
+#define CS_SETTLE_NS 125
+
 static void write_register(uint8_t reg, uint8_t value) {
     SPI.beginTransaction(_spi_settings);
-    digitalWrite(LSM6DSOX_CS_PIN, LOW);
-    SPI.transfer(reg & 0x7F);   // bit 7 = 0 → write (matches working code)
+    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    delayNanoseconds(CS_SETTLE_NS);
+    SPI.transfer(reg & 0x7F);   
     SPI.transfer(value);
-    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
 }
 
 static uint8_t read_register(uint8_t reg) {
     SPI.beginTransaction(_spi_settings);
-    digitalWrite(LSM6DSOX_CS_PIN, LOW);
-    SPI.transfer(reg | 0x80);   // bit 7 = 1 → read (matches working code)
+    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    delayNanoseconds(CS_SETTLE_NS);
+    SPI.transfer(reg | 0x80);   
     uint8_t value = SPI.transfer(0x00);
-    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
     return value;
 }
@@ -38,12 +49,15 @@ static uint8_t read_register(uint8_t reg) {
  */
 static void read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
     SPI.beginTransaction(_spi_settings);
-    digitalWrite(LSM6DSOX_CS_PIN, LOW);
+    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    delayNanoseconds(CS_SETTLE_NS);
     SPI.transfer(reg | 0x80);   // read flag
-    for (uint8_t i = 0; i < length; i++) {
-        buf[i] = SPI.transfer(0x00);
-    }
-    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+    // In-place block transfer: TX dummy bytes, RX directly into buf.
+    // On Teensy 4.0 this uses the SPI peripheral's hardware transfer path
+    // and is meaningfully faster than a per-byte loop at 833 Hz IMU rate.
+    SPI.transfer(buf, length);
+    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
 }
 
