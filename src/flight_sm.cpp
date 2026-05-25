@@ -51,7 +51,7 @@ void fsm_disarm(FlightSM *fsm) {
 void fsm_abort(FlightSM *fsm) {
     fsm->tvc_enabled = false;
     enter_state(fsm, STATE_ABORT);
-    Serial.println("[FSM] ABORT — all outputs safed");
+    Serial.println("[FSM] ABORT — all outputs saved");
 }
 
 bool fsm_state_changed(FlightSM *fsm) {
@@ -91,7 +91,7 @@ void fsm_update(FlightSM *fsm,
     switch (fsm->state) {
 
         case STATE_IDLE:
-            // Only exits via fsm_arm() — no automatic transition
+            // Only exits via fsm_arm() — send 'A' over USB serial
             break;
 
         case STATE_ARMED:

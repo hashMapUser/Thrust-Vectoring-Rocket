@@ -7,7 +7,7 @@
 // STATE TRANSITION THRESHOLDS
 // --------------------------------------------------------
 
-// IDLE → ARMED: triggered externally (button/serial command), not by sensor
+// IDLE → ARMED: send 'A' over USB serial. 'D' disarms, 'X' aborts.
 // ARMED → POWERED_FLIGHT: vertical accel exceeds this for LAUNCH_ACCEL_MS
 #define LAUNCH_ACCEL_THRESHOLD_G   2.5f    // g — well above pad vibration
 #define LAUNCH_ACCEL_MS            100     // must hold for this many ms
@@ -112,7 +112,7 @@ bool fsm_arm(FlightSM *fsm);
 void fsm_disarm(FlightSM *fsm);
 
 /**
- * Manually trigger abort — safes all outputs, sets STATE_ABORT.
+ * Manually trigger abort — saves all outputs, sets STATE_ABORT.
  */
 void fsm_abort(FlightSM *fsm);
 
