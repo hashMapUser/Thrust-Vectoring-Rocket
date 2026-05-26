@@ -86,7 +86,7 @@ typedef struct {
     float mag_y;
     float mag_z;
     bool  valid;
-} MMC5603NJ_Data;
+}mag_data;
 
 // --------------------------------------------------------
 // PUBLIC API
@@ -99,7 +99,7 @@ typedef struct {
  *
  * @return true on success; false if sensor absent or chip ID mismatch.
  */
-bool mmc5603nj_init();
+bool mag_init();
 
 /**
  * Trigger a single measurement, poll until complete, then burst-read
@@ -107,4 +107,4 @@ bool mmc5603nj_init();
  *
  * @param out  Populated on return. Always check out->valid.
  */
-void mmc5603nj_read(MMC5603NJ_Data *out);
+void mag_read(mag_data *out);

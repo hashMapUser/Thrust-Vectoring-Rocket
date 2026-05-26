@@ -35,7 +35,8 @@ alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no f
 mass = 0.900                        # kg
 MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia)
 distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM)
-distanceCPToCOM = 0.126             # m       (|distance| between CP and CoM)
+distanceCPToCOM = 0.2467            # m       (|distance| between CP and CoM)
+                                    # 9.71 in fwd of CoM, static margin = -3.24 cal (unstable by design)
 isAerodynamicallyUnstable = True    # True = CP fwd of CoM (destabilizing), False = CP aft (stabilizing)
 C_N_alpha = 2.0                     # 1/rad   (normal force slope; ~2 for slender rockets)
 rocketCrossSectionalArea = 0.006207 # m^2     (pi * (3 in / 2)^2 ~ 3" airframe)
@@ -64,13 +65,16 @@ timeToFinalSetpoint = 0.0           # s       (ramp end time; 0 = step)
 # --- Environment ---
 useThrustCurve = True               # True = Estes F-15, False = constant `thrustValue`
 thrustValue = 15.0                  # N (used only if useThrustCurve = False)
-windFx = 10.0                        # N (steady crosswind force)
+windFx = 0.0                        # N (steady crosswind force)
 windGustFx = 0.0                    # N (peak gust magnitude, randomized)
 airDensity = 1.225                  # kg/m^3
 gravity = 9.81                      # m/s^2
 
 # --- Reproducibility ---
 randomSeed = 42                     # set to None for different noise each run
+
+# --- Plotting ---
+focusOnPoweredPhase = True          # True = zoom plots to burn time + 0.5s coast (best for PID tuning)
 
 # ============================================================================
 # Estes F-15 thrust curve (from thrustcurve.org)
@@ -121,7 +125,7 @@ def run():
     t        = np.zeros(steps)
     theta    = np.zeros(steps)   # true rocket pitch (deg)
     omega    = np.zeros(steps)   # angular velocity (deg/s)
-    ang_accel = np.zeros(steps)  # angular accel (deg/s^2)
+    alpha_a  = np.zeros(steps)   # angular accel (deg/s^2)
 
     thetaMeas    = np.zeros(steps)   # what the gyro reports
     tvcCmd       = np.zeros(steps)   # PID output (before limiting)
@@ -134,6 +138,7 @@ def run():
     vx       = np.zeros(steps)
     x_pos    = np.zeros(steps)
     thrust_hist = np.zeros(steps)
+    fx_hist     = np.zeros(steps)  # lateral force on rocket
 
     # Initial conditions
     theta[0] = initAngle
@@ -166,9 +171,15 @@ def run():
         if now - last_pid_t >= PIDDT - 1e-9:
             pid_dt = now - last_pid_t if last_pid_t > 0 else PIDDT
             err = sp - thetaMeas[i]
-            integral += err * pid_dt
             d_raw = (err - prev_err) / pid_dt
             d_filt = alpha * d_raw + (1.0 - alpha) * d_filt
+            # Conditional integration anti-windup: only accumulate the integral
+            # when the previous output wasn't saturated, OR when the new error
+            # would push the output back inside the linear range.
+            prev_unsat = abs(pid_output) < absMaxTVCAngle
+            same_sign = (pid_output * err) > 0
+            if prev_unsat or not same_sign:
+                integral += err * pid_dt
             pid_output = kp * err + ki * integral + kd * d_filt
             prev_err = err
             last_pid_t = now
@@ -223,17 +234,29 @@ def run():
                     - T_lateral * math.sin(theta_rad)
                     - mass * gravity - drag_z)
 
+        fx_hist[i] = Fx_world
+
         # Translational integration
         vx[i + 1] = vx[i] + (Fx_world / mass) * dt
         vz[i + 1] = vz[i] + (Fz_world / mass) * dt
-        new_alt = altitude[i] + vz[i + 1] * dt
-        if new_alt <= 0.0:
+        x_pos[i + 1]    = x_pos[i]    + vx[i + 1] * dt
+        altitude[i + 1] = altitude[i] + vz[i + 1] * dt
+
+        # Ground impact: freeze everything once we hit the ground (after liftoff).
+        if altitude[i + 1] <= 0.0 and altitude[i] > 0.0 and vz[i + 1] < 0.0:
             altitude[i + 1] = 0.0
-            vz[i + 1] = 0.0
             vx[i + 1] = 0.0
-        else:
-            altitude[i + 1] = new_alt
-        x_pos[i + 1] = x_pos[i] + vx[i + 1] * dt
+            vz[i + 1] = 0.0
+            # Hold pose from here on
+            for k in range(i + 1, steps):
+                altitude[k] = 0.0
+                vx[k] = 0.0
+                vz[k] = 0.0
+                x_pos[k] = x_pos[i + 1]
+                theta[k] = theta[i + 1] if k > i + 1 else theta[i]
+                omega[k] = 0.0
+                t[k] = k * dt
+            break
 
         # --- Rotational dynamics ---
         # Moment from TVC: positive tvc angle -> positive torque -> positive theta rate.
@@ -252,8 +275,8 @@ def run():
 
         M_total = M_tvc + M_aero
 
-        ang_accel[i + 1] = math.degrees(M_total / MOI)
-        omega[i + 1]   = omega[i] + ang_accel[i + 1] * dt
+        alpha_a[i + 1] = math.degrees(M_total / MOI)
+        omega[i + 1]   = omega[i] + alpha_a[i + 1] * dt
         theta[i + 1]   = theta[i] + omega[i + 1] * dt
 
     # last sample
@@ -266,7 +289,7 @@ def run():
     thrust_hist[-1]  = thrust_hist[-2]
 
     return {
-        't': t, 'theta': theta, 'omega': omega, 'alpha': ang_accel,
+        't': t, 'theta': theta, 'omega': omega, 'alpha': alpha_a,
         'thetaMeas': thetaMeas,
         'tvcCmd': tvcCmd, 'tvcCmdLim': tvcCmdLim, 'tvcActual': tvcActual,
         'setpoint': setpoint_hist,
@@ -337,17 +360,13 @@ def plot(r):
     theta = r['theta']
     theta_p = theta[:last_powered + 1]
     t_p = r['t'][:last_powered + 1]
-    sp_arr = r['setpoint']
 
-    # Overshoot: peak exceedance past the setpoint after initial correction.
-    # For a positive initial disturbance targeting 0, this is how far below 0 theta went.
-    sp_sign = np.sign(initAngle - finalSetpoint)
-    exceedance = sp_sign * (sp_arr[:last_powered + 1] - theta_p)
-    overshoot = float(max(0.0, exceedance.max()))
+    overshoot = abs(theta_p).max()
     # Settling time: first t (within powered phase) where |theta - sp| stays under 5% of initAngle for 0.25s
     band = 0.05 * max(abs(initAngle), 1.0)
     settle_t = None
     window = int(0.25 / dt)
+    sp_arr = r['setpoint']
     for i in range(len(theta_p) - window):
         if np.all(np.abs(theta_p[i:i + window] - sp_arr[i:i + window]) < band):
             settle_t = t_p[i]
@@ -360,9 +379,29 @@ def plot(r):
     for ax_ in axs[:4]:
         ax_.axvspan(burn_end_t, r['t'][-1], color='gray', alpha=0.08, zorder=0)
 
+    # Optionally zoom time-axis plots to powered phase + small coast tail.
+    # The trajectory plot (x vs altitude) is left unzoomed since it doesn't have a time axis.
+    if focusOnPoweredPhase:
+        x_max = burn_end_t + 0.5
+        # axes[0]=pitch, [1]=tvc, [2]=omega, [3]=thrust, [4]=altitude/vz, [5]=trajectory
+        for ax_ in (axs[0], axs[1], axs[2], axs[3], axs[4]):
+            ax_.set_xlim(0, x_max)
+        # Re-fit y-limits to the data within the visible window
+        end_idx = min(int(x_max / dt) + 1, len(r['t']))
+        def _yfit(ax_, *series):
+            allvals = np.concatenate([s[:end_idx] for s in series])
+            lo, hi = float(np.min(allvals)), float(np.max(allvals))
+            pad = max(0.1, 0.1 * (hi - lo))
+            ax_.set_ylim(lo - pad, hi + pad)
+        _yfit(axs[0], r['theta'], r['thetaMeas'], r['setpoint'])
+        _yfit(axs[1], r['tvcCmdLim'], r['tvcActual'])  # ignore raw cmd which can be huge
+        _yfit(axs[2], r['omega'])
+        _yfit(axs[3], r['thrust'])
+        _yfit(axs[4], r['altitude'], r['vz'])
+
     fig.suptitle(
         f"kp={kp}  ki={ki}  kd={kd}    |    (powered phase, 0–{burn_end_t:.2f}s)    "
-        f"overshoot={overshoot:.2f}°   "
+        f"max |θ|={overshoot:.2f}°   "
         f"settle={'n/a' if settle_t is None else f'{settle_t:.2f}s'}   "
         f"ss err={ss_err:.2f}°   "
         f"saturation={sat_pct:.1f}%",

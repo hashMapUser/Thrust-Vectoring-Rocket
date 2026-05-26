@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
-#include "mmc5603nj.h"
+#include "mag.h"
 
 // --------------------------------------------------------
 // PRIVATE — I2C HELPERS
@@ -63,7 +63,7 @@ static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
 // PUBLIC API
 // --------------------------------------------------------
 
-bool mmc5603nj_init() {
+bool mag_init() {
     // Explicitly set pins and clock in case this runs before bmp390_init().
     // Calling Wire1.begin() more than once is safe on Teensy.
     Wire1.setSDA(MMC5603NJ_PIN_SDA);
@@ -88,7 +88,7 @@ bool mmc5603nj_init() {
     return true;
 }
 
-void mmc5603nj_read(MMC5603NJ_Data *out) {
+void mag_read(mag_data *out) {
     // 1. Trigger a single measurement
     if (!write_register(MMC5603NJ_REG_CTRL0, MMC5603NJ_TM_M)) {
         out->valid = false;
@@ -133,6 +133,6 @@ void mmc5603nj_read(MMC5603NJ_Data *out) {
     // 4. Assemble 18-bit values and scale to Gauss
     out->mag_x = assemble_axis(data[0], data[1], data[6]);
     out->mag_y = assemble_axis(data[2], data[3], data[7]);
-    out->mag_z = assemble_axis(data[4], data[5], data[8]);
-    out->valid = true;
+    out-> mag_z = assemble_axis(data[4], data[5], data[8]);
+    out-> valid = true;
 }

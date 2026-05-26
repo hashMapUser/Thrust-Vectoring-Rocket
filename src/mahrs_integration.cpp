@@ -31,7 +31,6 @@
 // --------------------------------------------------------
 
 static const float DT = 1.0f / 125.0f;  // 125 Hz fixed-rate tick
-// DEG_TO_RAD is provided by Arduino.h (via SPI.h) — no local definition needed
 
 // Beta gain schedule — accel/mag trust varies with flight phase.
 // During boost, thrust dominates the accelerometer reading and

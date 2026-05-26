@@ -2,7 +2,7 @@
 #include <EEPROM.h>
 #include <math.h>
 #include "mag_calib.h"
-#include "mmc5603nj.h"
+#include "mag.h"
 
 bool mag_calibrate(MagCalib *cal) {
     Serial.println("  Mag calibration — rotate sensor through a full sphere.");
@@ -15,8 +15,8 @@ bool mag_calibrate(MagCalib *cal) {
     float min_z =  9999, max_z = -9999;
 
     for (int i = 0; i < MAG_CALIB_SAMPLES; i++) {
-        MMC5603NJ_Data d;
-        mmc5603nj_read(&d);
+        mag_data d;
+        mag_read(&d);
 
         if (!d.valid) {
             Serial.println("  [WARN] Bad read during calibration — skipping sample");

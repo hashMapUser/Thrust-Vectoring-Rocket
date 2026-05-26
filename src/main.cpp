@@ -1,51 +1,75 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <SPI.h>
 
-#define CS_PIN 10
+#include "bmp390.h"
+#include "lsm6dsox.h"
+#include "flight_sm.h"
+#include "test_imu.h"
+#include "test_baro.h"
 
-// Try both modes — LSM6DSOX supports Mode 0 and Mode 3
-static SPISettings spi_mode0(500000, MSBFIRST, SPI_MODE0);
-static SPISettings spi_mode3(500000, MSBFIRST, SPI_MODE3);
+// Remove-before-flight (RBF) arming pin.
+// Wire the RBF jumper between this pin and GND.
+//   Jumper IN  (pin pulled LOW via jumper)  → IDLE / safe
+//   Jumper OUT (pin floats HIGH via pullup) → ARMED
+// Change this to any free digital pin on your Teensy.
+#define ARM_SWITCH_PIN  2
 
-uint8_t raw_read(uint8_t reg, SPISettings &cfg) {
-    SPI.beginTransaction(cfg);
-    digitalWrite(CS_PIN, LOW);
-    delayMicroseconds(2);          // let CS settle before first clock edge
-    SPI.transfer(reg | 0x80);      // bit7=1 → read
-    uint8_t val = SPI.transfer(0x00);
-    delayMicroseconds(2);
-    digitalWrite(CS_PIN, HIGH);
-    SPI.endTransaction();
-    return val;
-}
+static BMP390_Calib bmp_cal;
+static FlightSM     fsm;
 
 void setup() {
     Serial.begin(115200);
     while (!Serial) {}
 
-    pinMode(CS_PIN, OUTPUT);
-    digitalWrite(CS_PIN, HIGH);
-    delay(200);                    // let sensor power up fully
+    // CS pin MUST be driven HIGH before SPI.begin().
+    // If CS floats during bus init the LSM6DSOX receives garbage and
+    // returns 0x00 on WHO_AM_I regardless of SPI mode or clock speed.
+    pinMode(LSM6DSOX_CS_PIN, OUTPUT);
+    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+
+    // Internal pull-up: pin reads HIGH when jumper is absent (armed), LOW when shorted to GND (safe).
+    pinMode(ARM_SWITCH_PIN, INPUT_PULLUP);
+
     SPI.begin();
+    Wire.begin();
     delay(100);
 
-    Serial.println("=== Raw SPI diagnostic (no driver) ===");
-    Serial.println("WHO_AM_I (0x0F) expected: 0x6C");
-    Serial.println("CTRL3_C  (0x12) expected: 0x04 (IF_INC default)");
+    run_imu_tests();
+    run_baro_tests(&bmp_cal);
+
+    fsm_init(&fsm);
+    Serial.println("All tests complete.");
+    Serial.println("Pull RBF jumper to arm. Re-insert to disarm. Send 'D' or 'X' over serial for emergency disarm/abort.");
 }
 
 void loop() {
-    uint8_t id_m0  = raw_read(0x0F, spi_mode0);
-    uint8_t id_m3  = raw_read(0x0F, spi_mode3);
-    uint8_t ctrl_m0 = raw_read(0x12, spi_mode0);
-    uint8_t ctrl_m3 = raw_read(0x12, spi_mode3);
+    // --- RBF arming pin — edge-triggered with 50 ms debounce ---
+    static bool     last_stable_high = false;
+    static bool     last_raw_high    = false;
+    static uint32_t last_edge_ms     = 0;
+    const  uint32_t DEBOUNCE_MS      = 50;
 
-    Serial.print("Mode0 — WHO_AM_I=0x"); Serial.print(id_m0, HEX);
-    Serial.print("  CTRL3_C=0x");        Serial.println(ctrl_m0, HEX);
+    bool raw_high = (digitalRead(ARM_SWITCH_PIN) == HIGH);
+    if (raw_high != last_raw_high) {
+        last_raw_high = raw_high;
+        last_edge_ms  = millis();
+    }
+    if ((millis() - last_edge_ms) >= DEBOUNCE_MS && raw_high != last_stable_high) {
+        last_stable_high = raw_high;
+        if (raw_high) {
+            fsm_arm(&fsm) ? Serial.println("[ARM] Armed — RBF jumper pulled.")
+                          : Serial.println("[ARM] Arm rejected — not in IDLE.");
+        } else {
+            fsm_disarm(&fsm);
+            Serial.println("[ARM] Disarmed — RBF jumper re-inserted.");
+        }
+    }
 
-    Serial.print("Mode3 — WHO_AM_I=0x"); Serial.print(id_m3, HEX);
-    Serial.print("  CTRL3_C=0x");        Serial.println(ctrl_m3, HEX);
-
-    Serial.println("---");
-    delay(1000);
+    // --- Serial safety overrides (disarm and abort only) ---
+    if (Serial.available()) {
+        char c = Serial.read();
+        if      (c == 'D') { fsm_disarm(&fsm); Serial.println("[ARM] Disarmed via serial."); }
+        else if (c == 'X') { fsm_abort(&fsm);  Serial.println("[ARM] Abort triggered via serial."); }
+    }
 }
