@@ -43,8 +43,8 @@
 // PIN ASSIGNMENTS (Teensy 4.0 default Wire bus)
 // Change these if you move to Wire1 or Wire2
 // --------------------------------------------------------
-#define BMP390_PIN_SDA       18
-#define BMP390_PIN_SCL       19
+#define BMP390_PIN_SDA       17
+#define BMP390_PIN_SCL       16
 
 // --------------------------------------------------------
 // STRUCTS

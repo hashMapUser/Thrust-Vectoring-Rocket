@@ -14,8 +14,8 @@
 
 // Continuity check pins — measure resistance across e-match
 // Uses Teensy analog input with a voltage divider on the PCB
-#define PYRO_DROGUE_CONT_PIN  A0
-#define PYRO_MAIN_CONT_PIN    A1
+#define PYRO_DROGUE_CONT_PIN  A1   // Pyro Sense 1 — pin 15
+#define PYRO_MAIN_CONT_PIN    A0   // Pyro Sense 2 — pin 14
 
 // Continuity ADC thresholds — tune to your voltage divider values
 // Above CONT_GOOD = continuity present (e-match connected)

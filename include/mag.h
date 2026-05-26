@@ -67,10 +67,10 @@
 
 // --------------------------------------------------------
 // PIN ASSIGNMENTS (Teensy 4.0 Wire1 bus)
-// MMC5603NJ is on a separate I2C bus from the BMP390 (Wire / pins 18-19)
+// MMC5603NJ is on a separate I2C bus from the BMP390 (Wire / pins 16-17)
 // --------------------------------------------------------
-#define MMC5603NJ_PIN_SDA       17   // Wire1 SDA — Teensy 4.0
-#define MMC5603NJ_PIN_SCL       16   // Wire1 SCL — Teensy 4.0
+#define MMC5603NJ_PIN_SDA       19   // Wire1 SDA — Teensy 4.0
+#define MMC5603NJ_PIN_SCL       18   // Wire1 SCL — Teensy 4.0
 
 // --------------------------------------------------------
 // DATA STRUCT
