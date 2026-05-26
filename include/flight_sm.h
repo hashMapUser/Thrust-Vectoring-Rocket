@@ -3,20 +3,52 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// ============================================================
+// VERTICAL AXIS CONVENTION
+// ============================================================
+// All vertical-axis inputs to this module — accel_up_g, velocity_ms,
+// altitude_m — use "positive = up" semantics, independent of how the
+// IMU is physically mounted in the airframe.
+//
+//   At rest on the pad:   accel_up_g ≈ +1.0 g
+//   During boost:         accel_up_g ≈ +5…+8 g  (above LAUNCH threshold)
+//   Coast / free fall:    accel_up_g ≈  0   g  (below BURNOUT threshold)
+//   Descent on chute:     accel_up_g ≈ +1.0 g  (terminal velocity)
+//
+// The caller is responsible for mapping the physical IMU axis into
+// this convention before calling fsm_update(). For example, on this
+// vehicle the IMU's body-X axis points toward the tail (gravity acts
+// as a positive vector along +X), so the caller does:
+//
+//     const float accel_up_g = -imu.accel_x_g();
+//     alt_update(&alt, p, accel_up_g, dt);
+//     fsm_update(&fsm, accel_up_g, alt.altitude_m, alt.velocity_ms, ...);
+//
+// Keeping the sign flip in the caller decouples this module from
+// sensor mounting and matches the convention used by alt_estimator.h.
+// ============================================================
+
 // --------------------------------------------------------
 // STATE TRANSITION THRESHOLDS
 // --------------------------------------------------------
 
-// IDLE → ARMED: send 'A' over USB serial. 'D' disarms, 'X' aborts.
-// ARMED → POWERED_FLIGHT: vertical accel exceeds this for LAUNCH_ACCEL_MS
+// IDLE → ARMED: pull the RBF jumper (ARM_SWITCH_PIN HIGH). Re-insert to disarm.
+//               Serial 'D' disarms, 'X' aborts (emergency overrides).
+// ARMED → POWERED: vertical accel exceeds this for LAUNCH_ACCEL_MS
 #define LAUNCH_ACCEL_THRESHOLD_G   2.5f    // g — well above pad vibration
 #define LAUNCH_ACCEL_MS            100     // must hold for this many ms
 
-// POWERED_FLIGHT → COAST: accel drops below this (motor burnout)
+// POWERED → COAST: accel drops below this (motor burnout → free fall)
+// 0.5 g sits comfortably below the boost reading and above the noise
+// floor of ballistic free fall (~0 g), so it captures the moment thrust
+// truly stops rather than firing on a momentary thrust dip.
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f    // g
 
 // COAST → APOGEE: vertical velocity crosses zero (detected via alt estimator)
-// Backup: altitude hasn't increased for APOGEE_TIMEOUT_MS
+// Once apogee_detector.{h,cpp} is wired into the main loop, the
+// zero-crossing test inside fsm_update() can be replaced by the
+// consecutive-decrease detector's trigger. APOGEE_TIMEOUT_MS remains
+// as a backstop for either implementation.
 #define APOGEE_TIMEOUT_MS          8000    // 8 s — max expected coast phase
 
 // APOGEE → DESCENT: triggered by apogee detection, fires drogue
@@ -87,14 +119,18 @@ void fsm_init(FlightSM *fsm);
  * Call every loop iteration.
  *
  * @param fsm           State machine context.
- * @param accel_g       Vertical acceleration [g] (positive = up).
- * @param altitude_m    Estimated AGL altitude [m].
- * @param velocity_ms   Estimated vertical velocity [m/s].
+ * @param accel_up_g    Vertical specific force [g] in the "positive = up"
+ *                      convention — see the VERTICAL AXIS CONVENTION block
+ *                      at the top of this header. ≈ +1 g at rest, well
+ *                      above LAUNCH_ACCEL_THRESHOLD_G during boost,
+ *                      below BURNOUT_ACCEL_THRESHOLD_G after burnout.
+ * @param altitude_m    Estimated AGL altitude [m], positive going up.
+ * @param velocity_ms   Estimated vertical velocity [m/s], positive going up.
  * @param imu_valid     IMU read succeeded this cycle.
  * @param baro_valid    Barometer read succeeded this cycle.
  */
 void fsm_update(FlightSM *fsm,
-                float accel_g,
+                float accel_up_g,
                 float altitude_m,
                 float velocity_ms,
                 bool  imu_valid,
@@ -112,7 +148,7 @@ bool fsm_arm(FlightSM *fsm);
 void fsm_disarm(FlightSM *fsm);
 
 /**
- * Manually trigger abort — saves all outputs, sets STATE_ABORT.
+ * Manually trigger abort — safes all outputs, sets STATE_ABORT.
  */
 void fsm_abort(FlightSM *fsm);
 
