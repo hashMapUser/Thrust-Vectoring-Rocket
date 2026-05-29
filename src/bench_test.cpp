@@ -491,7 +491,9 @@ static void test_flash() {
 //  TEST 5 — SD Card
 // ============================================================
 static void test_sd() {
-    print_banner("TEST 5: SD Card (SPI, CS pin " + String(SD_CS_PIN) + ")");
+    char sd_banner[64];
+    snprintf(sd_banner, sizeof(sd_banner), "TEST 5: SD Card (SPI, CS pin %d)", SD_CS_PIN);
+    print_banner(sd_banner);
 
     Serial.println(F("  SD card setup: FAT32, any size up to 32 GB."));
     Serial.println(F("  No pre-formatting needed for modern cards already FAT32."));
