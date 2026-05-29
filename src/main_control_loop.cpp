@@ -35,6 +35,7 @@ uint32_t last_loop_time = 0;
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial && millis() < 3000) {}   // wait up to 3 s for USB serial
 
     // 1. PIN & BUS SETUP
     pinMode(ARM_SWITCH_PIN, INPUT_PULLUP);
@@ -97,7 +98,6 @@ void loop() {
                     Serial.println("[ARM] Armed.");
                 } else {
                     Serial.println("[ARM] Arm rejected — not in IDLE.");
-                    indicator_beep_error(&indicator);
                 }
             } else {
                 fsm_disarm(&fsm, &pyros);
