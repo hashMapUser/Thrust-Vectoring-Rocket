@@ -17,8 +17,8 @@
 #define LSM6DSOX_PIN_SCK      13   // Clock       — Teensy 4.0 hardware SPI default
 
 // SPI Mode 3 (CPOL=1, CPHA=1) — confirmed working on Teensy 4.0
-// 4 MHz is conservative but still >40x faster than needed at 833 Hz IMU rate.
-// 10 MHz (chip max) caused garbled reads on breadboard / flying-wire setups.
+// 500 kHz is very conservative (chip max is 10 MHz); higher speeds caused
+// garbled reads on breadboard / flying-wire setups. Increase once on PCB.
 #define LSM6DSOX_SPI_CLOCK    500000UL
 #define LSM6DSOX_SPI_SETTINGS SPISettings(LSM6DSOX_SPI_CLOCK, MSBFIRST, SPI_MODE3)
 
