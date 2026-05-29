@@ -43,7 +43,6 @@ void fsm_init(FlightSM *fsm) {
     fsm->main_fired       = false;
     fsm->tvc_enabled      = false;
     fsm->imu_fault        = false;
-    fsm->switch_engaged   = false;
 }
 
 bool fsm_arm(FlightSM *fsm, PyroState *pyro) {
@@ -104,7 +103,7 @@ void fsm_update(FlightSM *fsm,
     switch (fsm->state) {
 
         case STATE_IDLE:
-            // Exits only via fsm_arm() — called by the RBF debounce block.
+            // Exits only via fsm_arm() — called at startup.
             break;
 
         case STATE_ARMED:

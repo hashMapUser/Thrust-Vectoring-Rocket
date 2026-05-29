@@ -32,8 +32,7 @@
 // STATE TRANSITION THRESHOLDS
 // --------------------------------------------------------
 
-// IDLE → ARMED: pull the RBF jumper (ARM_SWITCH_PIN HIGH). Re-insert to disarm.
-//               Serial 'D' disarms, 'X' aborts (emergency overrides).
+// IDLE → ARMED: auto-armed at startup. Serial 'D' disarms, 'X' aborts (emergency overrides).
 // ARMED → POWERED: vertical accel exceeds this for LAUNCH_ACCEL_MS
 #define LAUNCH_ACCEL_THRESHOLD_G   2.5f    // g — well above pad vibration
 #define LAUNCH_ACCEL_MS            100     // must hold for this many ms
@@ -97,9 +96,6 @@ typedef struct {
 
     // Fault flags
     bool     imu_fault;
-
-    // Arming Switch
-    bool     switch_engaged;
 } FlightSM;
 
 // --------------------------------------------------------
