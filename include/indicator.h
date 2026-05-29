@@ -8,7 +8,7 @@
 // --------------------------------------------------------
 
 #define BUZZER_PIN    7    // piezo buzzer — active low or high depending on module
-#define LED_PIN       8    // status LED
+#define LED_PIN       3    // status LED — must not share a pin with any pyro output
 
 // Beep pattern timing [ms]
 #define BEEP_SHORT    80

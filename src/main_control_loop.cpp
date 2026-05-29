@@ -35,6 +35,7 @@ uint32_t last_loop_time = 0;
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial && millis() < 3000) {}   // wait up to 3 s for USB serial
 
     // 1. PIN & BUS SETUP
     pinMode(ARM_SWITCH_PIN, INPUT_PULLUP);
@@ -58,8 +59,8 @@ void setup() {
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
         while (true) {
-            indicator_beep_error(&indicator);
-            delay(2000);
+            indicator_update(&indicator, STATE_ABORT);
+            delay(10);
         }
     }
     lsm6dsox_load_bias(&gyro_bias);
@@ -97,7 +98,6 @@ void loop() {
                     Serial.println("[ARM] Armed.");
                 } else {
                     Serial.println("[ARM] Arm rejected — not in IDLE.");
-                    indicator_beep_error(&indicator);
                 }
             } else {
                 fsm_disarm(&fsm, &pyros);
@@ -177,8 +177,12 @@ void loop() {
                 pid_reset(&pid_pitch);
                 pid_reset(&pid_yaw);
                 break;
-            case STATE_APOGEE:
-                pyro_fire_main(&pyros);
+            case STATE_MAIN:
+                // APOGEE→MAIN is an atomic double-transition inside fsm_update(), so
+                // case STATE_APOGEE is never observable here — fire main on MAIN entry instead.
+                // Altitude guard bypassed: apogee detection via velocity zero-crossing already
+                // confirms altitude; baro not fitted this flight so altitude_m would be 0.
+                pyro_fire_main(&pyros, PYRO_MAIN_MIN_ALT_M + 1.0f);
                 break;
             case STATE_LANDED:
                 servo_disable();

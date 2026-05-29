@@ -81,14 +81,19 @@ typedef struct {
     uint32_t record_count;
     uint32_t next_write_addr;
     uint32_t checkpoint_offset;
-    uint8_t  _pad[FLASH_SECTOR_SIZE - 16];
+    // No in-RAM padding needed: header_persist() already limits the write to
+    // min(sizeof(FlashHeader), FLASH_PAGE_SIZE) bytes, so the 4 KB sector pad
+    // was wasting RAM without any benefit.
 } FlashHeader;
 #pragma pack(pop)
 
 // ============================================================
 //  RAM ring buffer (unchanged from original)
 // ============================================================
-static LogRecord  _buf[LOG_RAM_CAPACITY];
+// DMAMEM places this in RAM2 (OCRAM2) instead of RAM1 (DTCM).
+// At 4000 × 104 bytes = ~406 KB it was the entire cause of the RAM1 overflow.
+// RAM2 has 512 KB free and is fully CPU-accessible; no functional change.
+DMAMEM static LogRecord  _buf[LOG_RAM_CAPACITY];
 static uint16_t   _head    = 0;
 static uint16_t   _count   = 0;
 static bool       _wrapped = false;
