@@ -4,27 +4,15 @@
 // ============================================================
 // CONVENTION
 // ============================================================
-// All vertical-axis inputs to this module use a "positive = up"
-// convention — independent of how the IMU is physically mounted.
+// All vertical-axis inputs use a "positive = up" convention.
 //
-//   accel_up_g   : specific force on the rocket's vertical axis [g],
-//                  with sign convention chosen so that the value is
-//                  approximately +1g at rest (rocket upright, motor off)
-//                  and grows to +5g…+8g under thrust.
-//   velocity_ms  : vertical velocity [m/s], positive going up.
-//   altitude_m   : altitude AGL [m], positive going up.
+//   accel_up_g   : specific force on the rocket's vertical axis [g].
+//                  ≈ +1g at rest, grows to +5g…+8g under thrust.
+//   velocity_ms  : vertical velocity [m/s] integrated by the caller
+//                  from IMU accel. Barometer not used this flight.
 //
-// The caller is responsible for mapping the physical IMU axis into
-// this convention before calling fsm_update(). For example, on this
-// vehicle the IMU's X axis points toward the tail (gravity acts in
-// +X), so the caller does:
-//
-//     float accel_up_g = -imu.accel_x_g();
-//     alt_update(&alt, p, accel_up_g, dt);
-//     fsm_update(&fsm, accel_up_g, alt.altitude_m, alt.velocity_ms, ...);
-//
-// Keeping the sign-flip in the caller decouples the FSM from sensor
-// mounting and matches the convention used by alt_estimator.h.
+// accel_mag_g and gyro_rate_dps are magnitudes of the full 3-axis
+// vectors, used only for landed detection in STATE_MAIN.
 
 // --------------------------------------------------------
 // PRIVATE — STATE TRANSITION
@@ -50,25 +38,28 @@ void fsm_init(FlightSM *fsm) {
     fsm->prev_state       = STATE_IDLE;
     fsm->state_entry_ms   = millis();
     fsm->launch_detect_ms = 0;
-    fsm->max_altitude_m   = 0.0f;
     fsm->prev_velocity_ms = 0.0f;
     fsm->drogue_fired     = false;
     fsm->main_fired       = false;
     fsm->tvc_enabled      = false;
     fsm->imu_fault        = false;
-    fsm->baro_fault       = false;
-    fsm->mag_fault        = false;
+    fsm->switch_engaged   = false;
 }
 
-bool fsm_arm(FlightSM *fsm) {
+bool fsm_arm(FlightSM *fsm, PyroState *pyro) {
     if (fsm->state != STATE_IDLE) return false;
+    // Continuity check removed for this flight — arm unconditionally.
+    pyro->drogue_armed = true;
+    pyro->main_armed   = true;
+    Serial.println("[PYRO] Armed (no continuity check this flight)");
     enter_state(fsm, STATE_ARMED);
     fsm->tvc_enabled = true;
     return true;
 }
 
-void fsm_disarm(FlightSM *fsm) {
+void fsm_disarm(FlightSM *fsm, PyroState *pyro) {
     if (fsm->state != STATE_ARMED) return;
+    pyro_disarm(pyro);
     fsm->tvc_enabled = false;
     enter_state(fsm, STATE_IDLE);
 }
@@ -80,7 +71,11 @@ void fsm_abort(FlightSM *fsm) {
 }
 
 bool fsm_state_changed(FlightSM *fsm) {
-    return fsm->state != fsm->prev_state;
+    if (fsm->state != fsm->prev_state) {
+        fsm->prev_state = fsm->state;  // consume — returns false until next transition
+        return true;
+    }
+    return false;
 }
 
 uint32_t fsm_time_in_state(const FlightSM *fsm) {
@@ -88,44 +83,33 @@ uint32_t fsm_time_in_state(const FlightSM *fsm) {
 }
 
 void fsm_update(FlightSM *fsm,
-                float accel_up_g,     // see CONVENTION block at top of file
-                float altitude_m,
+                float accel_up_g,
                 float velocity_ms,
-                bool  imu_valid,
-                bool  baro_valid) {
+                float accel_mag_g,
+                float gyro_rate_dps,
+                bool  imu_valid) {
 
     uint32_t now = millis();
 
     // ── FAULT DETECTION ──
-    // Persistent sensor failures trigger abort in powered/coast flight.
-    if (!imu_valid)  fsm->imu_fault  = true;
-    if (!baro_valid) fsm->baro_fault = true;
+    if (!imu_valid) fsm->imu_fault = true;
 
-    if ((fsm->imu_fault || fsm->baro_fault) &&
+    if (fsm->imu_fault &&
         (fsm->state == STATE_POWERED || fsm->state == STATE_COAST)) {
         fsm_abort(fsm);
         return;
-    }
-
-    // Track maximum altitude — used for telemetry and as a sanity check
-    // for the apogee transition.
-    if (altitude_m > fsm->max_altitude_m) {
-        fsm->max_altitude_m = altitude_m;
     }
 
     // ── STATE TRANSITIONS ──
     switch (fsm->state) {
 
         case STATE_IDLE:
-            // Only exits via fsm_arm() — typically driven by an 'A' over
-            // USB serial from the ground station.
+            // Exits only via fsm_arm() — called by the RBF debounce block.
             break;
 
         case STATE_ARMED:
-            // Launch detection: vertical accel above launch threshold for
-            // LAUNCH_ACCEL_MS continuous milliseconds. With "positive = up"
-            // convention, rest is ~+1g and motor thrust drives the reading
-            // well above LAUNCH_ACCEL_THRESHOLD_G (typically 2.0g–3.0g).
+            // Launch detection: vertical accel above threshold for
+            // LAUNCH_ACCEL_MS continuous milliseconds.
             if (accel_up_g > LAUNCH_ACCEL_THRESHOLD_G) {
                 if (fsm->launch_detect_ms == 0) {
                     fsm->launch_detect_ms = now;
@@ -134,18 +118,13 @@ void fsm_update(FlightSM *fsm,
                     fsm->launch_detect_ms = 0;
                 }
             } else {
-                // Reset timer if accel drops back below threshold —
-                // prevents a single spike (wind gust, handling bump) from
-                // triggering launch on its own.
+                // Reset timer on dip — prevents a single spike from triggering.
                 fsm->launch_detect_ms = 0;
             }
             break;
 
         case STATE_POWERED:
-            // Burnout detection: thrust gone → reading falls back toward
-            // 0g (free-fall in ballistic flight). BURNOUT_ACCEL_THRESHOLD_G
-            // is typically ~1.5g — below the boost reading but above the
-            // post-burnout free-fall value.
+            // Burnout: thrust gone → reading falls toward 0 g.
             if (accel_up_g < BURNOUT_ACCEL_THRESHOLD_G) {
                 fsm->tvc_enabled = false;
                 enter_state(fsm, STATE_COAST);
@@ -153,56 +132,55 @@ void fsm_update(FlightSM *fsm,
             break;
 
         case STATE_COAST:
-            // Apogee detection: vertical velocity crosses zero (was
-            // positive, now non-positive), or coast timeout as a
-            // backstop.
-            //
-            // NOTE: this in-line zero-crossing test is the original
-            // implementation. The consecutive-decrease detector in
-            // apogee_detector.{h,cpp} is the replacement — once you wire
-            // it into the main loop, this block becomes a fallback driven
-            // by apogee_tick() returning true rather than the velocity
-            // check below.
-            if ((fsm->prev_velocity_ms > 0.0f && velocity_ms <= 0.0f) ||
-                (fsm_time_in_state(fsm) > APOGEE_TIMEOUT_MS)) {
-                enter_state(fsm, STATE_APOGEE);
+            // Apogee: integrated vertical velocity crosses zero (was positive,
+            // now non-positive). Guard of COAST_APOGEE_MIN_MS prevents a false
+            // trigger immediately after burnout. APOGEE_TIMEOUT_MS is the backstop.
+            if (fsm_time_in_state(fsm) >= COAST_APOGEE_MIN_MS) {
+                if ((fsm->prev_velocity_ms > 0.0f && velocity_ms <= 0.0f) ||
+                    (fsm_time_in_state(fsm) >= APOGEE_TIMEOUT_MS)) {
+                    enter_state(fsm, STATE_APOGEE);
+                }
             }
             break;
 
         case STATE_APOGEE:
-            // One-shot: drogue fire is handled in the main loop via
-            // fsm_state_changed() — we immediately transition to DESCENT
-            // here so the pyro pulse is bounded by one main-loop iteration.
-            enter_state(fsm, STATE_DESCENT);
+            // Single-chute flight: no drogue. Fire main at apogee and
+            // jump directly to STATE_MAIN for landed detection.
+            // One-shot: pyro fire is handled by the main loop via
+            // fsm_state_changed() before this transition executes.
+            enter_state(fsm, STATE_MAIN);
             break;
 
         case STATE_DESCENT:
-            // Main deploy at target AGL altitude.
-            if (altitude_m <= MAIN_DEPLOY_ALT_M && altitude_m > 0.0f) {
-                enter_state(fsm, STATE_MAIN);
-            }
+            // Not reached on single-chute flights (APOGEE → MAIN directly).
             break;
 
         case STATE_MAIN:
-            // Landing detection: near-zero vertical velocity sustained for
-            // LANDED_TIME_MS. We reset the entry time whenever velocity
-            // spikes back up so a swinging chute can't trigger LANDED
-            // prematurely.
-            if (fabsf(velocity_ms) < LANDED_VEL_THRESHOLD_MS) {
-                if (fsm_time_in_state(fsm) >= LANDED_TIME_MS) {
-                    enter_state(fsm, STATE_LANDED);
+            // Landing detection: accel magnitude near 1 g (rocket sitting on
+            // ground) AND angular rate near zero, held for LANDED_TIME_MS.
+            // Replaces baro velocity-based detect.
+            {
+                bool accel_ok = (accel_mag_g >= LANDED_ACCEL_LOW_G &&
+                                 accel_mag_g <= LANDED_ACCEL_HIGH_G);
+                bool gyro_ok  = (gyro_rate_dps < LANDED_GYRO_THRESHOLD_DPS);
+
+                if (accel_ok && gyro_ok) {
+                    if (fsm_time_in_state(fsm) >= LANDED_TIME_MS) {
+                        enter_state(fsm, STATE_LANDED);
+                    }
+                } else {
+                    // Reset timer while still moving.
+                    fsm->state_entry_ms = now;
                 }
-            } else {
-                fsm->state_entry_ms = now;
             }
             break;
 
         case STATE_LANDED:
-            // Terminal state — nothing to do
+            // Terminal state
             break;
 
         case STATE_ABORT:
-            // Terminal state — nothing to do
+            // Terminal state
             break;
     }
 

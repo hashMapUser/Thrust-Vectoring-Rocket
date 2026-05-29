@@ -2,13 +2,14 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "pyro.h"
 
 // ============================================================
 // VERTICAL AXIS CONVENTION
 // ============================================================
-// All vertical-axis inputs to this module — accel_up_g, velocity_ms,
-// altitude_m — use "positive = up" semantics, independent of how the
-// IMU is physically mounted in the airframe.
+// All vertical-axis inputs to this module — accel_up_g, velocity_ms —
+// use "positive = up" semantics, independent of how the IMU is physically
+// mounted in the airframe.
 //
 //   At rest on the pad:   accel_up_g ≈ +1.0 g
 //   During boost:         accel_up_g ≈ +5…+8 g  (above LAUNCH threshold)
@@ -21,11 +22,10 @@
 // as a positive vector along +X), so the caller does:
 //
 //     const float accel_up_g = -imu.accel_x_g();
-//     alt_update(&alt, p, accel_up_g, dt);
-//     fsm_update(&fsm, accel_up_g, alt.altitude_m, alt.velocity_ms, ...);
+//     fsm_update(&fsm, accel_up_g, vertical_velocity_ms, ...);
 //
-// Keeping the sign flip in the caller decouples this module from
-// sensor mounting and matches the convention used by alt_estimator.h.
+// vertical_velocity_ms is integrated by the caller from (accel_up_g - 1g)
+// during POWERED and COAST states only. Barometer is not used this flight.
 // ============================================================
 
 // --------------------------------------------------------
@@ -39,25 +39,22 @@
 #define LAUNCH_ACCEL_MS            100     // must hold for this many ms
 
 // POWERED → COAST: accel drops below this (motor burnout → free fall)
-// 0.5 g sits comfortably below the boost reading and above the noise
-// floor of ballistic free fall (~0 g), so it captures the moment thrust
-// truly stops rather than firing on a momentary thrust dip.
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f    // g
 
-// COAST → APOGEE: vertical velocity crosses zero (detected via alt estimator)
-// Once apogee_detector.{h,cpp} is wired into the main loop, the
-// zero-crossing test inside fsm_update() can be replaced by the
-// consecutive-decrease detector's trigger. APOGEE_TIMEOUT_MS remains
-// as a backstop for either implementation.
+// COAST → APOGEE: integrated vertical velocity crosses zero
+// Guard prevents premature trigger immediately after burnout
 #define APOGEE_TIMEOUT_MS          8000    // 8 s — max expected coast phase
+#define COAST_APOGEE_MIN_MS        1000    // minimum coast time before apogee can trigger
 
-// APOGEE → DESCENT: triggered by apogee detection, fires drogue
-// DESCENT → MAIN: altitude drops below this AGL
-#define MAIN_DEPLOY_ALT_M          150.0f  // m AGL — adjust for your field
+// APOGEE → DESCENT: drogue fired on entering APOGEE
+// DESCENT → MAIN: fixed timer from apogee — tune to expected drogue descent time
+#define MAIN_DEPLOY_DELAY_MS       30000   // 30 s — adjust for flight profile
 
-// MAIN → LANDED: vertical velocity near zero for LANDED_TIME_MS
-#define LANDED_VEL_THRESHOLD_MS    0.5f    // m/s
-#define LANDED_TIME_MS             3000    // must hold for 3 s
+// MAIN → LANDED: accel magnitude near 1 g AND angular rate near zero
+#define LANDED_ACCEL_LOW_G         0.75f   // g — lower bound of "at rest"
+#define LANDED_ACCEL_HIGH_G        1.35f   // g — upper bound of "at rest"
+#define LANDED_GYRO_THRESHOLD_DPS  10.0f   // deg/s — below this = not rotating
+#define LANDED_TIME_MS             5000    // must hold for 5 s
 
 // --------------------------------------------------------
 // STATES
@@ -92,7 +89,6 @@ typedef struct {
     uint32_t state_entry_ms;    // millis() when current state was entered
     uint32_t launch_detect_ms;  // millis() when launch accel first exceeded threshold
 
-    float    max_altitude_m;    // peak altitude seen — used for apogee detection
     float    prev_velocity_ms;  // previous vertical velocity — zero crossing = apogee
 
     bool     drogue_fired;
@@ -101,8 +97,9 @@ typedef struct {
 
     // Fault flags
     bool     imu_fault;
-    bool     baro_fault;
-    bool     mag_fault;
+
+    // Arming Switch
+    bool     switch_engaged;
 } FlightSM;
 
 // --------------------------------------------------------
@@ -118,34 +115,34 @@ void fsm_init(FlightSM *fsm);
  * Update state machine with latest sensor estimates.
  * Call every loop iteration.
  *
- * @param fsm           State machine context.
- * @param accel_up_g    Vertical specific force [g] in the "positive = up"
- *                      convention — see the VERTICAL AXIS CONVENTION block
- *                      at the top of this header. ≈ +1 g at rest, well
- *                      above LAUNCH_ACCEL_THRESHOLD_G during boost,
- *                      below BURNOUT_ACCEL_THRESHOLD_G after burnout.
- * @param altitude_m    Estimated AGL altitude [m], positive going up.
- * @param velocity_ms   Estimated vertical velocity [m/s], positive going up.
- * @param imu_valid     IMU read succeeded this cycle.
- * @param baro_valid    Barometer read succeeded this cycle.
+ * @param fsm             State machine context.
+ * @param accel_up_g      Vertical specific force [g] — see VERTICAL AXIS CONVENTION.
+ *                        ≈ +1 g at rest, >> LAUNCH_ACCEL_THRESHOLD_G during boost.
+ * @param velocity_ms     Integrated vertical velocity [m/s], positive going up.
+ *                        Caller integrates from IMU accel (baro not used this flight).
+ * @param accel_mag_g     Magnitude of the 3-axis accel vector [g]. Used for landed detect.
+ * @param gyro_rate_dps   Magnitude of the 3-axis gyro vector [deg/s]. Used for landed detect.
+ * @param imu_valid       IMU read succeeded this cycle.
  */
 void fsm_update(FlightSM *fsm,
                 float accel_up_g,
-                float altitude_m,
                 float velocity_ms,
-                bool  imu_valid,
-                bool  baro_valid);
+                float accel_mag_g,
+                float gyro_rate_dps,
+                bool  imu_valid);
 
 /**
  * Arm the flight computer. Only valid from STATE_IDLE.
- * @return true if arm was accepted.
+ * Arms pyro channels unconditionally (continuity check removed for this flight).
+ * @return true if arm accepted; false if not in IDLE.
  */
-bool fsm_arm(FlightSM *fsm);
+bool fsm_arm(FlightSM *fsm, PyroState *pyro);
 
 /**
  * Disarm / return to IDLE. Valid from ARMED only.
+ * Calls pyro_disarm() to safe pyro outputs.
  */
-void fsm_disarm(FlightSM *fsm);
+void fsm_disarm(FlightSM *fsm, PyroState *pyro);
 
 /**
  * Manually trigger abort — safes all outputs, sets STATE_ABORT.

@@ -1,220 +1,184 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <SPI.h>
 
-// ==========================================
-// 1. HARDWARE & SENSOR HEADERS
-// ==========================================
-#include "bmp390.h"      // Barometer
-#include "lsm6dsox.h"    // IMU
-#include "mag.h"         // Magnetometer (MMC5603NJ)
-#include "mag_calib.h"   // Hard/Soft iron mag calibration
+#include "lsm6dsox.h"
+#include "mag.h"          // mag_data type — needed for mahrs_tick signature
+#include "flight_sm.h"
+#include "pid.h"
+#include "servo_driver.h"
+#include "pyro.h"
+#include "indicator.h"
+#include "logger.h"
 
-// ==========================================
-// 2. ESTIMATION & STATE HEADERS
-// ==========================================
-#include "alt_estimator.h" // 1D Baro/Accel Complementary Filter
-#include "flight_sm.h"     // State Machine
-
-// Forward declarations for mahrs_integration.cpp 
+// Forward declarations for mahrs_integration.cpp
 struct RocketAttitude { float tip_a; float tip_b; float spin; };
 void mahrs_init();
 void mahrs_set_phase(FlightState phase);
 void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag);
 void mahrs_get_attitude(RocketAttitude *out);
+void mahrs_get_quaternion(float *q0, float *q1, float *q2, float *q3);
 
-// ==========================================
-// 3. CONTROL & ACTUATION HEADERS
-// ==========================================
-#include "pid.h"           // PID Controllers
-#include "servo_driver.h"  // TVC Servos
-#include "pyro.h"          // Ejection Charges
+// --- HARDWARE PIN DEFS ---
+#define ARM_SWITCH_PIN 2   // RBF jumper: jumper IN = GND = safe, jumper OUT = pull-up HIGH = arm
 
-// ==========================================
-// 4. HOUSEKEEPING HEADERS
-// ==========================================
-#include "indicator.h"     // Buzzer & LED
-#include "logger.h"        // SD Card & RAM Ring Buffer
+// --- GLOBAL MODULE CONTEXTS ---
+static GyroBias       gyro_bias;
+static FlightSM       fsm;
+static PIDController  pid_pitch;
+static PIDController  pid_yaw;
+static PyroState      pyros;
+static IndicatorState indicator;
 
-// ==========================================
-// GLOBAL STATE INSTANTIATIONS
-// ==========================================
-
-// These hold the memory state for modules across loop iterations.
-BMP390_Calib   bmp_cal;
-GyroBias       gyro_bias;
-MagCalib       mag_cal;
-
-AltEstimator   alt;
-FlightSM       fsm;
-
-PIDController  pid_pitch;
-PIDController  pid_yaw;
-
-PyroState      pyros;
-IndicatorState indicator;
-
-
-// --- Global Variables (Instantiated in setup) ---
-const uint32_t LOOP_INTERVAL_US = 8000; // 125 Hz = 8000 microseconds
+// --- TIMING ---
+const uint32_t LOOP_INTERVAL_US = 8000; // 125 Hz
 uint32_t last_loop_time = 0;
 
 void setup() {
-    // ==========================================
-    // 1. SERIAL & BUS SETUP
-    // ==========================================
     Serial.begin(115200);
-    // Note: Do not put a `while(!Serial);` loop here for flight code!
-    // If you fly without a USB cable connected, the rocket will freeze forever.
 
-    // CRITICAL: The CS pin must be driven HIGH before SPI.begin() is called.
-    // If it floats, the LSM6DSOX receives garbage and won't initialize properly. [cite: 563, 1121]
+    // 1. PIN & BUS SETUP
+    pinMode(ARM_SWITCH_PIN, INPUT_PULLUP);
+
     pinMode(LSM6DSOX_CS_PIN, OUTPUT);
     digitalWrite(LSM6DSOX_CS_PIN, HIGH);
-    SPI.begin();
 
-    // ==========================================
-    // 2. HARDWARE OUTPUTS & HOUSEKEEPING
-    // ==========================================
-    // Initialize these early so they are in a safe, known state (e.g., pyros LOW)
+    SPI.begin();
+    delay(100);
+
+    // 2. HARDWARE OUTPUTS
     indicator_init(&indicator);
-    logger_init();
     pyro_init(&pyros);
     servo_init();
 
-    // ==========================================
-    // 3. SENSOR INITIALIZATION & CALIBRATION
-    // ==========================================
-    // The bmp390_init and mag_init functions handle their own Wire/Wire1 bus setups[cite: 760, 761, 1060].
-    if (!bmp390_init(&bmp_cal)) {
-        Serial.println("[ERROR] Barometer Init Failed!");
-    }
-
+    // 3. SENSOR INIT
+    // IMU is required — halt with error pattern if it fails.
     if (!lsm6dsox_init()) {
-        Serial.println("[ERROR] IMU Init Failed!");
+        Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring (SCK hand-wired to pin 13)");
+        while (true) {
+            indicator_beep_error(&indicator);
+            delay(2000);
+        }
     }
-    // Load Gyro bias from EEPROM to prevent attitude drift
-    if (!lsm6dsox_load_bias(&gyro_bias)) {
-        Serial.println("[WARN] No Gyro Bias in EEPROM. Using default (0.0).");
-    }
+    lsm6dsox_load_bias(&gyro_bias);
 
-    if (!mag_init()) {
-        Serial.println("[ERROR] Magnetometer Init Failed!");
-    }
-    // Load Hard/Soft iron corrections from EEPROM
-    if (!mag_load_calib(&mag_cal)) {
-        Serial.println("[WARN] No Mag Calibration in EEPROM. Using defaults.");
-    }
-
-    // ==========================================
-    // 4. BASELINE ENVIRONMENT CALIBRATION
-    // ==========================================
-    // We must poll the barometer to get the local atmospheric pressure on the launch pad.
-    // This allows the altitude estimator to calculate Altitude Above Ground Level (AGL). [cite: 441]
-    float ground_pressure_hpa = 1013.25f; // Fallback to standard sea level
-    BMP390_Data baro_data;
-    
-    // Read a few times to flush out stale initial reads
-    for (int i = 0; i < 10; i++) {
-        bmp390_read(&bmp_cal, &baro_data);
-        delay(20);
-    }
-    if (baro_data.valid) {
-        ground_pressure_hpa = baro_data.pressure_pa / 100.0f;
-        Serial.print("[INIT] Baseline Pad Pressure: ");
-        Serial.print(ground_pressure_hpa);
-        Serial.println(" hPa");
-    }
-
-    // ==========================================
-    // 5. STATE, ESTIMATION, & CONTROL SETUP
-    // ==========================================
-    alt_init(&alt, ground_pressure_hpa);
+    // 4. FILTER & FSM INIT
     mahrs_init();
     fsm_init(&fsm);
-
     pid_init(&pid_pitch);
     pid_init(&pid_yaw);
 
-    // Give time to clear the pad or send the arming command
-    Serial.println("====================================");
-    Serial.println(" FLIGHT COMPUTER READY. SEND 'A' TO ARM.");
-    Serial.println("====================================");
+    Serial.println("FLIGHT COMPUTER READY. WAITING FOR SWITCH.");
 }
 
 void loop() {
-    // ==========================================
-    // 0. TIMING CONTROL (FIXED RATE)
-    // ==========================================
+    // 0. FIXED TIMING CONTROL
     uint32_t now = micros();
-    if (now - last_loop_time < LOOP_INTERVAL_US) {
-        return; // Non-blocking wait for the next tick
-    }
-    // Calculate actual dt (should be ~0.008s)
-    float dt = (now - last_loop_time) / 1000000.0f; 
+    if (now - last_loop_time < LOOP_INTERVAL_US) return;
+
+    float dt = (now - last_loop_time) / 1000000.0f;
     last_loop_time = now;
 
-    // ==========================================
-    // 1. SENSOR INGESTION
-    // ==========================================
-    BMP390_Data baro_data;
-    bmp390_read(&bmp_cal, &baro_data);
+    // 1. INPUT HANDLING
+    // --- RBF arming switch (debounced, 50 ms) ---
+    {
+        static bool     rbf_stable  = false;
+        static bool     rbf_raw     = false;
+        static uint32_t rbf_edge_ms = 0;
+        bool raw = (digitalRead(ARM_SWITCH_PIN) == HIGH);
+        if (raw != rbf_raw) { rbf_raw = raw; rbf_edge_ms = millis(); }
+        if ((millis() - rbf_edge_ms) >= 50 && raw != rbf_stable) {
+            rbf_stable = raw;
+            if (raw) {
+                if (fsm_arm(&fsm, &pyros)) {
+                    Serial.println("[ARM] Armed.");
+                } else {
+                    Serial.println("[ARM] Arm rejected — not in IDLE.");
+                    indicator_beep_error(&indicator);
+                }
+            } else {
+                fsm_disarm(&fsm, &pyros);
+                Serial.println("[ARM] Disarmed.");
+            }
+        }
+    }
 
+    // --- Serial commands ---
+    if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'D') {
+            fsm_disarm(&fsm, &pyros);
+            Serial.println("[ARM] Disarmed via serial.");
+        } else if (c == 'X') {
+            fsm_abort(&fsm);
+            pyro_safe_all(&pyros);
+            Serial.println("[ARM] Abort via serial.");
+        } else if (c == 'G') {
+            if (fsm.state != STATE_IDLE) {
+                Serial.println("[CAL] Gyro cal only allowed in IDLE.");
+            } else {
+                Serial.println("[CAL] Gyro calibration — hold perfectly still for ~2.5 s...");
+                if (lsm6dsox_calibrate_gyro(&gyro_bias)) {
+                    lsm6dsox_save_bias(&gyro_bias);
+                    Serial.println("[CAL] Gyro bias saved to EEPROM.");
+                } else {
+                    Serial.println("[CAL] Gyro cal failed — motion detected. Try again.");
+                }
+            }
+        } else if (c == 'W') {
+            logger_dump_to_sd();
+        }
+    }
+
+    // 2. SENSOR INGESTION — IMU only (baro, mag not used this flight)
     LSM6DSOX_Data imu_data;
     lsm6dsox_read(&imu_data, &gyro_bias);
 
-    mag_data raw_mag, cal_mag;
-    mag_read(&raw_mag);
-    if (raw_mag.valid) {
-        // Apply hard/soft iron calibration
-        mag_apply_calib(&mag_cal, raw_mag.mag_x, raw_mag.mag_y, raw_mag.mag_z,
-                        &cal_mag.mag_x, &cal_mag.mag_y, &cal_mag.mag_z);
-        cal_mag.valid = true;
-    } else {
-        cal_mag.valid = false;
+    // Dummy mag with valid=false — AHRS runs in 6-DOF mode
+    mag_data no_mag = {};
+
+    // 3. STATE ESTIMATION
+    float accel_up_g = -imu_data.ax;  // body X points toward tail; negate for "up"
+
+    // Accel vector magnitude and gyro rate magnitude for landed detection
+    float accel_mag_g   = sqrtf(imu_data.ax*imu_data.ax +
+                                 imu_data.ay*imu_data.ay +
+                                 imu_data.az*imu_data.az);
+    float gyro_rate_dps = sqrtf(imu_data.gx*imu_data.gx +
+                                 imu_data.gy*imu_data.gy +
+                                 imu_data.gz*imu_data.gz);
+
+    // Vertical velocity integration — only during POWERED and COAST.
+    // Gravity-corrected: subtract 1 g before converting to m/s².
+    static float vertical_velocity_ms = 0.0f;
+    if (fsm.state == STATE_POWERED || fsm.state == STATE_COAST) {
+        vertical_velocity_ms += (accel_up_g - 1.0f) * 9.81f * dt;
     }
 
-    // ==========================================
-    // 2. STATE ESTIMATION
-    // ==========================================
-    // Map the IMU's physical vertical axis to the "Positive = Up" convention.
-    // (Assuming physical +X points toward the nozzle, making -X point up)
-    float accel_up_g = -imu_data.ax; 
-    
-    // Altitude & Velocity estimation (convert Pa to hPa for the estimator)
-    alt_update(&alt, baro_data.pressure_pa / 100.0f, accel_up_g, dt);
+    mahrs_tick(&imu_data, &no_mag);
 
-    // Orientation estimation (Madgwick Filter)
-    mahrs_tick(&imu_data, &cal_mag);
     RocketAttitude attitude;
     mahrs_get_attitude(&attitude);
 
-    // ==========================================
-    // 3. FLIGHT STATE MACHINE (FSM)
-    // ==========================================
-    fsm_update(&fsm, accel_up_g, alt.altitude_m, alt.velocity_ms, 
-               imu_data.valid, baro_data.valid);
+    // 4. FLIGHT STATE MACHINE
+    fsm_update(&fsm, accel_up_g, vertical_velocity_ms, accel_mag_g, gyro_rate_dps, imu_data.valid);
 
-    // Handle one-shot events on state transitions
     if (fsm_state_changed(&fsm)) {
-        // Adjust filter gains based on flight phase (from mahrs_integration)
         mahrs_set_phase(fsm.state);
-        
-        // Log the state transition to the SD card checkpoint file
-        logger_checkpoint(fsm.state, alt.altitude_m);
 
-        // State-specific transition logic
         switch (fsm.state) {
             case STATE_POWERED:
-                // Zero out the PID integrators right as thrust begins
+                // Reset integrator at motor ignition
+                vertical_velocity_ms = 0.0f;
                 pid_reset(&pid_pitch);
                 pid_reset(&pid_yaw);
                 break;
             case STATE_APOGEE:
-                pyro_fire_drogue(&pyros);
+                // Single-chute flight — fire main at apogee, no drogue.
+                pyro_fire_main(&pyros);
                 break;
-            case STATE_MAIN:
-                pyro_fire_main(&pyros, alt.altitude_m);
+            case STATE_LANDED:
+                servo_disable();   // de-energise servos — stops buzzing and saves battery
+                Serial.println("[INFO] Landed. Send 'W' to dump flight log to SD.");
                 break;
             case STATE_ABORT:
                 pyro_safe_all(&pyros);
@@ -225,37 +189,18 @@ void loop() {
         }
     }
 
-    // ==========================================
-    // 4. CONTROL & ACTUATION
-    // ==========================================
+    // 5. CONTROL & ACTUATION
     if (fsm.state == STATE_POWERED && fsm.tvc_enabled) {
-        // Target setpoint is 0.0 degrees (straight up)
         float pitch_cmd = pid_update(&pid_pitch, 0.0f, attitude.tip_a, dt);
         float yaw_cmd   = pid_update(&pid_yaw,   0.0f, attitude.tip_b, dt);
 
         servo_set_pitch(pitch_cmd);
         servo_set_yaw(yaw_cmd);
     } else if (fsm.state >= STATE_COAST) {
-        // Lock servos to center once motor burns out to reduce drag/wobble
-        servo_center(); 
+        servo_center();
     }
 
-    // ==========================================
-    // 5. HOUSEKEEPING & LOGGING
-    // ==========================================
-    // Manage pyro firing pulse durations
+    // 6. HOUSEKEEPING
     pyro_update(&pyros);
-    
-    // Update Buzzer/LED sequences
     indicator_update(&indicator, fsm.state);
-
-    // Populate and push telemetry to the high-speed RAM buffer
-    LogRecord record;
-    record.timestamp_ms   = millis();
-    record.altitude_m     = alt.altitude_m;
-    record.velocity_ms    = alt.velocity_ms;
-    record.flight_state   = fsm.state;
-    // ... [Populate remaining record fields from attitude, imu_data, etc.] ...
-    
-    logger_write(&record);
 }

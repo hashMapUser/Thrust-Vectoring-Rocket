@@ -78,18 +78,13 @@ void pyro_fire_drogue(PyroState *pyro) {
     Serial.println("[PYRO] DROGUE FIRED");
 }
 
-void pyro_fire_main(PyroState *pyro, float altitude_m) {
+void pyro_fire_main(PyroState *pyro) {
     if (!pyro->main_armed) {
         Serial.println("[PYRO] Main fire blocked — not armed");
         return;
     }
     if (pyro->main_fired) {
         Serial.println("[PYRO] Main already fired");
-        return;
-    }
-    if (altitude_m < PYRO_MAIN_MIN_ALT_M) {
-        Serial.print("[PYRO] Main fire blocked — altitude too low: ");
-        Serial.println(altitude_m);
         return;
     }
 

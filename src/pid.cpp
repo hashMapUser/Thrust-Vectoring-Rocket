@@ -41,7 +41,7 @@ float pid_update(PIDController *pid, float setpoint, float measured, float dt) {
     // ── INTEGRAL with anti-windup ──
     // Only accumulate integral when output is not saturated.
     // This prevents the integrator from winding up when the servo
-    // is already at its limit — a common source of instability.
+    // is already at its limit 
     pid->integral += pid->ki * error * dt;
     pid->integral  = constrain(pid->integral,
                                pid->integral_min,
