@@ -44,32 +44,5 @@ void setup() {
 }
 
 void loop() {
-    // --- RBF arming pin — edge-triggered with 50 ms debounce ---
-    static bool     last_stable_high = false;
-    static bool     last_raw_high    = false;
-    static uint32_t last_edge_ms     = 0;
-    const  uint32_t DEBOUNCE_MS      = 50;
 
-    bool raw_high = (digitalRead(ARM_SWITCH_PIN) == HIGH);
-    if (raw_high != last_raw_high) {
-        last_raw_high = raw_high;
-        last_edge_ms  = millis();
-    }
-    if ((millis() - last_edge_ms) >= DEBOUNCE_MS && raw_high != last_stable_high) {
-        last_stable_high = raw_high;
-        if (raw_high) {
-            fsm_arm(&fsm) ? Serial.println("[ARM] Armed — RBF jumper pulled.")
-                          : Serial.println("[ARM] Arm rejected — not in IDLE.");
-        } else {
-            fsm_disarm(&fsm);
-            Serial.println("[ARM] Disarmed — RBF jumper re-inserted.");
-        }
-    }
-
-    // --- Serial safety overrides (disarm and abort only) ---
-    if (Serial.available()) {
-        char c = Serial.read();
-        if      (c == 'D') { fsm_disarm(&fsm); Serial.println("[ARM] Disarmed via serial."); }
-        else if (c == 'X') { fsm_abort(&fsm);  Serial.println("[ARM] Abort triggered via serial."); }
-    }
 }

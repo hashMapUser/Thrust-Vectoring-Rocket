@@ -3,23 +3,22 @@
 //
 //  Strategy
 //  --------
-//  RAM ring buffer  : high-rate writes every loop tick, zero SD
-//                     latency. Same as before.
+//  RAM ring buffer  : high-rate writes every loop tick, zero flash
+//                     latency.
 //
-//  GD25Q128 flash   : NEW. Every FLASH_PAGE_SIZE bytes of records
-//                     are flushed to flash via a 256-byte page
-//                     program. The flash write pointer is persisted
-//                     in a 4 KB header sector so a power-loss
-//                     during flight does NOT lose previously written
-//                     pages. Worst case loss = one partial page
-//                     (~3 records at 76 bytes each).
+//  GD25Q128 flash   : Every FLASH_PAGE_SIZE bytes of records are
+//                     flushed to flash via a 256-byte page program.
+//                     The flash write pointer is persisted in a 4 KB
+//                     header sector so a power-loss during flight does
+//                     NOT lose previously written pages. Worst-case
+//                     loss = one partial page (~3 records).
 //
-//  SD card          : Checkpoint file written on state transitions
-//                     (same as before). Full CSV dump on request.
-//                     logger_dump_to_sd() reads from flash, not RAM,
-//                     so it recovers data even after a power cycle.
+//  SD card          : Checkpoint file written on state transitions.
+//                     Full CSV dump on request. logger_dump_to_sd()
+//                     reads from flash, not RAM, so it recovers data
+//                     even after a power cycle.
 //
-//  Flash memory map (GD25Q128ESIGR, 16 MB):
+//  Flash memory map (GD25Q128, 16 MB):
 //  ┌─────────────┬──────────────┬──────────────────────────────┐
 //  │ 0x000000    │  4 KB sec 0  │ Header: magic, record count, │
 //  │             │              │ write ptr, checkpoint offset  │
@@ -37,62 +36,37 @@
 #include <string.h>
 #include <stdio.h>
 #include "logger.h"
+#include "flash.h"
 
 // ============================================================
-//  GD25Q128 driver — pin & SPI config
+//  Flash memory map (logger-level; chip geometry in flash.h)
 // ============================================================
-#define FLASH_CS_PIN        9           // GD25Q128 chip select
-#define FLASH_SPI_FREQ      40000000UL  // 40 MHz — safe for short PCB traces
-#define FLASH_SPI_MODE      SPI_MODE0
-
-// Command set (JEDEC-compatible)
-#define CMD_WRITE_ENABLE    0x06
-#define CMD_PAGE_PROGRAM    0x02
-#define CMD_READ_DATA       0x03
-#define CMD_SECTOR_ERASE    0x20   // 4 KB
-#define CMD_CHIP_ERASE      0xC7
-#define CMD_READ_STATUS1    0x05
-#define CMD_JEDEC_ID        0x9F
-#define CMD_RELEASE_PD      0xAB
-
-#define STATUS_WIP          (1u << 0)
-
-// Geometry
-#define FLASH_PAGE_SIZE     256u
-#define FLASH_SECTOR_SIZE   4096u
-#define FLASH_TOTAL_BYTES   (16u * 1024u * 1024u)
-
-// Memory map
 #define ADDR_HEADER         0x000000u
 #define ADDR_CHECKPOINT     0x001000u
 #define ADDR_FLIGHT_DATA    0x002000u
 
-// Persist header every N page flushes (limits sector wear)
+// Persist header every N page flushes to limit sector wear
 #define HEADER_FLUSH_INTERVAL   64u
 
 // ============================================================
-//  Flash header (packed into first 4 KB sector)
+//  Flash header (packed into the first 4 KB sector)
 // ============================================================
 #define HEADER_MAGIC    0xF17E0001u
 
-#pragma pack(push,1)
+#pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
     uint32_t record_count;
     uint32_t next_write_addr;
     uint32_t checkpoint_offset;
-    // No in-RAM padding needed: header_persist() already limits the write to
-    // min(sizeof(FlashHeader), FLASH_PAGE_SIZE) bytes, so the 4 KB sector pad
-    // was wasting RAM without any benefit.
 } FlashHeader;
 #pragma pack(pop)
 
 // ============================================================
-//  RAM ring buffer (unchanged from original)
+//  RAM ring buffer
 // ============================================================
-// DMAMEM places this in RAM2 (OCRAM2) instead of RAM1 (DTCM).
-// At 4000 × 104 bytes = ~406 KB it was the entire cause of the RAM1 overflow.
-// RAM2 has 512 KB free and is fully CPU-accessible; no functional change.
+// DMAMEM places this in RAM2 (OCRAM2) — at ~406 KB it would
+// overflow DTCM (RAM1) on the Teensy 4.0.
 DMAMEM static LogRecord  _buf[LOG_RAM_CAPACITY];
 static uint16_t   _head    = 0;
 static uint16_t   _count   = 0;
@@ -101,14 +75,14 @@ static bool       _wrapped = false;
 // ============================================================
 //  Flash state
 // ============================================================
-static bool       _flash_ready          = false;
+static bool        _flash_ready           = false;
 static FlashHeader _fhdr;
-static uint8_t    _page_buf[FLASH_PAGE_SIZE];
-static uint16_t   _page_buf_used        = 0;
-static uint32_t   _pages_since_hdr_flush = 0;
+static uint8_t     _page_buf[FLASH_PAGE_SIZE];
+static uint16_t    _page_buf_used         = 0;
+static uint32_t    _pages_since_hdr_flush = 0;
 
 // ============================================================
-//  SD state (unchanged)
+//  SD state
 // ============================================================
 static bool   _sd_ready      = false;
 static File   _checkpoint;
@@ -128,87 +102,12 @@ static const char CSV_HEADER[] =
     "state,imu_ok,baro_ok,mag_ok\n";
 
 // ============================================================
-//  Flash low-level helpers
-// ============================================================
-static inline void flash_cs_low()  { digitalWriteFast(FLASH_CS_PIN, LOW);  }
-static inline void flash_cs_high() { digitalWriteFast(FLASH_CS_PIN, HIGH); }
-
-static void flash_wait_ready() {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_READ_STATUS1);
-    while (SPI.transfer(0x00) & STATUS_WIP) {}
-    flash_cs_high();
-    SPI.endTransaction();
-}
-
-static void flash_write_enable() {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_WRITE_ENABLE);
-    flash_cs_high();
-    SPI.endTransaction();
-}
-
-static void flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len) {
-    flash_write_enable();
-    flash_wait_ready();
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_PAGE_PROGRAM);
-    SPI.transfer((addr >> 16) & 0xFF);
-    SPI.transfer((addr >>  8) & 0xFF);
-    SPI.transfer((addr >>  0) & 0xFF);
-    for (uint16_t i = 0; i < len; i++) SPI.transfer(data[i]);
-    flash_cs_high();
-    SPI.endTransaction();
-    flash_wait_ready();
-}
-
-static void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_READ_DATA);
-    SPI.transfer((addr >> 16) & 0xFF);
-    SPI.transfer((addr >>  8) & 0xFF);
-    SPI.transfer((addr >>  0) & 0xFF);
-    for (uint32_t i = 0; i < len; i++) buf[i] = SPI.transfer(0x00);
-    flash_cs_high();
-    SPI.endTransaction();
-}
-
-static void flash_erase_sector(uint32_t addr) {
-    flash_write_enable();
-    flash_wait_ready();
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_SECTOR_ERASE);
-    SPI.transfer((addr >> 16) & 0xFF);
-    SPI.transfer((addr >>  8) & 0xFF);
-    SPI.transfer((addr >>  0) & 0xFF);
-    flash_cs_high();
-    SPI.endTransaction();
-    flash_wait_ready();
-}
-
-static bool flash_check_jedec() {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_JEDEC_ID);
-    uint8_t mfr = SPI.transfer(0);  // 0xC8 = GigaDevice
-    uint8_t mem = SPI.transfer(0);  // 0x40
-    uint8_t cap = SPI.transfer(0);  // 0x18
-    flash_cs_high();
-    SPI.endTransaction();
-    return (mfr == 0xC8 && mem == 0x40 && cap == 0x18);
-}
-
-// ============================================================
 //  Flash header helpers
 // ============================================================
 static void header_persist() {
     flash_erase_sector(ADDR_HEADER);
-    flash_page_program(ADDR_HEADER, (const uint8_t *)&_fhdr,
+    flash_page_program(ADDR_HEADER,
+                       (const uint8_t *)&_fhdr,
                        sizeof(FlashHeader) < FLASH_PAGE_SIZE
                            ? (uint16_t)sizeof(FlashHeader)
                            : FLASH_PAGE_SIZE);
@@ -218,9 +117,9 @@ static void header_load() {
     flash_read(ADDR_HEADER, (uint8_t *)&_fhdr, sizeof(FlashHeader));
     if (_fhdr.magic != HEADER_MAGIC) {
         memset(&_fhdr, 0, sizeof(_fhdr));
-        _fhdr.magic           = HEADER_MAGIC;
-        _fhdr.record_count    = 0;
-        _fhdr.next_write_addr = ADDR_FLIGHT_DATA;
+        _fhdr.magic             = HEADER_MAGIC;
+        _fhdr.record_count      = 0;
+        _fhdr.next_write_addr   = ADDR_FLIGHT_DATA;
         _fhdr.checkpoint_offset = 0;
         header_persist();
         Serial.println("[LOGGER] Flash: fresh header written");
@@ -252,7 +151,7 @@ static void flush_page_buffer() {
 }
 
 // ============================================================
-//  SD helpers (unchanged from original)
+//  SD helpers
 // ============================================================
 static bool find_filename(char *out, size_t len) {
     for (int i = 1; i <= SD_MAX_FILES; i++) {
@@ -273,10 +172,10 @@ static void write_record_csv(File &f, const LogRecord *r) {
     WF(r->gx,    2);  WF(r->gy,    2);  WF(r->gz,   2);
     WF(r->ax,    4);  WF(r->ay,    4);  WF(r->az,   4);
     WF(r->mx,    4);  WF(r->my,    4);  WF(r->mz,   4);
-    WF(r->temperature_c, 2);
-    WF(r->pressure_hpa,  2);
-    WF(r->altitude_m,    2);
-    WF(r->velocity_ms,   3);
+    WF(r->temperature_c,  2);
+    WF(r->pressure_hpa,   2);
+    WF(r->altitude_m,     2);
+    WF(r->velocity_ms,    3);
     WF(r->servo_pitch_us, 1);
     WF(r->servo_yaw_us,   1);
     WF(r->pid_pitch_out,  3);
@@ -296,39 +195,33 @@ static void write_record_csv(File &f, const LogRecord *r) {
 // ============================================================
 
 bool logger_init() {
-    // --- RAM buffer ---
     _head    = 0;
     _count   = 0;
     _wrapped = false;
 
-    // --- Flash ---
-    pinMode(FLASH_CS_PIN, OUTPUT);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
-
-    // Release from power-down (safe no-op if already awake)
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    flash_cs_low();
-    SPI.transfer(CMD_RELEASE_PD);
-    flash_cs_high();
-    SPI.endTransaction();
-    delayMicroseconds(30);
-
-    if (!flash_check_jedec()) {
-        Serial.println("[LOGGER] GD25Q128 not found — check CS pin/SPI. Flash disabled.");
+    // --- Flash (SPI1: CS=0, MISO=1, MOSI=26, SCK=27) ---
+    if (!flash_init()) {
+        Serial.println("[LOGGER] GD25Q128 not found — flash disabled");
         _flash_ready = false;
     } else {
-        Serial.println("[LOGGER] GD25Q128 found (0xC8 0x40 0x18)");
         header_load();
         _page_buf_used         = 0;
         _pages_since_hdr_flush = 0;
         _flash_ready           = true;
     }
 
-    // --- SD ---
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("[LOGGER] SD not found — checkpoint disabled, RAM logging only");
+    // --- SD card (CS=7, CD=24; LOW = card inserted) ---
+    pinMode(SD_CD_PIN, INPUT_PULLUP);
+    if (digitalRead(SD_CD_PIN) == HIGH) {
+        Serial.println("[LOGGER] SD not inserted — checkpoint disabled");
         _sd_ready = false;
-        return _flash_ready;  // flash alone is still useful
+        return _flash_ready;
+    }
+
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("[LOGGER] SD init failed — checkpoint disabled");
+        _sd_ready = false;
+        return _flash_ready;
     }
 
     _checkpoint = SD.open(LOG_CHECKPOINT_FILE, FILE_WRITE);
@@ -348,19 +241,19 @@ bool logger_init() {
     _sd_ready = true;
     Serial.print("[LOGGER] SD ready. Dump → "); Serial.println(_dump_filename);
 
-    return true;  // both flash and SD up
+    return true;
 }
 
 void logger_write(const LogRecord *rec) {
     if (!rec) return;
 
-    // 1. RAM ring buffer — always, no SD latency
+    // RAM ring buffer — always, no flash latency
     _buf[_head] = *rec;
     _head = (_head + 1) % LOG_RAM_CAPACITY;
     if (_count < LOG_RAM_CAPACITY) _count++;
     else _wrapped = true;
 
-    // 2. Flash page buffer — coalesce into 256-byte pages
+    // Flash page buffer — coalesce records into 256-byte pages
     if (!_flash_ready) return;
 
     const uint8_t *src    = (const uint8_t *)rec;
@@ -385,8 +278,7 @@ void logger_write(const LogRecord *rec) {
 }
 
 void logger_checkpoint(FlightState state, float altitude_m) {
-    // Always flush page buffer on state transitions —
-    // this is the safest moment to take the ~60 µs SPI hit.
+    // Flush page buffer on state transitions — safest moment to take the SPI hit
     if (_flash_ready && _page_buf_used > 0) {
         memset(_page_buf + _page_buf_used, 0xFF, FLASH_PAGE_SIZE - _page_buf_used);
         _page_buf_used = FLASH_PAGE_SIZE;
@@ -395,8 +287,7 @@ void logger_checkpoint(FlightState state, float altitude_m) {
     }
 
     // Append a text line to the flash checkpoint sector
-    if (_flash_ready &&
-        _fhdr.checkpoint_offset < (FLASH_SECTOR_SIZE - 80u)) {
+    if (_flash_ready && _fhdr.checkpoint_offset < (FLASH_SECTOR_SIZE - 80u)) {
         char line[80];
         int n = snprintf(line, sizeof(line),
                          "T=%8lu  %-10s  ALT=%7.1f m\n",
@@ -408,7 +299,6 @@ void logger_checkpoint(FlightState state, float altitude_m) {
         }
     }
 
-    // SD checkpoint (same as before)
     if (!_sd_ready || !_checkpoint) return;
     char line[80];
     snprintf(line, sizeof(line),
@@ -420,7 +310,7 @@ void logger_checkpoint(FlightState state, float altitude_m) {
 }
 
 bool logger_dump_to_sd() {
-    // Flush any partial page first
+    // Flush any partial page before reading back
     if (_flash_ready && _page_buf_used > 0) {
         memset(_page_buf + _page_buf_used, 0xFF, FLASH_PAGE_SIZE - _page_buf_used);
         _page_buf_used = FLASH_PAGE_SIZE;
@@ -428,8 +318,6 @@ bool logger_dump_to_sd() {
         header_persist();
     }
 
-    // Decide source: prefer flash (recovers data across power cycles);
-    // fall back to RAM if flash is absent.
     bool use_flash = _flash_ready && (_fhdr.record_count > 0);
     bool use_ram   = !use_flash && (_count > 0);
 
@@ -439,8 +327,9 @@ bool logger_dump_to_sd() {
     }
 
     if (!_sd_ready) {
-        if (!SD.begin(SD_CS_PIN)) {
-            Serial.println("[LOGGER] SD still not available — dump failed");
+        pinMode(SD_CD_PIN, INPUT_PULLUP);
+        if (digitalRead(SD_CD_PIN) == HIGH || !SD.begin(SD_CS_PIN)) {
+            Serial.println("[LOGGER] SD not available — dump failed");
             return false;
         }
         _sd_ready = true;
@@ -484,7 +373,6 @@ bool logger_dump_to_sd() {
             }
         }
     } else {
-        // RAM fallback
         Serial.print("[LOGGER] Dumping RAM ("); Serial.print(_count);
         Serial.print(" records) → "); Serial.println(_dump_filename);
         uint16_t start = _wrapped ? _head : 0;

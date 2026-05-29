@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <math.h>
-#include "mmc5603nj.h"
+#include "mag.h"
 
 // --------------------------------------------------------
 // THRESHOLDS
@@ -40,8 +40,8 @@ static void mag_print_fail(const char *test, const char *reason) {
 
 static bool test_mag_init() {
     Serial.println("  Running: MMC5603NJ init / chip ID");
-    if (!mmc5603nj_init()) {
-        mag_print_fail("Mag init", "mmc5603nj_init() returned false — check I2C address and SDA/SCL");
+    if (!mag_init()) {
+        mag_print_fail("Mag init", "mag_init() returned false — check I2C address and SDA/SCL");
         return false;
     }
     mag_print_pass("Mag init / chip ID");
@@ -50,8 +50,8 @@ static bool test_mag_init() {
 
 static bool test_mag_read_valid() {
     Serial.println("  Running: Magnetometer single read");
-    MMC5603NJ_Data d;
-    mmc5603nj_read(&d);
+    mag_data d;
+    mag_read(&d);
     if (!d.valid) {
         mag_print_fail("Single read", "read returned valid=false — possible I2C timeout");
         return false;
@@ -71,8 +71,8 @@ static bool test_mag_read_valid() {
 static bool test_mag_magnitude() {
     Serial.println("  Running: Field magnitude plausibility");
 
-    MMC5603NJ_Data d;
-    mmc5603nj_read(&d);
+    mag_data d;
+    mag_read(&d);
     if (!d.valid) {
         mag_print_fail("Field magnitude", "read invalid");
         return false;
@@ -104,8 +104,8 @@ static bool test_mag_noise() {
     float min_z =  9999, max_z = -9999;
 
     for (int i = 0; i < MAG_SAMPLE_COUNT; i++) {
-        MMC5603NJ_Data d;
-        mmc5603nj_read(&d);
+        mag_data d;
+        mag_read(&d);
         if (!d.valid) {
             mag_print_fail("Noise floor", "read failed mid-sample");
             return false;
@@ -144,14 +144,14 @@ static bool test_mag_noise() {
 static bool test_mag_response() {
     Serial.println("  Running: Magnetometer axis response");
 
-    MMC5603NJ_Data baseline;
-    mmc5603nj_read(&baseline);
+    mag_data baseline;
+    mag_read(&baseline);
 
     Serial.println("    >>> Bring a phone face-down close to the sensor now <<<");
     delay(4000);
 
-    MMC5603NJ_Data stimulated;
-    mmc5603nj_read(&stimulated);
+    mag_data stimulated;
+    mag_read(&stimulated);
 
     float dx = fabsf(stimulated.mag_x - baseline.mag_x);
     float dy = fabsf(stimulated.mag_y - baseline.mag_y);
