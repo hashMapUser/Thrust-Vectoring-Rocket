@@ -8,7 +8,7 @@
 // CONFIG
 // --------------------------------------------------------
 
-#define SD_CS_PIN           7   // external SPI SD module — CS on pin 7
+#define SD_CS_PIN           BUILTIN_SDCARD
 #define SD_MAX_FILES        999
 
 // RAM ring buffer — stores high-rate flight data during flight.

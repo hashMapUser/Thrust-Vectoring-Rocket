@@ -2,10 +2,11 @@
 #include <Wire.h>
 #include <SPI.h>
 
+#include "bmp390.h"
 #include "lsm6dsox.h"
 #include "flight_sm.h"
-#include "pyro.h"
 #include "test_imu.h"
+#include "test_baro.h"
 
 // Remove-before-flight (RBF) arming pin.
 // Wire the RBF jumper between this pin and GND.
@@ -14,11 +15,12 @@
 // Change this to any free digital pin on your Teensy.
 #define ARM_SWITCH_PIN  2
 
+static BMP390_Calib bmp_cal;
 static FlightSM     fsm;
-static PyroState    pyros;
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial) {}
 
     // CS pin MUST be driven HIGH before SPI.begin().
     // If CS floats during bus init the LSM6DSOX receives garbage and
@@ -34,8 +36,8 @@ void setup() {
     delay(100);
 
     run_imu_tests();
+    run_baro_tests(&bmp_cal);
 
-    pyro_init(&pyros);
     fsm_init(&fsm);
     Serial.println("All tests complete.");
     Serial.println("Pull RBF jumper to arm. Re-insert to disarm. Send 'D' or 'X' over serial for emergency disarm/abort.");
@@ -56,13 +58,10 @@ void loop() {
     if ((millis() - last_edge_ms) >= DEBOUNCE_MS && raw_high != last_stable_high) {
         last_stable_high = raw_high;
         if (raw_high) {
-            if (fsm_arm(&fsm, &pyros)) {
-                Serial.println("[ARM] Armed — RBF jumper pulled.");
-            } else {
-                Serial.println("[ARM] Arm rejected — continuity failed or not in IDLE.");
-            }
+            fsm_arm(&fsm) ? Serial.println("[ARM] Armed — RBF jumper pulled.")
+                          : Serial.println("[ARM] Arm rejected — not in IDLE.");
         } else {
-            fsm_disarm(&fsm, &pyros);
+            fsm_disarm(&fsm);
             Serial.println("[ARM] Disarmed — RBF jumper re-inserted.");
         }
     }
@@ -70,7 +69,7 @@ void loop() {
     // --- Serial safety overrides (disarm and abort only) ---
     if (Serial.available()) {
         char c = Serial.read();
-        if      (c == 'D') { fsm_disarm(&fsm, &pyros); Serial.println("[ARM] Disarmed via serial."); }
-        else if (c == 'X') { fsm_abort(&fsm);           Serial.println("[ARM] Abort triggered via serial."); }
+        if      (c == 'D') { fsm_disarm(&fsm); Serial.println("[ARM] Disarmed via serial."); }
+        else if (c == 'X') { fsm_abort(&fsm);  Serial.println("[ARM] Abort triggered via serial."); }
     }
 }

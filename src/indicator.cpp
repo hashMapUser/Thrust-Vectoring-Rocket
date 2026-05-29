@@ -56,22 +56,6 @@ void indicator_init(IndicatorState *ind) {
     ind->led_on         = false;
 }
 
-void indicator_beep_error(IndicatorState *ind) {
-    for (int i = 0; i < 5; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        digitalWrite(LED_PIN,    HIGH);
-        delay(BEEP_SHORT);
-        digitalWrite(BUZZER_PIN, LOW);
-        digitalWrite(LED_PIN,    LOW);
-        delay(BEEP_GAP);
-    }
-    // Reset so indicator_update() resumes the normal pattern from step 0
-    ind->step           = 0;
-    ind->last_update_ms = millis();
-    ind->buzzer_on      = false;
-    ind->led_on         = false;
-}
-
 void indicator_update(IndicatorState *ind, FlightState state) {
     if (state >= 9) return;  // bounds check
 

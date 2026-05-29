@@ -38,11 +38,3 @@ void indicator_init(IndicatorState *ind);
  * Non-blocking — call every loop iteration.
  */
 void indicator_update(IndicatorState *ind, FlightState state);
-
-/**
- * Blocking one-shot error pattern: five rapid beeps.
- * Call when fsm_arm() is rejected (e.g. continuity failed).
- * Takes ~1 s. Resets indicator step on return so normal
- * pattern resumes cleanly.
- */
-void indicator_beep_error(IndicatorState *ind);

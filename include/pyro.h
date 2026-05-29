@@ -27,6 +27,10 @@
 // Typical: 500 ms for commercial e-matches
 #define PYRO_FIRE_DURATION_MS 500
 
+// Minimum altitude to allow main deploy [m AGL]
+// Prevents accidental ground firing if alt estimator glitches
+#define PYRO_MAIN_MIN_ALT_M   50.0f
+
 // --------------------------------------------------------
 // PYRO STATE
 // --------------------------------------------------------
@@ -85,10 +89,10 @@ void pyro_fire_drogue(PyroState *pyro);
 /**
  * Fire the main charge. Only fires if:
  *   - main is armed and not already fired
- * Altitude lockout removed — FSM timer guards deployment instead.
+ *   - altitude_m > PYRO_MAIN_MIN_ALT_M (safety lockout)
  * Non-blocking.
  */
-void pyro_fire_main(PyroState *pyro);
+void pyro_fire_main(PyroState *pyro, float altitude_m);
 
 /**
  * Update pyro pulse timing — call every loop iteration.
