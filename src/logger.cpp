@@ -210,7 +210,7 @@ bool logger_init() {
         _flash_ready           = true;
     }
 
-    // --- SD card (CS=7, CD=24; LOW = card inserted) ---
+    // --- SD card (CS=8, CD=24; LOW = card inserted) ---
     pinMode(SD_CD_PIN, INPUT_PULLUP);
     if (digitalRead(SD_CD_PIN) == HIGH) {
         Serial.println("[LOGGER] SD not inserted — checkpoint disabled");

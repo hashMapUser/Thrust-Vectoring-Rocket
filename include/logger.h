@@ -9,7 +9,7 @@
 // --------------------------------------------------------
 
 // SD card on Teensy 4.0 — external slot wired per pin map
-#define SD_CS_PIN           7    // chip select
+#define SD_CS_PIN           8    // chip select
 #define SD_CD_PIN           24   // card detect — LOW = card inserted
 #define SD_MAX_FILES        999
 

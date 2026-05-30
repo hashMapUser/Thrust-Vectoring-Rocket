@@ -8,8 +8,8 @@
 // --------------------------------------------------------
 
 // Teensy 4.0 PWM pins for TVC servos
-#define SERVO_PITCH_PIN      22   // controls pitch axis (Y)
-#define SERVO_YAW_PIN        23   // controls yaw axis (Z)
+#define SERVO_PITCH_PIN      18   // controls pitch axis (Y)
+#define SERVO_YAW_PIN        22   // controls yaw axis (Z)
 
 // Standard PWM pulse widths [microseconds]
 // These are starting points — calibrate per-servo on the bench

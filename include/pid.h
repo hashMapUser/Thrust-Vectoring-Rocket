@@ -12,13 +12,13 @@
 // Tuning order: P first (increase until oscillation, halve it),
 // then D (add damping), then I last (remove steady-state error).
 
-#define PID_DEFAULT_KP   2.0f   // proportional gain
-#define PID_DEFAULT_KI   0.05f  // integral gain
-#define PID_DEFAULT_KD   0.5f   // derivative gain
+#define PID_DEFAULT_KP   0.34f   // proportional gain
+#define PID_DEFAULT_KI   0.215f  // integral gain
+#define PID_DEFAULT_KD   0.05f   // derivative gain
 
 // Output limits [degrees of servo deflection]
-#define PID_OUT_MAX      10.0f
-#define PID_OUT_MIN     -10.0f
+#define PID_OUT_MAX      5.0f
+#define PID_OUT_MIN     -5.0f
 
 // Integral windup clamp — prevents integrator from building up
 // during periods when the output is saturated (e.g. at max deflection)

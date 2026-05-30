@@ -50,7 +50,7 @@ static bool test_sd_card_detect() {
  * Calls SD.begin() with the correct CS pin (pin 7).
  */
 static bool test_sd_init() {
-    Serial.println("  Running: SD init (CS pin 7)");
+    Serial.println("  Running: SD init (CS pin 8)");
     if (!SD.begin(SD_CS_PIN)) {
         sd_print_fail("SD init", "SD.begin() failed — check CS wiring and card format (FAT32)");
         return false;
@@ -181,7 +181,7 @@ static bool test_sd_filename_sequence() {
 static void run_sd_tests() {
     Serial.println("========================================");
     Serial.println("  SD CARD TEST SUITE");
-    Serial.println("  CS=pin 7   CD=pin 24");
+    Serial.println("  CS=pin 8   CD=pin 24");
     Serial.println("========================================");
 
     uint8_t passed = 0;
