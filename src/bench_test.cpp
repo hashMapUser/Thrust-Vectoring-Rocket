@@ -627,6 +627,43 @@ static void test_logger_roundtrip() {
 }
 
 // ============================================================
+//  TEST B — Buzzer (PIN_BUZZER = 3)
+// ============================================================
+static void beep(uint32_t on_ms, uint32_t off_ms) {
+    digitalWrite(PIN_BUZZER, HIGH); delay(on_ms);
+    digitalWrite(PIN_BUZZER, LOW);  delay(off_ms);
+}
+
+static void test_buzzer() {
+    print_banner("TEST B: Buzzer (pin 3)");
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+
+    Serial.println(F("  IDLE    — 1 short beep")); delay(300);
+    beep(100, 900);
+
+    Serial.println(F("  ARMED   — 2 short beeps")); delay(300);
+    beep(100, 100); beep(100, 900);
+
+    Serial.println(F("  POWERED — 3 short beeps")); delay(300);
+    beep(100, 100); beep(100, 100); beep(100, 900);
+
+    Serial.println(F("  APOGEE  — 1 long beep")); delay(300);
+    beep(600, 900);
+
+    Serial.println(F("  DESCENT — 4 short beeps")); delay(300);
+    beep(100, 100); beep(100, 100); beep(100, 100); beep(100, 900);
+
+    Serial.println(F("  LANDED  — 3 long beeps")); delay(300);
+    beep(600, 200); beep(600, 200); beep(600, 900);
+
+    Serial.println(F("  ABORT   — rapid burst")); delay(300);
+    for (int i = 0; i < 8; i++) beep(80, 80);
+
+    pass("Buzzer PASSED — if you heard all patterns");
+}
+
+// ============================================================
 //  Run all tests
 // ============================================================
 static void run_all() {
@@ -658,6 +695,7 @@ static void print_menu() {
     Serial.println(F("║  5 - SD Card (SPI)                       ║"));
     Serial.println(F("║  6 - Logger round-trip (flash → SD CSV)  ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
+    Serial.println(F("║  B - Buzzer patterns                      ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
     Serial.println(F("Send a character to begin."));
@@ -704,6 +742,7 @@ void loop() {
         case '5': test_sd();              break;
         case '6': test_logger_roundtrip(); break;
         case '7': run_all();              break;
+        case 'B': case 'b': test_buzzer(); break;
         case 'R': case 'r': print_menu(); break;
         default:
             Serial.print(F("Unknown command: "));
