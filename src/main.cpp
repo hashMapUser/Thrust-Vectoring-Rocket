@@ -2,13 +2,12 @@
 #include <Wire.h>
 #include <SPI.h>
 
+#include "board_pins.h"
 #include "lps22hb.h"
 #include "lsm6dsox.h"
 #include "flight_sm.h"
 #include "test_imu.h"
 #include "test_baro.h"
-
-// ARM_SWITCH_PIN removed — see board_pins.h PIN_ARM_SENSE (pin 24, analog in).
 
 static FlightSM fsm;
 
@@ -19,8 +18,8 @@ void setup() {
     // CS pin MUST be driven HIGH before SPI.begin().
     // If CS floats during bus init the LSM6DSOX receives garbage and
     // returns 0x00 on WHO_AM_I regardless of SPI mode or clock speed.
-    pinMode(LSM6DSOX_CS_PIN, OUTPUT);
-    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+    pinMode(PIN_IMU_CS, OUTPUT);
+    digitalWrite(PIN_IMU_CS, HIGH);
 
     SPI.begin();
     Wire.begin();

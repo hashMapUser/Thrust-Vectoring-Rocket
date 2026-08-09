@@ -113,8 +113,8 @@ typedef struct {
 
 /**
  * IMPORTANT — call this before SPI.begin():
- *   pinMode(LSM6DSOX_CS_PIN, OUTPUT);
- *   digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+ *   pinMode(PIN_IMU_CS, OUTPUT);
+ *   digitalWrite(PIN_IMU_CS, HIGH);
  *
  * Issues a software reset, verifies WHO_AM_I, then configures accel + gyro.
  *

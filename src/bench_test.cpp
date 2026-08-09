@@ -114,7 +114,7 @@ static void test_lps22hb() {
         Serial.println(F("    - 3.3V on VDD pin?"));
         Serial.println(F("    - SDA/SCL pulled up to 3.3V with 4.7k?"));
         Serial.println(F("    - I2C address: 0x5C (SA0 low) or 0x5D (SA0 high)?"));
-        Serial.println(F("    - LPS22HB_PIN_SDA/SCL match your board? (currently pins 18/19)"));
+        Serial.println(F("    - PIN_BARO_SDA/SCL match your board? (currently pins 18/19)"));
         return;
     }
     pass("lps22hb_init() OK — WHO_AM_I 0xB1 confirmed");
@@ -189,7 +189,7 @@ static void test_lsm6dsox() {
         Serial.println(F("  Checklist:"));
         Serial.println(F("    - CS pin HIGH before SPI.begin()? (done in setup())"));
         Serial.println(F("    - SPI MODE3?"));
-        Serial.println(F("    - LSM6DSOX_CS_PIN correct? (currently pin 10)"));
+        Serial.println(F("    - PIN_IMU_CS correct? (currently pin 10)"));
         Serial.println(F("    - WHO_AM_I should be 0x6C"));
         return;
     }

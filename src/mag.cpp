@@ -66,8 +66,8 @@ static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
 bool mag_init() {
     // Explicitly set pins and clock in case this runs before bmp390_init().
     // Calling Wire1.begin() more than once is safe on Teensy.
-    Wire1.setSDA(MMC5603NJ_PIN_SDA);
-    Wire1.setSCL(MMC5603NJ_PIN_SCL);
+    Wire1.setSDA(PIN_MAG_SDA);
+    Wire1.setSCL(PIN_MAG_SCL);
     Wire1.begin();
     Wire1.setClock(MMC5603NJ_I2C_CLOCK);    
 
