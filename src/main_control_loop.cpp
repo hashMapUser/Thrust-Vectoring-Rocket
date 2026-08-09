@@ -1,8 +1,13 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
+#include "Watchdog_t4.h"
 
+#include "board_pins.h"
 #include "lsm6dsox.h"
+#include "lps22hb.h"
 #include "mag.h"
+#include "alt_estimator.h"
 #include "flight_sm.h"
 #include "pid.h"
 #include "servo_driver.h"
@@ -18,11 +23,12 @@ void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag);
 void mahrs_get_attitude(RocketAttitude *out);
 void mahrs_get_quaternion(float *q0, float *q1, float *q2, float *q3);
 
-// --- HARDWARE PIN DEFS ---
-#define ARM_SWITCH_PIN 2   // RBF jumper: jumper IN = GND = safe, jumper OUT = pull-up HIGH = arm
+// --- WATCHDOG ---
+static WDT_T4<WDT3> wdt;
 
 // --- GLOBAL MODULE CONTEXTS ---
 static GyroBias       gyro_bias;
+static AltEstimator   alt_est;
 static FlightSM       fsm;
 static PIDController  pid_pitch;
 static PIDController  pid_yaw;
@@ -33,17 +39,31 @@ static IndicatorState indicator;
 const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
 uint32_t last_loop_time = 0;
 
+// --- ARM SENSE DEBOUNCE ---
+// Read PIN_ARM_SENSE via 12-bit analogRead.
+// Threshold 1614 ≈ 1.3 V on a 3.3 V reference.
+static bool arm_sense_stable  = false;
+static bool arm_sense_raw     = false;
+static uint32_t arm_edge_ms   = 0;
+
+static inline bool read_arm_sense() {
+    return analogRead(PIN_ARM_SENSE) >= ARM_SENSE_THRESHOLD;
+}
+
 void setup() {
     Serial.begin(115200);
-    while (!Serial && millis() < 3000) {}   // wait up to 3 s for USB serial
+    while (!Serial && millis() < 3000) {}
 
-    // 1. PIN & BUS SETUP
-    pinMode(ARM_SWITCH_PIN, INPUT_PULLUP);
+    // 1. ANALOG + PIN SETUP
+    analogReadResolution(12);   // 12-bit ADC for ARM_SENSE
+    pinMode(PIN_ARM_SENSE, INPUT);
 
-    pinMode(LSM6DSOX_CS_PIN, OUTPUT);
-    digitalWrite(LSM6DSOX_CS_PIN, HIGH);
+    // IMU CS must be HIGH before SPI.begin() (keeps CS deasserted during bus init)
+    pinMode(PIN_IMU_CS, OUTPUT);
+    digitalWrite(PIN_IMU_CS, HIGH);
 
     SPI.begin();
+    Wire.begin();
     delay(100);
 
     // 2. HARDWARE OUTPUTS
@@ -51,11 +71,14 @@ void setup() {
     pyro_init(&pyros);
     servo_init();
 
-    // 3. LOGGER — init before sensors so SD checkpoint is open before
-    //    any sensor faults are logged. Non-fatal if SD is absent.
+    // 3. LOGGER
     logger_init();
 
     // 4. SENSOR INIT
+    if (!lps22hb_init()) {
+        Serial.println("[WARN] LPS22HB not found — baro disabled");
+    }
+
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
         while (true) {
@@ -65,43 +88,67 @@ void setup() {
     }
     lsm6dsox_load_bias(&gyro_bias);
 
-    // 5. FILTER & FSM INIT
+    // 5. ALTITUDE ESTIMATOR INIT
+    // Take a ground pressure snapshot (baro must be initialised first).
+    // If baro is absent, init with sea-level; in-flight bias refinement will
+    // still work but altitude will be inaccurate.
+    {
+        LPS22HB_Data baro_ground;
+        lps22hb_read(&baro_ground);
+        float ground_hpa = baro_ground.valid ? (baro_ground.pressure_pa / 100.0f)
+                                              : 1013.25f;
+        alt_init(&alt_est, ground_hpa);
+    }
+
+    // 6. FILTER & FSM INIT
     mahrs_init();
     fsm_init(&fsm);
     pid_init(&pid_pitch);
     pid_init(&pid_yaw);
 
-    Serial.println("FLIGHT COMPUTER READY. WAITING FOR SWITCH.");
+    // 7. WATCHDOG — 500 ms timeout; fed every loop iteration.
+    // On watchdog reset, setup() runs again: pyro pins go LOW first via
+    // pyro_init(), servos centre via servo_init(), FSM starts in IDLE.
+    {
+        WDT_timings_t wdt_cfg;
+        wdt_cfg.timeout = 0.5f;   // 500 ms
+        wdt.begin(wdt_cfg);
+    }
+
+    Serial.println("FLIGHT COMPUTER READY. WAITING FOR ARM SWITCH.");
 }
 
 void loop() {
-    // ── 0. FIXED TIMING CONTROL ──────────────────────────────────
-    uint32_t now = micros();
-    if (now - last_loop_time < LOOP_INTERVAL_US) return;
+    // ── 0. TIMING ──────────────────────────────────────────────
+    uint32_t now_us = micros();
+    if (now_us - last_loop_time < LOOP_INTERVAL_US) return;
 
-    float dt = (now - last_loop_time) / 1000000.0f;
-    last_loop_time = now;
+    float dt = (now_us - last_loop_time) / 1000000.0f;
+    last_loop_time = now_us;
 
-    // ── 1. INPUT HANDLING ─────────────────────────────────────────
-    // RBF arming switch (debounced, 50 ms)
+    wdt.feed();   // T11: pet the watchdog every loop
+
+    uint32_t now_ms = millis();
+
+    // ── 1. ARM SENSE (T3) ─────────────────────────────────────
     {
-        static bool     rbf_stable  = false;
-        static bool     rbf_raw     = false;
-        static uint32_t rbf_edge_ms = 0;
-        bool raw = (digitalRead(ARM_SWITCH_PIN) == HIGH);
-        if (raw != rbf_raw) { rbf_raw = raw; rbf_edge_ms = millis(); }
-        if ((millis() - rbf_edge_ms) >= 50 && raw != rbf_stable) {
-            rbf_stable = raw;
+        bool raw = read_arm_sense();
+        if (raw != arm_sense_raw) { arm_sense_raw = raw; arm_edge_ms = now_ms; }
+        if ((now_ms - arm_edge_ms) >= 50 && raw != arm_sense_stable) {
+            arm_sense_stable = raw;
             if (raw) {
-                if (fsm_arm(&fsm, &pyros)) {
-                    logger_checkpoint(STATE_ARMED, 0.0f);
+                // Rising edge: attempt to arm
+                alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
+                if (fsm_arm(&fsm, &pyros, true)) {
+                    logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
                     Serial.println("[ARM] Armed.");
                 } else {
                     Serial.println("[ARM] Arm rejected — not in IDLE.");
                 }
             } else {
+                // Falling edge: disarm
                 fsm_disarm(&fsm, &pyros);
-                logger_checkpoint(STATE_IDLE, 0.0f);
+                logger_checkpoint(STATE_IDLE, alt_est.altitude_m);
                 Serial.println("[ARM] Disarmed.");
             }
         }
@@ -121,28 +168,29 @@ void loop() {
             if (fsm.state != STATE_IDLE) {
                 Serial.println("[CAL] Gyro cal only allowed in IDLE.");
             } else {
-                Serial.println("[CAL] Gyro calibration — hold still for ~2.5 s...");
                 if (lsm6dsox_calibrate_gyro(&gyro_bias)) {
                     lsm6dsox_save_bias(&gyro_bias);
                     Serial.println("[CAL] Gyro bias saved to EEPROM.");
-                } else {
-                    Serial.println("[CAL] Gyro cal failed — motion detected. Try again.");
                 }
             }
-        } else if (c == 'W') {
-            logger_dump_to_sd();
+        } else if (c == 'R') {
+            // T9: USB dump (T8 logger_finalize happens inside logger_usb_dump)
+            logger_usb_dump();
         }
     }
 
-    // ── 2. SENSOR INGESTION ───────────────────────────────────────
+    // ── 2. SENSOR INGESTION ───────────────────────────────────
     LSM6DSOX_Data imu_data;
     lsm6dsox_read(&imu_data, &gyro_bias);
 
-    // Dummy mag — AHRS runs 6-DOF only (mag not fitted this flight)
-    mag_data no_mag = {};
+    // Baro: gated by P_DA in lps22hb_read(); returns NaN when no new sample
+    LPS22HB_Data baro_data;
+    lps22hb_read(&baro_data);
 
-    // ── 3. STATE ESTIMATION ───────────────────────────────────────
-    float accel_up_g = -imu_data.ax;  // body +X toward tail; negate for "up"
+    mag_data no_mag = {};   // mag not fitted this flight
+
+    // ── 3. STATE ESTIMATION ───────────────────────────────────
+    float accel_up_g = -imu_data.ax;   // body +X toward tail; negate for "up"
 
     float accel_mag_g   = sqrtf(imu_data.ax*imu_data.ax +
                                  imu_data.ay*imu_data.ay +
@@ -151,10 +199,14 @@ void loop() {
                                  imu_data.gy*imu_data.gy +
                                  imu_data.gz*imu_data.gz);
 
-    static float vertical_velocity_ms = 0.0f;
-    if (fsm.state == STATE_POWERED || fsm.state == STATE_COAST) {
-        vertical_velocity_ms += (accel_up_g - 1.0f) * 9.81f * dt;
+    // T8: accumulate accel calibration samples during IDLE
+    if (fsm.state == STATE_IDLE) {
+        alt_calibrate_sample(&alt_est, accel_up_g);
     }
+
+    // T8: update altitude estimator every tick (NaN pressure = accel-only update)
+    float pressure_for_est = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
+    alt_update(&alt_est, pressure_for_est, accel_up_g, dt);
 
     mahrs_tick(&imu_data, &no_mag);
 
@@ -164,30 +216,27 @@ void loop() {
     float q0, q1, q2, q3;
     mahrs_get_quaternion(&q0, &q1, &q2, &q3);
 
-    // ── 4. FLIGHT STATE MACHINE ───────────────────────────────────
-    fsm_update(&fsm, accel_up_g, vertical_velocity_ms, accel_mag_g, gyro_rate_dps, imu_data.valid);
+    // ── 4. FLIGHT STATE MACHINE ───────────────────────────────
+    fsm_update(&fsm, accel_up_g, alt_est.velocity_ms,
+               accel_mag_g, gyro_rate_dps, alt_est.altitude_m, imu_data.valid);
 
     if (fsm_state_changed(&fsm)) {
         mahrs_set_phase(fsm.state);
-        logger_checkpoint(fsm.state, vertical_velocity_ms);  // altitude_m not available; use vel as proxy
+        logger_checkpoint(fsm.state, alt_est.altitude_m);
 
         switch (fsm.state) {
             case STATE_POWERED:
-                vertical_velocity_ms = 0.0f;
                 pid_reset(&pid_pitch);
                 pid_reset(&pid_yaw);
                 break;
             case STATE_MAIN:
-                // APOGEE→MAIN is an atomic double-transition inside fsm_update(), so
-                // case STATE_APOGEE is never observable here — fire main on MAIN entry instead.
-                // Altitude guard bypassed: apogee detection via velocity zero-crossing already
-                // confirms altitude; baro not fitted this flight so altitude_m would be 0.
-                pyro_fire_main(&pyros, PYRO_MAIN_MIN_ALT_M + 1.0f);
+                // G5: pass real altitude from estimator (T8)
+                pyro_fire_main(&pyros, alt_est.altitude_m);
                 break;
             case STATE_LANDED:
                 servo_disable();
-                Serial.println("[INFO] Landed. Send 'W' to dump flight log to SD.");
-                logger_dump_to_sd();   // auto-dump on landing
+                Serial.println("[INFO] Landed. Send 'R' to USB-dump flight log.");
+                logger_finalize();
                 break;
             case STATE_ABORT:
                 pyro_safe_all(&pyros);
@@ -198,7 +247,7 @@ void loop() {
         }
     }
 
-    // ── 5. CONTROL & ACTUATION ────────────────────────────────────
+    // ── 5. CONTROL & ACTUATION ────────────────────────────────
     float pitch_cmd = 0.0f;
     float yaw_cmd   = 0.0f;
 
@@ -211,60 +260,39 @@ void loop() {
         servo_center();
     }
 
-    // ── 6. HOUSEKEEPING ───────────────────────────────────────────
+    // ── 6. HOUSEKEEPING ───────────────────────────────────────
     pyro_update(&pyros);
     indicator_update(&indicator, fsm.state);
 
-    // ── 7. LOGGING ────────────────────────────────────────────────
-    // Populate LogRecord from all live sensor and estimator data.
-    // Fields match the LogRecord struct in logger.h exactly.
+    // ── 7. LOGGING ────────────────────────────────────────────
     LogRecord rec;
 
-    rec.timestamp_ms = millis();
+    rec.timestamp_ms = now_ms;
 
-    // Attitude (Madgwick Euler output, remapped to rocket frame by mahrs_get_attitude)
     rec.roll  = attitude.tip_b;
     rec.pitch = attitude.tip_a;
     rec.yaw   = attitude.spin;
+    rec.q0    = q0; rec.q1 = q1; rec.q2 = q2; rec.q3 = q3;
 
-    // Quaternion (filter frame — document axis mapping in post-processing)
-    rec.q0 = q0;
-    rec.q1 = q1;
-    rec.q2 = q2;
-    rec.q3 = q3;
+    rec.gx = imu_data.gx; rec.gy = imu_data.gy; rec.gz = imu_data.gz;
+    rec.ax = imu_data.ax; rec.ay = imu_data.ay; rec.az = imu_data.az;
 
-    // IMU — raw bias-corrected values straight from lsm6dsox_read()
-    rec.gx = imu_data.gx;   // deg/s
-    rec.gy = imu_data.gy;
-    rec.gz = imu_data.gz;
-    rec.ax = imu_data.ax;   // g
-    rec.ay = imu_data.ay;
-    rec.az = imu_data.az;
+    rec.mx = 0.0f; rec.my = 0.0f; rec.mz = 0.0f;  // mag not fitted
 
-    // Magnetometer — not fitted; log zeros with mag_valid = false
-    rec.mx = 0.0f;
-    rec.my = 0.0f;
-    rec.mz = 0.0f;
+    rec.temperature_c = baro_data.valid ? baro_data.temperature_c : NAN;
+    rec.pressure_hpa  = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
+    rec.altitude_m    = alt_est.altitude_m;      // T8: real altitude
+    rec.velocity_ms   = alt_est.velocity_ms;     // T8: estimator velocity
 
-    // Barometer — not used this flight; log zeros
-    rec.temperature_c = 0.0f;
-    rec.pressure_hpa  = 0.0f;
-
-    // Altitude estimator — velocity from IMU integration; no baro altitude yet
-    rec.altitude_m  = 0.0f;
-    rec.velocity_ms = vertical_velocity_ms;
-
-    // Control outputs — servo pulse widths and PID terms
     rec.servo_pitch_us = servo_get_pitch_us();
     rec.servo_yaw_us   = servo_get_yaw_us();
     rec.pid_pitch_out  = pitch_cmd;
     rec.pid_yaw_out    = yaw_cmd;
 
-    // System status
     rec.flight_state = (uint8_t)fsm.state;
     rec.imu_valid    = imu_data.valid;
-    rec.baro_valid   = false;   // baro not fitted this flight
-    rec.mag_valid    = false;   // mag not fitted this flight
+    rec.baro_valid   = baro_data.valid;   // T9: set correctly now that T7 is landed
+    rec.mag_valid    = false;
 
     logger_write(&rec);
 }

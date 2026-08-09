@@ -61,38 +61,31 @@ void alt_update(AltEstimator *est,
                 float dt) {
 
     if (!est->initialised) return;
-
-    // NaN guard: a single bad sensor read shouldn't be allowed to poison
-    // the integrator forever. The upstream BMP390/LSM6 drivers return
-    // NaN with valid=false on transient failures; this catches that case.
-    if (isnan(pressure_hpa) || isnan(accel_z_g) || isnan(dt)) return;
-
-    // ── BAROMETRIC ALTITUDE ──
-    // Subtract cached ground altitude to get AGL.
-    float baro_agl = pressure_to_altitude(pressure_hpa) - est->ground_altitude_m;
-    est->baro_altitude_m = baro_agl;
+    if (isnan(accel_z_g) || isnan(dt)) return;
 
     // ── INERTIAL ACCELERATION ──
-    // accel_z_g is specific force in g (1g upward when stationary on the
-    // pad, 0 in free fall). Multiply by g to get m/s², subtract 1g to
-    // remove gravity, subtract estimated bias to get inertial acceleration.
     float accel_ms2       = accel_z_g * ALT_GRAVITY;
     float accel_corrected = accel_ms2 - ALT_GRAVITY - est->accel_bias_ms2;
 
     // ── INTEGRATE ACCELERATION → VELOCITY ──
     est->velocity_ms += accel_corrected * dt;
 
-    // ── COMPLEMENTARY FILTER ──
-    // Blend inertial prediction (altitude + velocity·dt) with absolute
-    // baro altitude. Baro continually corrects integration drift.
-    est->altitude_m = ALT_ALPHA * (est->altitude_m + est->velocity_ms * dt)
-                    + (1.0f - ALT_ALPHA) * baro_agl;
+    if (!isnan(pressure_hpa)) {
+        // ── BAROMETRIC ALTITUDE (only when sensor has new data) ──
+        float baro_agl = pressure_to_altitude(pressure_hpa) - est->ground_altitude_m;
+        est->baro_altitude_m = baro_agl;
+
+        // ── COMPLEMENTARY FILTER ──
+        // Blend inertial prediction with absolute baro altitude.
+        // Only applied when baro data is fresh (P_DA was set).
+        est->altitude_m = ALT_ALPHA * (est->altitude_m + est->velocity_ms * dt)
+                        + (1.0f - ALT_ALPHA) * baro_agl;
+    } else {
+        // ── INERTIAL-ONLY PROPAGATION (baro not ready this tick) ──
+        est->altitude_m += est->velocity_ms * dt;
+    }
 
     // ── IN-FLIGHT BIAS REFINEMENT ──
-    // When velocity is near zero (briefly at apogee, or if pre-arm
-    // calibration was skipped), nudge the bias toward whatever would
-    // make the corrected accel read zero. Gain is in 1/s so the
-    // convergence rate is independent of loop frequency.
     if (fabsf(est->velocity_ms) < ALT_BIAS_VEL_GATE) {
         est->accel_bias_ms2 += accel_corrected * ALT_BIAS_GAIN_HZ * dt;
     }

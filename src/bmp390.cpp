@@ -131,10 +131,8 @@ static float compensate_pressure(uint32_t raw, const BMP390_Calib *cal) {
 // --------------------------------------------------------
 
 bool bmp390_init(BMP390_Calib *cal) {
-    // Set pins explicitly so the wiring is defined in one place (bmp390.h)
-    // rather than relying on Wire defaults
-    Wire.setSDA(BMP390_PIN_SDA);
-    Wire.setSCL(BMP390_PIN_SCL);
+    Wire.setSDA(PIN_MAG_SDA);
+    Wire.setSCL(PIN_MAG_SCL);
     Wire.begin();
     Wire.setClock(BMP390_I2C_CLOCK);
 

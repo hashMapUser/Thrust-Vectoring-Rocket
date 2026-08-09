@@ -39,12 +39,9 @@
 // I2C fast-mode clock
 #define BMP390_I2C_CLOCK     400000UL
 
-// --------------------------------------------------------
-// PIN ASSIGNMENTS (Teensy 4.0 default Wire bus)
-// Change these if you move to Wire1 or Wire2
-// --------------------------------------------------------
-#define BMP390_PIN_SDA       17
-#define BMP390_PIN_SCL       16
+// BMP390 not used this flight (replaced by LPS22HB).
+// Wire1 pins: SCL=PIN_MAG_SCL (16), SDA=PIN_MAG_SDA (17) from board_pins.h.
+#include "board_pins.h"
 
 // --------------------------------------------------------
 // STRUCTS

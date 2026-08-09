@@ -2,75 +2,41 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "board_pins.h"
+
+// PIN_SERVO_X (5) and PIN_SERVO_Y (6) come from board_pins.h.
+// Both pins are on separate FlexPWM submodules.
 
 // --------------------------------------------------------
 // SERVO CONFIG
 // --------------------------------------------------------
 
-// Teensy 4.0 PWM pins for TVC servos
-#define SERVO_PITCH_PIN      18   // controls pitch axis (Y)
-#define SERVO_YAW_PIN        22   // controls yaw axis (Z)
+// Standard PWM pulse widths [microseconds] — calibrate on bench (M3)
+#define SERVO_CENTER_US      1500
+#define SERVO_MIN_US         1000
+#define SERVO_MAX_US         2000
 
-// Standard PWM pulse widths [microseconds]
-// These are starting points — calibrate per-servo on the bench
-#define SERVO_CENTER_US      1500  // neutral / center position
-#define SERVO_MIN_US         1000  // full deflection one way
-#define SERVO_MAX_US         2000  // full deflection other way
+// Maximum TVC deflection [degrees] — set from bench measurement (M3)
+// Placeholder: spec assumed ±7°. Update after servo_range_finder run.
+#define SERVO_MAX_ANGLE_DEG  7.0f
 
-// Maximum TVC deflection angle [degrees]
-// Physical limit of your gimbal — prevents linkage damage
-#define SERVO_MAX_ANGLE_DEG  10.0f
-
-// PWM update rate [Hz] — 50 Hz is standard for analog servos
-// Digital servos can run at 200-300 Hz for faster response
+// PWM update rate
 #define SERVO_PWM_HZ         200
+
+// Direction invert flags — set after bench direction test (M4).
+// 0 = natural direction, 1 = invert (negate command before sending).
+// Confirm positive pitch command produces a RESTORING nozzle deflection.
+#define SERVO_X_INVERT       0
+#define SERVO_Y_INVERT       0
 
 // --------------------------------------------------------
 // PUBLIC API
 // --------------------------------------------------------
 
-/**
- * Initialise servo PWM outputs.
- * Centers both servos. Call once in setup().
- */
 void servo_init();
-
-/**
- * Command the pitch servo to a deflection angle.
- * Positive angle = pitch up.
- * Angle is clamped to ±SERVO_MAX_ANGLE_DEG.
- *
- * @param angle_deg  Desired deflection [degrees].
- */
 void servo_set_pitch(float angle_deg);
-
-/**
- * Command the yaw servo to a deflection angle.
- * Positive angle = yaw right.
- * Angle is clamped to ±SERVO_MAX_ANGLE_DEG.
- *
- * @param angle_deg  Desired deflection [degrees].
- */
 void servo_set_yaw(float angle_deg);
-
-/**
- * Return both servos to center position immediately.
- * Call on burnout, abort, or any fault condition.
- */
 void servo_center();
-
-/**
- * Disable servo PWM output entirely (de-energises servo).
- * Call after landing to prevent servo buzzing.
- */
 void servo_disable();
-
-/**
- * Returns current pitch servo pulse width [us] for logging.
- */
 float servo_get_pitch_us();
-
-/**
- * Returns current yaw servo pulse width [us] for logging.
- */
 float servo_get_yaw_us();

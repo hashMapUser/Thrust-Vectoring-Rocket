@@ -22,22 +22,22 @@ static SPISettings _spi_settings(LSM6DSOX_SPI_CLOCK, MSBFIRST, SPI_MODE3);
 
 static void write_register(uint8_t reg, uint8_t value) {
     SPI.beginTransaction(_spi_settings);
-    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    digitalWriteFast(PIN_IMU_CS, LOW);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.transfer(reg & 0x7F);   
     SPI.transfer(value);
-    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    digitalWriteFast(PIN_IMU_CS, HIGH);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
 }
 
 static uint8_t read_register(uint8_t reg) {
     SPI.beginTransaction(_spi_settings);
-    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    digitalWriteFast(PIN_IMU_CS, LOW);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.transfer(reg | 0x80);   
     uint8_t value = SPI.transfer(0x00);
-    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    digitalWriteFast(PIN_IMU_CS, HIGH);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
     return value;
@@ -49,14 +49,14 @@ static uint8_t read_register(uint8_t reg) {
  */
 static void read_registers(uint8_t reg, uint8_t length, uint8_t *buf) {
     SPI.beginTransaction(_spi_settings);
-    digitalWriteFast(LSM6DSOX_CS_PIN, LOW);
+    digitalWriteFast(PIN_IMU_CS, LOW);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.transfer(reg | 0x80);   // read flag
     // In-place block transfer: TX dummy bytes, RX directly into buf.
     // On Teensy 4.0 this uses the SPI peripheral's hardware transfer path
     // and is meaningfully faster than a per-byte loop at 833 Hz IMU rate.
     SPI.transfer(buf, length);
-    digitalWriteFast(LSM6DSOX_CS_PIN, HIGH);
+    digitalWriteFast(PIN_IMU_CS, HIGH);
     delayNanoseconds(CS_SETTLE_NS);
     SPI.endTransaction();
 }
@@ -77,9 +77,17 @@ bool lsm6dsox_init() {
     // CS pin setup and SPI.begin() must be called in setup() BEFORE this
     // function — see main.cpp and the note in lsm6dsox.h
 
-    // 1. Software reset — identical to working sketch
+    // 1. Software reset — poll SW_RESET bit until it self-clears (typ <50 µs).
+    // A 10 ms timeout is used; failure indicates the sensor is not responding.
+    // Keep this reset even after the 4.7K CS pull-up (H1) is fitted — it also
+    // covers brownouts where the sensor retains stale register state.
     write_register(LSM6DSOX_REG_CTRL3_C, LSM6DSOX_SW_RESET);
-    delay(50);
+    {
+        uint32_t t0 = millis();
+        while (read_register(LSM6DSOX_REG_CTRL3_C) & LSM6DSOX_SW_RESET) {
+            if (millis() - t0 > 10) return false;
+        }
+    }
 
     // 2. WHO_AM_I
     uint8_t chip_id = read_register(LSM6DSOX_REG_WHO_AM_I);

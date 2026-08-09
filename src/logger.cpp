@@ -3,25 +3,23 @@
 //
 //  Strategy
 //  --------
-//  RAM ring buffer  : high-rate writes every loop tick, zero flash
-//                     latency.
+//  RAM ring buffer  : high-rate writes every loop tick; zero flash latency.
 //
-//  GD25Q128 flash   : Every FLASH_PAGE_SIZE bytes of records are
-//                     flushed to flash via a 256-byte page program.
-//                     The flash write pointer is persisted in a 4 KB
-//                     header sector so a power-loss during flight does
-//                     NOT lose previously written pages. Worst-case
-//                     loss = one partial page (~3 records).
+//  GD25Q128 flash   : Every FLASH_PAGE_SIZE bytes of records are flushed
+//                     to flash via a 256-byte page program. The flash write
+//                     pointer is persisted in sector 0 so a power loss during
+//                     flight does NOT lose previously written pages.
+//                     Worst-case loss = one partial page (~1-2 records).
 //
-//  SD card          : Checkpoint file written on state transitions.
-//                     Full CSV dump on request. logger_dump_to_sd()
-//                     reads from flash, not RAM, so it recovers data
-//                     even after a power cycle.
+//  SD card          : Disabled for this flight (H6 — SD VDD wired to 5 V).
+//
+//  USB dump         : On receipt of byte 'R' over Serial, Teensy streams:
+//                       "TVCR" + uint16 version + uint16 record_size +
+//                       uint32 record_count + raw records + uint32 CRC32
 //
 //  Flash memory map (GD25Q128, 16 MB):
 //  ┌─────────────┬──────────────┬──────────────────────────────┐
-//  │ 0x000000    │  4 KB sec 0  │ Header: magic, record count, │
-//  │             │              │ write ptr, checkpoint offset  │
+//  │ 0x000000    │  4 KB sec 0  │ TVCR header (magic, counts…) │
 //  ├─────────────┼──────────────┼──────────────────────────────┤
 //  │ 0x001000    │  4 KB sec 1  │ Checkpoint text log           │
 //  ├─────────────┼──────────────┼──────────────────────────────┤
@@ -31,7 +29,6 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <SD.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -39,34 +36,35 @@
 #include "flash.h"
 
 // ============================================================
-//  Flash memory map (logger-level; chip geometry in flash.h)
+//  Flash memory map
 // ============================================================
 #define ADDR_HEADER         0x000000u
 #define ADDR_CHECKPOINT     0x001000u
 #define ADDR_FLIGHT_DATA    0x002000u
 
-// Persist header every N page flushes to limit sector wear
 #define HEADER_FLUSH_INTERVAL   64u
 
 // ============================================================
-//  Flash header (packed into the first 4 KB sector)
+//  TVCR flash header (packed into the first 4 KB sector)
 // ============================================================
-#define HEADER_MAGIC    0xF17E0001u
+#define HEADER_MAGIC    0x54564352u  // "TVCR"
+#define HEADER_VERSION  1u
 
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;
+    uint32_t magic;             // 0x54564352
+    uint16_t version;           // 1
+    uint16_t record_size;       // sizeof(LogRecord)
     uint32_t record_count;
-    uint32_t next_write_addr;
-    uint32_t checkpoint_offset;
+    uint32_t flight_epoch_ms;   // millis() at first logger_write() call
+    uint32_t next_write_addr;   // internal — resume pointer after power cycle
+    uint32_t checkpoint_offset; // internal — bytes used in checkpoint sector
 } FlashHeader;
 #pragma pack(pop)
 
 // ============================================================
 //  RAM ring buffer
 // ============================================================
-// DMAMEM places this in RAM2 (OCRAM2) — at ~406 KB it would
-// overflow DTCM (RAM1) on the Teensy 4.0.
 DMAMEM static LogRecord  _buf[LOG_RAM_CAPACITY];
 static uint16_t   _head    = 0;
 static uint16_t   _count   = 0;
@@ -82,24 +80,17 @@ static uint16_t    _page_buf_used         = 0;
 static uint32_t    _pages_since_hdr_flush = 0;
 
 // ============================================================
-//  SD state
+//  CRC32 (IEEE 802.3 poly 0xEDB88320)
 // ============================================================
-static bool   _sd_ready      = false;
-static File   _checkpoint;
-static char   _dump_filename[20];
-
-static const char CSV_HEADER[] =
-    "timestamp_ms,"
-    "roll,pitch,yaw,"
-    "q0,q1,q2,q3,"
-    "gx,gy,gz,"
-    "ax,ay,az,"
-    "mx,my,mz,"
-    "temp_c,pressure_hpa,"
-    "altitude_m,velocity_ms,"
-    "servo_pitch_us,servo_yaw_us,"
-    "pid_pitch,pid_yaw,"
-    "state,imu_ok,baro_ok,mag_ok\n";
+static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (crc & 1u ? 0xEDB88320u : 0u);
+        }
+    }
+    return crc;
+}
 
 // ============================================================
 //  Flash header helpers
@@ -108,18 +99,19 @@ static void header_persist() {
     flash_erase_sector(ADDR_HEADER);
     flash_page_program(ADDR_HEADER,
                        (const uint8_t *)&_fhdr,
-                       sizeof(FlashHeader) < FLASH_PAGE_SIZE
-                           ? (uint16_t)sizeof(FlashHeader)
-                           : FLASH_PAGE_SIZE);
+                       (uint16_t)sizeof(FlashHeader));
 }
 
 static void header_load() {
     flash_read(ADDR_HEADER, (uint8_t *)&_fhdr, sizeof(FlashHeader));
     if (_fhdr.magic != HEADER_MAGIC) {
         memset(&_fhdr, 0, sizeof(_fhdr));
-        _fhdr.magic             = HEADER_MAGIC;
-        _fhdr.record_count      = 0;
-        _fhdr.next_write_addr   = ADDR_FLIGHT_DATA;
+        _fhdr.magic           = HEADER_MAGIC;
+        _fhdr.version         = HEADER_VERSION;
+        _fhdr.record_size     = (uint16_t)sizeof(LogRecord);
+        _fhdr.record_count    = 0;
+        _fhdr.flight_epoch_ms = 0;
+        _fhdr.next_write_addr = ADDR_FLIGHT_DATA;
         _fhdr.checkpoint_offset = 0;
         header_persist();
         Serial.println("[LOGGER] Flash: fresh header written");
@@ -151,46 +143,6 @@ static void flush_page_buffer() {
 }
 
 // ============================================================
-//  SD helpers
-// ============================================================
-static bool find_filename(char *out, size_t len) {
-    for (int i = 1; i <= SD_MAX_FILES; i++) {
-        snprintf(out, len, "FLIGHT_%03d.CSV", i);
-        if (!SD.exists(out)) return true;
-    }
-    return false;
-}
-
-static void write_record_csv(File &f, const LogRecord *r) {
-    char tmp[32];
-    #define WF(val, dec) dtostrf(val, 1, dec, tmp); f.print(tmp); f.print(',');
-    #define WU(val)      f.print((uint32_t)(val)); f.print(',');
-
-    WU(r->timestamp_ms);
-    WF(r->roll,  2);  WF(r->pitch, 2);  WF(r->yaw,  2);
-    WF(r->q0,    5);  WF(r->q1,    5);  WF(r->q2,   5);  WF(r->q3, 5);
-    WF(r->gx,    2);  WF(r->gy,    2);  WF(r->gz,   2);
-    WF(r->ax,    4);  WF(r->ay,    4);  WF(r->az,   4);
-    WF(r->mx,    4);  WF(r->my,    4);  WF(r->mz,   4);
-    WF(r->temperature_c,  2);
-    WF(r->pressure_hpa,   2);
-    WF(r->altitude_m,     2);
-    WF(r->velocity_ms,    3);
-    WF(r->servo_pitch_us, 1);
-    WF(r->servo_yaw_us,   1);
-    WF(r->pid_pitch_out,  3);
-    WF(r->pid_yaw_out,    3);
-
-    f.print(r->flight_state);       f.print(',');
-    f.print(r->imu_valid  ? 1 : 0); f.print(',');
-    f.print(r->baro_valid ? 1 : 0); f.print(',');
-    f.println(r->mag_valid ? 1 : 0);
-
-    #undef WF
-    #undef WU
-}
-
-// ============================================================
 //  Public API
 // ============================================================
 
@@ -199,55 +151,27 @@ bool logger_init() {
     _count   = 0;
     _wrapped = false;
 
-    // --- Flash (SPI1: CS=0, MISO=1, MOSI=26, SCK=27) ---
     if (!flash_init()) {
         Serial.println("[LOGGER] GD25Q128 not found — flash disabled");
         _flash_ready = false;
-    } else {
-        header_load();
-        _page_buf_used         = 0;
-        _pages_since_hdr_flush = 0;
-        _flash_ready           = true;
+        return false;
     }
 
-    // --- SD card (CS=8, CD=24; LOW = card inserted) ---
-    pinMode(SD_CD_PIN, INPUT_PULLUP);
-    if (digitalRead(SD_CD_PIN) == HIGH) {
-        Serial.println("[LOGGER] SD not inserted — checkpoint disabled");
-        _sd_ready = false;
-        return _flash_ready;
-    }
-
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("[LOGGER] SD init failed — checkpoint disabled");
-        _sd_ready = false;
-        return _flash_ready;
-    }
-
-    _checkpoint = SD.open(LOG_CHECKPOINT_FILE, FILE_WRITE);
-    if (!_checkpoint) {
-        Serial.println("[LOGGER] Could not open checkpoint file");
-        _sd_ready = false;
-        return _flash_ready;
-    }
-
-    _checkpoint.print("\n--- BOOT ");
-    _checkpoint.print(millis());
-    _checkpoint.println(" ms ---");
-    _checkpoint.flush();
-
-    find_filename(_dump_filename, sizeof(_dump_filename));
-
-    _sd_ready = true;
-    Serial.print("[LOGGER] SD ready. Dump → "); Serial.println(_dump_filename);
-
+    header_load();
+    _page_buf_used         = 0;
+    _pages_since_hdr_flush = 0;
+    _flash_ready           = true;
     return true;
 }
 
 void logger_write(const LogRecord *rec) {
     if (!rec) return;
 
-    // RAM ring buffer — always, no flash latency
+    // Set flight epoch on the very first record written
+    if (_count == 0 && _fhdr.flight_epoch_ms == 0)
+        _fhdr.flight_epoch_ms = millis();
+
+    // RAM ring buffer — always, zero latency
     _buf[_head] = *rec;
     _head = (_head + 1) % LOG_RAM_CAPACITY;
     if (_count < LOG_RAM_CAPACITY) _count++;
@@ -278,7 +202,7 @@ void logger_write(const LogRecord *rec) {
 }
 
 void logger_checkpoint(FlightState state, float altitude_m) {
-    // Flush page buffer on state transitions — safest moment to take the SPI hit
+    // Flush page buffer on state transitions — safest moment for the SPI hit
     if (_flash_ready && _page_buf_used > 0) {
         memset(_page_buf + _page_buf_used, 0xFF, FLASH_PAGE_SIZE - _page_buf_used);
         _page_buf_used = FLASH_PAGE_SIZE;
@@ -299,106 +223,87 @@ void logger_checkpoint(FlightState state, float altitude_m) {
         }
     }
 
-    if (!_sd_ready || !_checkpoint) return;
-    char line[80];
-    snprintf(line, sizeof(line),
-             "T=%lu ms  STATE=%-10s  ALT=%.1f m  RECORDS=%u\n",
-             millis(), STATE_NAMES[(int)state], altitude_m, _count);
-    _checkpoint.print(line);
-    _checkpoint.flush();
-    Serial.print("[LOGGER] Checkpoint: "); Serial.print(line);
+    Serial.print("[LOGGER] Checkpoint: ");
+    Serial.print(STATE_NAMES[(int)state]);
+    Serial.print("  ALT=");
+    Serial.print(altitude_m, 1);
+    Serial.print(" m  records=");
+    Serial.println(_fhdr.record_count);
 }
 
-bool logger_dump_to_sd() {
-    // Flush any partial page before reading back
-    if (_flash_ready && _page_buf_used > 0) {
+void logger_finalize() {
+    if (!_flash_ready) return;
+
+    // Flush any partial page
+    if (_page_buf_used > 0) {
         memset(_page_buf + _page_buf_used, 0xFF, FLASH_PAGE_SIZE - _page_buf_used);
         _page_buf_used = FLASH_PAGE_SIZE;
         flush_page_buffer();
-        header_persist();
     }
 
-    bool use_flash = _flash_ready && (_fhdr.record_count > 0);
-    bool use_ram   = !use_flash && (_count > 0);
+    // Write final header with accurate record count and epoch
+    header_persist();
+    Serial.print("[LOGGER] Finalized: ");
+    Serial.print(_fhdr.record_count);
+    Serial.println(" records on flash");
+}
 
-    if (!use_flash && !use_ram) {
-        Serial.println("[LOGGER] Nothing to dump — buffer empty");
-        return false;
+void logger_usb_dump() {
+    logger_finalize();
+
+    if (!_flash_ready || _fhdr.record_count == 0) {
+        Serial.println("[LOGGER] Nothing to dump");
+        return;
     }
 
-    if (!_sd_ready) {
-        pinMode(SD_CD_PIN, INPUT_PULLUP);
-        if (digitalRead(SD_CD_PIN) == HIGH || !SD.begin(SD_CS_PIN)) {
-            Serial.println("[LOGGER] SD not available — dump failed");
-            return false;
-        }
-        _sd_ready = true;
-        find_filename(_dump_filename, sizeof(_dump_filename));
+    uint32_t count    = _fhdr.record_count;
+    uint32_t rec_size = sizeof(LogRecord);
+    uint32_t payload  = count * rec_size;
+
+    Serial.print("[LOGGER] Streaming ");
+    Serial.print(count);
+    Serial.print(" records (");
+    Serial.print(payload);
+    Serial.println(" bytes)...");
+
+    // ── TVCR protocol header ──────────────────────────────────────
+    // magic (4) + version (2) + record_size (2) + record_count (4) = 12 bytes
+    uint8_t hdr[12];
+    hdr[0]  = 'T'; hdr[1]  = 'V'; hdr[2]  = 'C'; hdr[3]  = 'R';
+    hdr[4]  = (uint8_t)(HEADER_VERSION & 0xFF);
+    hdr[5]  = (uint8_t)(HEADER_VERSION >> 8);
+    hdr[6]  = (uint8_t)(rec_size & 0xFF);
+    hdr[7]  = (uint8_t)(rec_size >> 8);
+    hdr[8]  = (uint8_t)(count & 0xFF);
+    hdr[9]  = (uint8_t)((count >> 8) & 0xFF);
+    hdr[10] = (uint8_t)((count >> 16) & 0xFF);
+    hdr[11] = (uint8_t)((count >> 24) & 0xFF);
+    Serial.write(hdr, 12);
+
+    // ── Raw record payload + CRC32 ────────────────────────────────
+    uint32_t crc      = 0xFFFFFFFFu;
+    uint32_t addr     = ADDR_FLIGHT_DATA;
+    uint32_t end_addr = _fhdr.next_write_addr;
+    uint8_t  chunk[256];
+
+    while (addr < end_addr) {
+        uint32_t bytes = end_addr - addr;
+        if (bytes > sizeof(chunk)) bytes = sizeof(chunk);
+        flash_read(addr, chunk, bytes);
+        Serial.write(chunk, (size_t)bytes);
+        crc = crc32_update(crc, chunk, bytes);
+        addr += bytes;
     }
 
-    if (_checkpoint) {
-        _checkpoint.print("--- DUMP START ---\n");
-        _checkpoint.flush();
-        _checkpoint.close();
-    }
+    crc ^= 0xFFFFFFFFu;
+    uint8_t crc_buf[4];
+    crc_buf[0] = (uint8_t)(crc & 0xFF);
+    crc_buf[1] = (uint8_t)((crc >> 8) & 0xFF);
+    crc_buf[2] = (uint8_t)((crc >> 16) & 0xFF);
+    crc_buf[3] = (uint8_t)((crc >> 24) & 0xFF);
+    Serial.write(crc_buf, 4);
 
-    File dump = SD.open(_dump_filename, FILE_WRITE);
-    if (!dump) {
-        Serial.print("[LOGGER] Cannot create "); Serial.println(_dump_filename);
-        return false;
-    }
-
-    dump.print(CSV_HEADER);
-    uint32_t written = 0;
-
-    if (use_flash) {
-        Serial.print("[LOGGER] Dumping flash → "); Serial.println(_dump_filename);
-        uint32_t addr = ADDR_FLIGHT_DATA;
-        uint32_t end  = _fhdr.next_write_addr;
-        LogRecord batch[4];
-        while (addr + sizeof(LogRecord) <= end) {
-            uint8_t n = 0;
-            while (n < 4 && addr + sizeof(LogRecord) <= end) {
-                flash_read(addr, (uint8_t *)&batch[n], sizeof(LogRecord));
-                addr += sizeof(LogRecord);
-                n++;
-            }
-            for (uint8_t i = 0; i < n; i++) {
-                write_record_csv(dump, &batch[i]);
-                written++;
-            }
-            if (written % 500 == 0) {
-                dump.flush();
-                Serial.print("[LOGGER] "); Serial.print(written); Serial.println(" records...");
-            }
-        }
-    } else {
-        Serial.print("[LOGGER] Dumping RAM ("); Serial.print(_count);
-        Serial.print(" records) → "); Serial.println(_dump_filename);
-        uint16_t start = _wrapped ? _head : 0;
-        for (uint16_t i = 0; i < _count; i++) {
-            write_record_csv(dump, &_buf[(start + i) % LOG_RAM_CAPACITY]);
-            written++;
-            if (written % 500 == 0) dump.flush();
-        }
-    }
-
-    dump.flush();
-    dump.close();
-
-    Serial.print("[LOGGER] Dump complete: "); Serial.print(written);
-    Serial.print(" records → "); Serial.println(_dump_filename);
-
-    _checkpoint = SD.open(LOG_CHECKPOINT_FILE, FILE_WRITE);
-    if (_checkpoint) {
-        _checkpoint.print("--- DUMP COMPLETE: ");
-        _checkpoint.print(_dump_filename);
-        _checkpoint.println(" ---");
-        _checkpoint.flush();
-    }
-
-    return true;
+    Serial.println("[LOGGER] USB dump complete");
 }
 
 uint16_t logger_record_count() { return _count; }
-bool     logger_sd_ready()     { return _sd_ready; }

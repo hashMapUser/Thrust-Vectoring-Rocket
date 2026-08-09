@@ -8,27 +8,18 @@
 // CONFIG
 // --------------------------------------------------------
 
-// SD card on Teensy 4.0 — external slot wired per pin map
-#define SD_CS_PIN           8    // chip select
-#define SD_CD_PIN           24   // card detect — LOW = card inserted
-#define SD_MAX_FILES        999
+// SD card disabled for this flight (H6: SD VDD wired to 5V).
+// Flight data logs to GD25Q128 NOR flash; dump via USB after landing.
 
-// RAM ring buffer — stores high-rate flight data during flight.
-// 4000 records × ~120 bytes each = ~480 KB
-// Teensy 4.0 has 1 MB RAM so this is safe.
-// At 100 Hz this covers 40 seconds — more than any motor burn + coast phase.
+// RAM ring buffer — absorbs high-rate writes during flight.
+// 4000 records × sizeof(LogRecord) bytes. DMAMEM places this in OCRAM2.
 #define LOG_RAM_CAPACITY    4000
 
-// Checkpoint file — small file written to SD during flight.
-// Contains only state transitions and timestamps.
-// Survives a crash when the full RAM dump cannot be written.
-#define LOG_CHECKPOINT_FILE "CHKPT.TXT"
-
 // --------------------------------------------------------
-// LOG RECORD — fixed-width struct stored in RAM
+// LOG RECORD — packed fixed-width struct for flash storage
 // --------------------------------------------------------
 
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint32_t timestamp_ms;
 
     // Attitude
@@ -39,7 +30,7 @@ typedef struct {
     float gx, gy, gz;
     float ax, ay, az;
 
-    // Magnetometer
+    // Magnetometer (zeros when not fitted)
     float mx, my, mz;
 
     // Barometer / altitude
@@ -67,42 +58,37 @@ typedef struct {
 
 /**
  * Initialise the logger.
- * Opens the checkpoint file on SD for immediate writing.
- * Allocates the RAM ring buffer.
- * @return true on success; false if SD not found.
+ * Brings up NOR flash (SPI2), loads or initialises the flash header.
+ * @return true if flash is ready; false if GD25Q128 not found.
  */
 bool logger_init();
 
 /**
- * Store one record in the RAM ring buffer.
- * Never touches SD — safe to call every loop iteration.
- * Overwrites oldest record when buffer is full (ring behavior).
+ * Store one record in the RAM ring buffer and coalesce into flash pages.
+ * Never blocks. Call every loop iteration.
  */
 void logger_write(const LogRecord *rec);
 
 /**
- * Write a state transition checkpoint to SD immediately.
- * Cheap — only writes one line of text.
+ * Write a state-transition checkpoint to the flash checkpoint sector.
  * Call on every FSM state change.
- *
- * @param state      New flight state.
- * @param altitude_m Current altitude [m].
  */
 void logger_checkpoint(FlightState state, float altitude_m);
 
 /**
- * Dump the entire RAM buffer to a new CSV file on SD.
- * Blocking — takes several seconds. Call after landing only.
- * @return true if dump succeeded.
+ * Finalise the flight: write the TVCR header (record_count, flight_epoch_ms)
+ * and flush any partial page. Call on landing or USB dump request.
  */
-bool logger_dump_to_sd();
+void logger_finalize();
 
 /**
- * How many records are currently stored in the RAM buffer.
+ * Stream all flash records over USB Serial in TVCR binary protocol.
+ * Host sends 'R'; Teensy responds with header + raw records + CRC32.
+ * Blocks until all data is sent. Call only from LANDED state.
+ */
+void logger_usb_dump();
+
+/**
+ * How many records are currently in the RAM ring buffer.
  */
 uint16_t logger_record_count();
-
-/**
- * True if SD card is available and checkpoint file is open.
- */
-bool logger_sd_ready();

@@ -2,48 +2,40 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "board_pins.h"
 
 // --------------------------------------------------------
 // PYRO CONFIG
 // --------------------------------------------------------
 
-// Output pins — use Teensy 4.0 digital pins rated for the FET drive circuit
-// These drive logic-level MOSFETs, NOT the e-match directly
-#define PYRO_DROGUE_PIN       6    // drogue ejection charge (apogee)
-#define PYRO_MAIN_PIN         8    // main ejection charge (low altitude)
+// PIN_PYRO1_FIRE (32) and PIN_PYRO2_FIRE (31) come from board_pins.h.
+// This flight: PIN_PYRO1_FIRE = main chute. PIN_PYRO2_FIRE unused.
+// H5: PYRO1_SENSE (30) and PYRO2_SENSE (33) have no ADC — continuity sensing disabled.
 
-// Continuity check pins — measure resistance across e-match
-// Uses Teensy analog input with a voltage divider on the PCB
-#define PYRO_DROGUE_CONT_PIN  A1   // Pyro Sense 1 — pin 15
-#define PYRO_MAIN_CONT_PIN    A0   // Pyro Sense 2 — pin 14
-
-// Continuity ADC thresholds — tune to your voltage divider values
-// Above CONT_GOOD = continuity present (e-match connected)
-// Below CONT_OPEN = open circuit (e-match missing or broken)
-#define PYRO_CONT_GOOD        512   // ADC counts (0–1023)
-#define PYRO_CONT_OPEN        100
-
-// Fire pulse duration [ms] — long enough to ignite e-match
-// Typical: 500 ms for commercial e-matches
-#define PYRO_FIRE_DURATION_MS 500
+// Fire pulse duration [ms].
+// 150 ms is ample for ignition; shorter pulse limits contact energy if match fails open.
+#define PYRO_FIRE_DURATION_MS 150
 
 // Minimum altitude to allow main deploy [m AGL]
-// Prevents accidental ground firing if alt estimator glitches
 #define PYRO_MAIN_MIN_ALT_M   50.0f
+
+// EEPROM — persist fired flags across brownouts so a reset cannot re-arm a spent channel.
+#define PYRO_EEPROM_ADDR      30   // bytes 30-33 (after gyro bias at 10-23)
+#define PYRO_EEPROM_MAGIC     0xF1A5u
 
 // --------------------------------------------------------
 // PYRO STATE
 // --------------------------------------------------------
 
 typedef struct {
-    bool drogue_continuity;
-    bool main_continuity;
-
     bool drogue_armed;
     bool main_armed;
 
     bool drogue_fired;
     bool main_fired;
+
+    bool drogue_firing;   // pulse currently active (replaces digitalRead on output pin)
+    bool main_firing;
 
     uint32_t drogue_fire_start_ms;
     uint32_t main_fire_start_ms;
@@ -54,54 +46,42 @@ typedef struct {
 // --------------------------------------------------------
 
 /**
- * Initialise pyro output pins and check continuity.
- * Prints continuity status to Serial.
- * Call once in setup() — pyros are NOT armed at this point.
+ * Initialise pyro output pins.
+ * Sets outputs LOW BEFORE enabling the output driver (i.MX RT init-order requirement).
+ * Loads fired flags from EEPROM — a previously fired channel stays marked fired.
+ * Continuity sensing is disabled (H5: sense pins have no ADC this flight).
  */
 void pyro_init(PyroState *pyro);
 
 /**
- * Check continuity on both channels.
- * Updates pyro->drogue_continuity and pyro->main_continuity.
- */
-void pyro_check_continuity(PyroState *pyro);
-
-/**
- * Arm both pyro channels. Only valid when:
- *   - Both channels have continuity
- *   - System is transitioning to STATE_ARMED
- * @return true if arm accepted; false if continuity check fails.
+ * Arm both pyro channels unconditionally.
+ * Continuity check removed — use bench meter before flight (H5).
+ * @return always true (kept for API compat with fsm_arm caller).
  */
 bool pyro_arm(PyroState *pyro);
 
 /**
- * Disarm both channels. Sets outputs LOW.
+ * Disarm both channels and set outputs LOW.
  */
 void pyro_disarm(PyroState *pyro);
 
 /**
- * Fire the drogue charge. Only fires if:
- *   - drogue is armed and not already fired
- * Non-blocking — call pyro_update() every loop to manage pulse timing.
+ * Fire the drogue charge. Non-blocking. Call pyro_update() every loop.
  */
 void pyro_fire_drogue(PyroState *pyro);
 
 /**
- * Fire the main charge. Only fires if:
- *   - main is armed and not already fired
- *   - altitude_m > PYRO_MAIN_MIN_ALT_M (safety lockout)
- * Non-blocking.
+ * Fire the main charge if altitude_m > PYRO_MAIN_MIN_ALT_M.
+ * Non-blocking. Call pyro_update() every loop.
  */
 void pyro_fire_main(PyroState *pyro, float altitude_m);
 
 /**
- * Update pyro pulse timing — call every loop iteration.
- * Cuts the fire pin after PYRO_FIRE_DURATION_MS has elapsed.
+ * Cut fire pins after PYRO_FIRE_DURATION_MS. Call every loop iteration.
  */
 void pyro_update(PyroState *pyro);
 
 /**
- * Force all pyro outputs LOW immediately.
- * Call on abort or any fault condition.
+ * Force all pyro outputs LOW immediately. Call on abort or fault.
  */
 void pyro_safe_all(PyroState *pyro);

@@ -2,16 +2,12 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "board_pins.h"
 
 // --------------------------------------------------------
 // GD25Q128ESIGR — SPI NOR Flash (128 Mbit / 16 MB)
-// Teensy 4.0 SPI1 bus
+// Teensy 4.0 SPI2 bus (MISO=34, MOSI=35, CS=36, SCK=37)
 // --------------------------------------------------------
-#define GD25Q128_CS_PIN     0
-#define GD25Q128_MISO_PIN   1
-#define GD25Q128_MOSI_PIN   26
-#define GD25Q128_SCK_PIN    27
-
 #define GD25Q128_SPI_FREQ   40000000UL   // 40 MHz — safe for short PCB traces
 #define GD25Q128_SPI_MODE   SPI_MODE0
 

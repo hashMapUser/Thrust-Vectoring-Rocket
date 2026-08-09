@@ -66,11 +66,10 @@
 #define MMC5603NJ_MEAS_TIMEOUT_MS 15
 
 // --------------------------------------------------------
-// PIN ASSIGNMENTS (Teensy 4.0 Wire1 bus)
-// MMC5603NJ is on a separate I2C bus from the BMP390 (Wire / pins 16-17)
+// PIN ASSIGNMENTS — from board_pins.h
+// Wire1: SCL=PIN_MAG_SCL (16), SDA=PIN_MAG_SDA (17)
 // --------------------------------------------------------
-#define MMC5603NJ_PIN_SDA       19   // Wire1 SDA — Teensy 4.0
-#define MMC5603NJ_PIN_SCL       18   // Wire1 SCL — Teensy 4.0
+#include "board_pins.h"
 
 // --------------------------------------------------------
 // DATA STRUCT
@@ -95,7 +94,7 @@ typedef struct {
 /**
  * Verify chip ID, fire SET coil to remove residual magnetization,
  * and prepare sensor for on-demand measurements.
- * Wire must already be initialized (BMP390 init handles this on the same bus).
+ * Wire must already be initialized (lps22hb_init handles this on the same bus).
  *
  * @return true on success; false if sensor absent or chip ID mismatch.
  */

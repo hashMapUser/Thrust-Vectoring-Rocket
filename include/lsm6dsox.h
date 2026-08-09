@@ -3,18 +3,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SPI.h>
+#include "board_pins.h"
 
 // --------------------------------------------------------
-// SPI CONFIG
+// SPI CONFIG (Teensy 4.0 SPI0: MOSI=11, MISO=12, SCK=13, CS=PIN_IMU_CS=10)
 // --------------------------------------------------------
-
-// --------------------------------------------------------
-// PIN ASSIGNMENTS (Teensy 4.0 default SPI bus)
-// --------------------------------------------------------
-#define LSM6DSOX_CS_PIN       10   // Chip select — your wiring
-#define LSM6DSOX_PIN_MOSI     11   // MOSI        — Teensy 4.0 hardware SPI default
-#define LSM6DSOX_PIN_MISO     12   // MISO        — Teensy 4.0 hardware SPI default
-#define LSM6DSOX_PIN_SCK      13   // Clock       — Teensy 4.0 hardware SPI default
 
 // SPI Mode 3 (CPOL=1, CPHA=1) — confirmed working on Teensy 4.0
 // 500 kHz is very conservative (chip max is 10 MHz); higher speeds caused

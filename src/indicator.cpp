@@ -1,18 +1,16 @@
 #include <Arduino.h>
 #include "indicator.h"
 
-// Beep patterns per state — encoded as arrays of durations [ms]
-// Positive = ON, negative = OFF, 0 = end of pattern
-//
-// IDLE:    single slow pulse every 1.5s   (I'm alive)
-// ARMED:   double fast beep               (armed — stand clear)
-// POWERED: triple fast beep               (motor burning)
+// Beep patterns per state: positive = ON [ms], negative = OFF [ms], 0 = end
+// IDLE:    single slow pulse  (alive)
+// ARMED:   double beep        (armed — stand clear)
+// POWERED: triple beep        (motor burning)
 // COAST:   silent
-// APOGEE:  long single beep               (apogee reached)
-// DESCENT: four short beeps               (descending)
-// MAIN:    continuous fast beep           (main deployed — find me)
-// LANDED:  SOS-ish pattern               (find me on the ground)
-// ABORT:   rapid continuous beep         (fault)
+// APOGEE:  long single beep
+// DESCENT: four short beeps
+// MAIN:    continuous fast    (find me)
+// LANDED:  three long beeps   (find me on ground)
+// ABORT:   rapid continuous   (fault)
 
 struct Pattern {
     const int16_t *steps;
@@ -46,36 +44,29 @@ static const Pattern PATTERNS[] = {
 };
 
 void indicator_init(IndicatorState *ind) {
-    pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(LED_PIN,    OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(LED_PIN,    LOW);
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
     ind->last_update_ms = millis();
     ind->step           = 0;
     ind->buzzer_on      = false;
-    ind->led_on         = false;
 }
 
 void indicator_update(IndicatorState *ind, FlightState state) {
-    if (state >= 9) return;  // bounds check
+    if (state >= 9) return;
 
-    const Pattern &pat  = PATTERNS[(int)state];
-    uint32_t now        = millis();
-    uint32_t elapsed    = now - ind->last_update_ms;
+    const Pattern &pat = PATTERNS[(int)state];
+    uint32_t now       = millis();
+    uint32_t elapsed   = now - ind->last_update_ms;
 
-    int16_t step_val = pat.steps[ind->step % pat.count];
-    uint32_t duration = (uint32_t)abs(step_val);
+    int16_t  step_val  = pat.steps[ind->step % pat.count];
+    uint32_t duration  = (uint32_t)abs(step_val);
 
     if (elapsed >= duration) {
         ind->last_update_ms = now;
         ind->step           = (ind->step + 1) % pat.count;
 
-        // Next step
-        bool active = pat.steps[ind->step % pat.count] > 0;
+        bool active    = pat.steps[ind->step % pat.count] > 0;
         ind->buzzer_on = active;
-        ind->led_on    = active;
-
-        digitalWrite(BUZZER_PIN, active ? HIGH : LOW);
-        digitalWrite(LED_PIN,    active ? HIGH : LOW);
+        digitalWrite(PIN_BUZZER, active ? HIGH : LOW);
     }
 }

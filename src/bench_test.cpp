@@ -29,17 +29,14 @@
 #include <math.h>
 
 // Pull in your actual driver headers
-#include "bmp390.h"
+#include "board_pins.h"
+#include "lps22hb.h"
 #include "lsm6dsox.h"
 #include "mag.h"
 #include "mag_calib.h"
 #include "logger.h"
 
-// ============================================================
-//  Pin assignments — must match your schematic
-// ============================================================
-#define FLASH_CS_PIN        9    // GD25Q128 chip select
-// SD_CS_PIN and LSM6DSOX_CS_PIN come from logger.h / lsm6dsox.h
+// PIN_FLASH_CS removed — use PIN_FLASH_CS (36) from board_pins.h
 
 // ============================================================
 //  GD25Q128 command set (needed for standalone flash tests)
@@ -85,43 +82,42 @@ static void info(const char *msg) {
 // ============================================================
 static void flash_wait_ready_bt() {
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_READ_STATUS1);
     uint32_t t0 = millis();
     while (SPI.transfer(0x00) & FSTATUS_WIP) {
         if (millis() - t0 > 5000) { Serial.println("  [WARN] Flash WIP timeout"); break; }
     }
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
 }
 
 static void flash_write_enable_bt() {
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_WRITE_ENABLE);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
 }
 
 // ============================================================
-//  TEST 1 — BMP390
+//  TEST 1 — LPS22HBTR
 // ============================================================
-static void test_bmp390() {
-    print_banner("TEST 1: BMP390 Barometer (I2C)");
+static void test_lps22hb() {
+    print_banner("TEST 1: LPS22HBTR Barometer (I2C)");
 
-    BMP390_Calib cal;
-    bool init_ok = bmp390_init(&cal);
+    bool init_ok = lps22hb_init();
 
     if (!init_ok) {
-        fail("bmp390_init() returned false — sensor not responding");
+        fail("lps22hb_init() returned false — sensor not responding");
         Serial.println(F("  Checklist:"));
         Serial.println(F("    - 3.3V on VDD pin?"));
         Serial.println(F("    - SDA/SCL pulled up to 3.3V with 4.7k?"));
-        Serial.println(F("    - I2C address: 0x77 (SDO high) or 0x76 (SDO low)?"));
-        Serial.println(F("    - BMP390_PIN_SDA/SCL match your board? (currently pins 17/16)"));
+        Serial.println(F("    - I2C address: 0x5C (SA0 low) or 0x5D (SA0 high)?"));
+        Serial.println(F("    - LPS22HB_PIN_SDA/SCL match your board? (currently pins 18/19)"));
         return;
     }
-    pass("bmp390_init() OK — chip ID 0x60 confirmed, calibration loaded");
+    pass("lps22hb_init() OK — WHO_AM_I 0xB1 confirmed");
 
     // Read 5 samples and print them
     Serial.println(F("  Reading 5 samples (250 ms apart):"));
@@ -129,8 +125,8 @@ static void test_bmp390() {
     float pressure_sum = 0, temp_sum = 0;
 
     for (int i = 0; i < 5; i++) {
-        BMP390_Data d;
-        bmp390_read(&cal, &d);
+        LPS22HB_Data d;
+        lps22hb_read(&d);
         Serial.print(F("    ["));
         Serial.print(i + 1);
         Serial.print(F("] valid="));
@@ -156,9 +152,9 @@ static void test_bmp390() {
     float avg_hpa  = (pressure_sum / valid_count) / 100.0f;
     float avg_temp = temp_sum / valid_count;
 
-    // Sanity: sea-level ±200 hPa, temperature 0–60 °C
+    // Sanity: sea-level ±200 hPa, temperature 0–70 °C
     if (avg_hpa < 800.0f || avg_hpa > 1100.0f) {
-        fail("Pressure out of sane range (800–1100 hPa) — calibration issue?");
+        fail("Pressure out of sane range (800–1100 hPa)");
         return;
     }
     if (avg_temp < 0.0f || avg_temp > 70.0f) {
@@ -178,7 +174,7 @@ static void test_bmp390() {
     Serial.print(alt_m, 1);
     Serial.println(F(" m  (compare to your known elevation)"));
 
-    pass("BMP390 PASSED — pressure and temperature in range");
+    pass("LPS22HBTR PASSED — pressure and temperature in range");
 }
 
 // ============================================================
@@ -379,12 +375,12 @@ static void test_flash() {
 
     // --- JEDEC ID ---
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_JEDEC_ID);
     uint8_t mfr = SPI.transfer(0);
     uint8_t mem = SPI.transfer(0);
     uint8_t cap = SPI.transfer(0);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
 
     Serial.print(F("  JEDEC ID: 0x"));
@@ -396,7 +392,7 @@ static void test_flash() {
     if (mfr != 0xC8 || mem != 0x40 || cap != 0x18) {
         fail("JEDEC ID mismatch — chip not responding or wrong part");
         Serial.println(F("  Checklist:"));
-        Serial.println(F("    - FLASH_CS_PIN = 9 correct?"));
+        Serial.println(F("    - PIN_FLASH_CS = 9 correct?"));
         Serial.println(F("    - WP# and HOLD# pins pulled HIGH via 10k to 3.3V?"));
         Serial.println(F("    - SPI MODE0, MSBFIRST?"));
         Serial.println(F("    - 3.3V on VCC?"));
@@ -411,12 +407,12 @@ static void test_flash() {
 
     flash_write_enable_bt();
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_SECTOR_ERASE);
     SPI.transfer((TEST_ADDR >> 16) & 0xFF);
     SPI.transfer((TEST_ADDR >>  8) & 0xFF);
     SPI.transfer((TEST_ADDR >>  0) & 0xFF);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
     flash_wait_ready_bt();
     Serial.println(F("done"));
@@ -424,13 +420,13 @@ static void test_flash() {
     // Verify erased (all 0xFF)
     uint8_t read_buf[32];
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_READ_DATA);
     SPI.transfer((TEST_ADDR >> 16) & 0xFF);
     SPI.transfer((TEST_ADDR >>  8) & 0xFF);
     SPI.transfer((TEST_ADDR >>  0) & 0xFF);
     for (int i = 0; i < 32; i++) read_buf[i] = SPI.transfer(0);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
 
     bool erased_ok = true;
@@ -444,25 +440,25 @@ static void test_flash() {
 
     flash_write_enable_bt();
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_PAGE_PROGRAM);
     SPI.transfer((TEST_ADDR >> 16) & 0xFF);
     SPI.transfer((TEST_ADDR >>  8) & 0xFF);
     SPI.transfer((TEST_ADDR >>  0) & 0xFF);
     for (int i = 0; i < 32; i++) SPI.transfer(write_buf[i]);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
     flash_wait_ready_bt();
 
     // Read back and verify
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_READ_DATA);
     SPI.transfer((TEST_ADDR >> 16) & 0xFF);
     SPI.transfer((TEST_ADDR >>  8) & 0xFF);
     SPI.transfer((TEST_ADDR >>  0) & 0xFF);
     for (int i = 0; i < 32; i++) read_buf[i] = SPI.transfer(0);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
 
     bool write_ok = true;
@@ -492,7 +488,7 @@ static void test_flash() {
 // ============================================================
 static void test_sd() {
     char sd_banner[64];
-    snprintf(sd_banner, sizeof(sd_banner), "TEST 5: SD Card (SPI, CS pin %d)", SD_CS_PIN);
+    snprintf(sd_banner, sizeof(sd_banner), "TEST 5: SD Card (SPI, CS pin %d)", PIN_SD_CS);
     print_banner(sd_banner);
 
     Serial.println(F("  SD card setup: FAT32, any size up to 32 GB."));
@@ -500,11 +496,11 @@ static void test_sd() {
     Serial.println(F("  If SD.begin() fails on a new card, format it FAT32 on your PC first."));
     Serial.println();
 
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!SD.begin(PIN_SD_CS)) {
         fail("SD.begin() failed");
         Serial.println(F("  Checklist:"));
         Serial.println(F("    - Card inserted in Hirose DM3AT connector?"));
-        Serial.println(F("    - SD_CS_PIN = 7 correct?"));
+        Serial.println(F("    - PIN_SD_CS = 7 correct?"));
         Serial.println(F("    - Card formatted FAT32? (not exFAT, not NTFS)"));
         Serial.println(F("    - SPI bus shared with flash — flash CS must be HIGH during SD init"));
         Serial.println(F("    - Try a different SD card (some cards fail at 3.3V)"));
@@ -552,11 +548,13 @@ static void test_sd() {
 
 // ============================================================
 //  TEST 6 — Full logger round-trip
-//  Writes 50 fake LogRecords via logger_write(), dumps to SD,
-//  reads the CSV back and checks the first and last rows.
+//  Writes 50 fake LogRecords via logger_write(), finalises the
+//  flash header, then streams via USB dump (TVCR protocol).
+//  Host side: tools/dump_flash.py — see T9 in FC_V2_SPEC.md.
+//  SD card is disabled for this flight (H6: SD VDD at 5 V).
 // ============================================================
 static void test_logger_roundtrip() {
-    print_banner("TEST 6: Logger Round-Trip (flash → SD CSV)");
+    print_banner("TEST 6: Logger Round-Trip (flash → USB TVCR dump)");
 
     info("Erasing flash and reinitialising logger...");
     // logger_erase() is declared in the updated logger.h
@@ -608,74 +606,22 @@ static void test_logger_roundtrip() {
     }
     pass("All 50 records written");
 
-    Serial.println(F("  Dumping to SD..."));
-    bool dump_ok = logger_dump_to_sd();
-    if (!dump_ok) {
-        fail("logger_dump_to_sd() failed — is SD card present?");
-        return;
-    }
-    pass("Dump completed");
+    Serial.println(F("  Finalising flash header..."));
+    logger_finalize();
+    pass("Flash header written");
 
-    // Find the file that was just written — logger names it FLIGHT_NNN.CSV
-    // Scan for any FLIGHT_*.CSV and open the most recent one.
-    Serial.println(F("  Looking for FLIGHT_NNN.CSV on SD..."));
-    char found_name[20] = "";
-    for (int i = 1; i <= 999; i++) {
-        char candidate[20];
-        snprintf(candidate, sizeof(candidate), "FLIGHT_%03d.CSV", i);
-        if (SD.exists(candidate)) {
-            strncpy(found_name, candidate, sizeof(found_name));
-        }
-    }
+    Serial.println(F("  Streaming TVCR dump over USB Serial..."));
+    Serial.println(F("  Run tools/dump_flash.py on the host to capture and decode."));
+    logger_usb_dump();
 
-    if (found_name[0] == '\0') {
-        fail("No FLIGHT_NNN.CSV found on SD after dump");
-        return;
-    }
-
-    Serial.print(F("  Found: ")); Serial.println(found_name);
-
-    File f = SD.open(found_name, FILE_READ);
-    if (!f) {
-        fail("Could not open CSV file for reading");
-        return;
-    }
-
-    // Read and print first 4 lines (header + first 3 data rows)
-    Serial.println(F("  First 4 lines of CSV:"));
-    for (int line = 0; line < 4 && f.available(); line++) {
-        String s = f.readStringUntil('\n');
-        Serial.print(F("    ")); Serial.println(s);
-    }
-
-    // Seek to end and count lines (= records + 1 for header)
-    uint32_t file_size = f.size();
-    f.close();
-
-    Serial.print(F("  File size: ")); Serial.print(file_size); Serial.println(F(" bytes"));
-    if (file_size < 100) {
-        fail("CSV file suspiciously small — likely empty or header only");
-        return;
-    }
-
-    pass("CSV file exists, has content, and header is readable");
     Serial.println();
-    Serial.println(F("  ── SD CARD RETRIEVAL GUIDE ────────────────────────────"));
+    Serial.println(F("  ── USB DUMP RETRIEVAL GUIDE ───────────────────────────"));
     Serial.println(F("  After a real flight:"));
-    Serial.println(F("    1. Power down the rocket"));
-    Serial.println(F("    2. Remove the SD card from the Hirose connector"));
-    Serial.println(F("    3. Insert into a PC via SD adapter or USB reader"));
-    Serial.println(F("    4. Open FLIGHT_NNN.CSV in Excel, Google Sheets, or"));
-    Serial.println(F("       any CSV viewer. The file is plain-text, no decoder needed."));
-    Serial.println(F("    5. Columns: timestamp_ms, roll, pitch, yaw, q0-q3,"));
-    Serial.println(F("       gx/gy/gz, ax/ay/az, mx/my/mz, temp, pressure,"));
-    Serial.println(F("       altitude, velocity, servo_pitch_us, servo_yaw_us,"));
-    Serial.println(F("       pid_pitch, pid_yaw, flight_state, imu_ok, baro_ok, mag_ok"));
-    Serial.println(F("    6. CHKPT.TXT has the state-transition log (lightweight"));
-    Serial.println(F("       crash insurance written during flight)."));
-    Serial.println(F("    7. Even if the Teensy crashes on landing, flash holds"));
-    Serial.println(F("       all data. Re-power and send 'W' to re-dump from flash."));
-    Serial.println(F("  ─────────────────────────────────────────────────────────"));
+    Serial.println(F("    1. Connect USB; open tools/dump_flash.py on the host"));
+    Serial.println(F("    2. Send 'R' over Serial — Teensy streams TVCR binary"));
+    Serial.println(F("    3. Script verifies CRC32 and converts to flight.csv"));
+    Serial.println(F("    4. DO NOT insert the SD card (H6: SD VDD at 5 V)"));
+    Serial.println(F("  ────────────────────────────────────────────────────────"));
 
     pass("Logger round-trip PASSED");
 }
@@ -684,7 +630,7 @@ static void test_logger_roundtrip() {
 //  Run all tests
 // ============================================================
 static void run_all() {
-    test_bmp390();
+    test_lps22hb();
     test_lsm6dsox();
     test_mmc5603();
     test_flash();
@@ -705,7 +651,7 @@ static void print_menu() {
     Serial.println(F("╔══════════════════════════════════════════╗"));
     Serial.println(F("║       TVC FLIGHT COMPUTER BENCH TEST     ║"));
     Serial.println(F("╠══════════════════════════════════════════╣"));
-    Serial.println(F("║  1 - BMP390 Barometer (I2C)              ║"));
+    Serial.println(F("║  1 - LPS22HBTR Barometer (I2C)           ║"));
     Serial.println(F("║  2 - LSM6DSOX IMU (SPI)                  ║"));
     Serial.println(F("║  3 - MMC5603NJ Magnetometer (I2C Wire1)  ║"));
     Serial.println(F("║  4 - GD25Q128 NOR Flash (SPI)            ║"));
@@ -725,9 +671,9 @@ void setup() {
     while (!Serial && millis() < 3000) {}   // wait up to 3 s for USB
 
     // CS pins HIGH before SPI.begin() — critical
-    pinMode(FLASH_CS_PIN,     OUTPUT); digitalWriteFast(FLASH_CS_PIN,     HIGH);
-    pinMode(LSM6DSOX_CS_PIN,  OUTPUT); digitalWriteFast(LSM6DSOX_CS_PIN,  HIGH);
-    pinMode(SD_CS_PIN,        OUTPUT); digitalWriteFast(SD_CS_PIN,         HIGH);
+    pinMode(PIN_FLASH_CS,  OUTPUT); digitalWriteFast(PIN_FLASH_CS,  HIGH);
+    pinMode(PIN_IMU_CS,    OUTPUT); digitalWriteFast(PIN_IMU_CS,    HIGH);
+    pinMode(PIN_SD_CS,     OUTPUT); digitalWriteFast(PIN_SD_CS,     HIGH);
 
     SPI.begin();
     Wire.begin();
@@ -736,9 +682,9 @@ void setup() {
 
     // Release flash from power-down
     SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
-    digitalWriteFast(FLASH_CS_PIN, LOW);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
     SPI.transfer(FCMD_RELEASE_PD);
-    digitalWriteFast(FLASH_CS_PIN, HIGH);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
     SPI.endTransaction();
     delayMicroseconds(30);
 
@@ -751,7 +697,7 @@ void loop() {
     while (Serial.available()) Serial.read();  // flush any extra chars
 
     switch (c) {
-        case '1': test_bmp390();          break;
+        case '1': test_lps22hb();         break;
         case '2': test_lsm6dsox();        break;
         case '3': test_mmc5603();         break;
         case '4': test_flash();           break;

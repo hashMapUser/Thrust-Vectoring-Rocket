@@ -16,8 +16,8 @@
 
 static const SPISettings kCfg(GD25Q128_SPI_FREQ, MSBFIRST, GD25Q128_SPI_MODE);
 
-static inline void cs_low()  { digitalWriteFast(GD25Q128_CS_PIN, LOW);  }
-static inline void cs_high() { digitalWriteFast(GD25Q128_CS_PIN, HIGH); }
+static inline void cs_low()  { digitalWriteFast(PIN_FLASH_CS, LOW);  }
+static inline void cs_high() { digitalWriteFast(PIN_FLASH_CS, HIGH); }
 
 static void write_enable() {
     SPI1.beginTransaction(kCfg);
@@ -41,12 +41,12 @@ void flash_wait_ready() {
 }
 
 bool flash_init() {
-    pinMode(GD25Q128_CS_PIN, OUTPUT);
-    digitalWriteFast(GD25Q128_CS_PIN, HIGH);
+    pinMode(PIN_FLASH_CS, OUTPUT);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
 
-    SPI1.setMOSI(GD25Q128_MOSI_PIN);
-    SPI1.setMISO(GD25Q128_MISO_PIN);
-    SPI1.setSCK(GD25Q128_SCK_PIN);
+    SPI1.setMOSI(PIN_FLASH_MOSI);
+    SPI1.setMISO(PIN_FLASH_MISO);
+    SPI1.setSCK(PIN_FLASH_SCK);
     SPI1.begin();
 
     // Release from power-down; safe no-op if already awake
