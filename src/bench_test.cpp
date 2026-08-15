@@ -35,6 +35,7 @@
 #include "mag.h"
 #include "mag_calib.h"
 #include "logger.h"
+#include "servo_driver.h"
 
 // PIN_FLASH_CS removed — use PIN_FLASH_CS (36) from board_pins.h
 
@@ -627,6 +628,99 @@ static void test_logger_roundtrip() {
 }
 
 // ============================================================
+//  TEST S — Servos (PIN_SERVO_X=5, PIN_SERVO_Y=6)
+//  Watch the TVC mount physically while this runs.
+//  Expected travel: ±7° (SERVO_MAX_ANGLE_DEG) from centre.
+// ============================================================
+static void test_servos() {
+    print_banner("TEST S: TVC Servos (X=pin5, Y=pin6)");
+    servo_init();
+
+    auto sweep = [](const char *name, auto set_fn) {
+        Serial.print(F("  ")); Serial.print(name);
+
+        Serial.print(F(" -> centre (1500 us) ... "));
+        set_fn(0.0f); delay(600);
+
+        Serial.print(F("+7deg ... "));
+        set_fn(SERVO_MAX_ANGLE_DEG); delay(800);
+
+        Serial.print(F("-7deg ... "));
+        set_fn(-SERVO_MAX_ANGLE_DEG); delay(800);
+
+        Serial.println(F("centre"));
+        set_fn(0.0f); delay(600);
+    };
+
+    sweep("SERVO X (pitch)", servo_set_pitch);
+    sweep("SERVO Y (yaw)  ", servo_set_yaw);
+
+    // Diagonal corners to verify independence
+    Serial.println(F("  Corner sweep (both axes together):"));
+    const float ang = SERVO_MAX_ANGLE_DEG;
+    float corners[4][2] = { {ang,ang}, {ang,-ang}, {-ang,-ang}, {-ang,ang} };
+    for (int i = 0; i < 4; i++) {
+        Serial.print(F("    pitch=")); Serial.print(corners[i][0], 1);
+        Serial.print(F("  yaw="));    Serial.println(corners[i][1], 1);
+        servo_set_pitch(corners[i][0]);
+        servo_set_yaw(corners[i][1]);
+        delay(700);
+    }
+    servo_center();
+    Serial.println(F("  Centred."));
+
+    Serial.print(F("  Final pulse widths — X: "));
+    Serial.print(servo_get_pitch_us(), 0);
+    Serial.print(F(" us  Y: "));
+    Serial.print(servo_get_yaw_us(), 0);
+    Serial.println(F(" us  (both should be ~1500)"));
+
+    pass("Servos PASSED — confirm physical travel matched printout");
+}
+
+// ============================================================
+//  TEST L — Status LEDs (pins 4, 33, 30)
+// ============================================================
+static void test_leds() {
+    print_banner("TEST L: Status LEDs (GREEN=4, WHITE=33, RED=30)");
+
+    pinMode(PIN_LED_GREEN, OUTPUT);
+    pinMode(PIN_LED_WHITE, OUTPUT);
+    pinMode(PIN_LED_RED,   OUTPUT);
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_WHITE, LOW);
+    digitalWrite(PIN_LED_RED,   LOW);
+
+    struct { const char *name; uint8_t pin; } leds[] = {
+        { "GREEN (pin 4)",  PIN_LED_GREEN },
+        { "WHITE (pin 33)", PIN_LED_WHITE },
+        { "RED   (pin 30)", PIN_LED_RED   },
+    };
+
+    for (int i = 0; i < 3; i++) {
+        Serial.print(F("  ON  — ")); Serial.println(leds[i].name);
+        digitalWrite(leds[i].pin, HIGH);
+        delay(800);
+        Serial.print(F("  OFF — ")); Serial.println(leds[i].name);
+        digitalWrite(leds[i].pin, LOW);
+        delay(300);
+    }
+
+    // All on together
+    Serial.println(F("  ALL ON"));
+    digitalWrite(PIN_LED_GREEN, HIGH);
+    digitalWrite(PIN_LED_WHITE, HIGH);
+    digitalWrite(PIN_LED_RED,   HIGH);
+    delay(1000);
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_WHITE, LOW);
+    digitalWrite(PIN_LED_RED,   LOW);
+    Serial.println(F("  ALL OFF"));
+
+    pass("LEDs PASSED — confirm each lit in sequence, then all together");
+}
+
+// ============================================================
 //  TEST B — Buzzer (PIN_BUZZER = 3)
 // ============================================================
 static void beep(uint32_t on_ms, uint32_t off_ms) {
@@ -695,6 +789,8 @@ static void print_menu() {
     Serial.println(F("║  5 - SD Card (SPI)                       ║"));
     Serial.println(F("║  6 - Logger round-trip (flash → SD CSV)  ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
+    Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
+    Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
@@ -742,6 +838,8 @@ void loop() {
         case '5': test_sd();              break;
         case '6': test_logger_roundtrip(); break;
         case '7': run_all();              break;
+        case 'S': case 's': test_servos(); break;
+        case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
         case 'R': case 'r': print_menu(); break;
         default:

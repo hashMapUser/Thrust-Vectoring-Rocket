@@ -40,11 +40,16 @@
 #define PIN_PYRO1_FIRE   32   // main chute (single-deploy flight)
 #define PIN_PYRO2_FIRE   31   // unused this flight
 
+// --- Status LEDs ---
+#define PIN_LED_GREEN    4
+#define PIN_LED_WHITE    33
+#define PIN_LED_RED      30
+
 // --- Arming sense (analog in, A10) ---
 // ~2.69 V armed (SW401 closed, PYRO_PWR present), 0 V safe
 #define PIN_ARM_SENSE    24
 
-// --- Disabled / no-ADC pins (documented only — do not use for ADC) ---
-// PIN_BAT_VOLTAGE  = 2  (no ADC on this Teensy pin)
-// PIN_PYRO1_SENSE  = 30 (no ADC)
-// PIN_PYRO2_SENSE  = 33 (no ADC)
+// --- Documented-only pins (do not drive during flight) ---
+// PIN_BAT_VOLTAGE    = 14  (A0, analog — no firmware use this revision)
+// PIN_PYRO1_SENSE    = 22  (A8, no continuity telemetry per H5)
+// PIN_PYRO2_SENSE    = 23  (A9, no continuity telemetry per H5)
