@@ -13,6 +13,9 @@
 #include "servo_driver.h"
 #include "pyro.h"
 #include "indicator.h"
+#include "buzzer.h"
+
+extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 #include "logger.h"
 
 // Forward declarations for mahrs_integration.cpp
@@ -34,6 +37,7 @@ static PIDController  pid_pitch;
 static PIDController  pid_yaw;
 static PyroState      pyros;
 static IndicatorState indicator;
+static buzzer_t       buzz;
 
 // --- TIMING ---
 const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
@@ -68,6 +72,8 @@ void setup() {
 
     // 2. HARDWARE OUTPUTS
     indicator_init(&indicator);
+    buzzer_init(&buzz, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
+    buzzer_set(&buzz, BUZZ_BOOT);
     pyro_init(&pyros);
     servo_init();
 
@@ -81,10 +87,8 @@ void setup() {
 
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
-        while (true) {
-            indicator_update(&indicator, STATE_ABORT);
-            delay(10);
-        }
+        buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
+        while (true) { buzzer_update(&buzz); delay(10); }
     }
     lsm6dsox_load_bias(&gyro_bias);
 
@@ -115,6 +119,7 @@ void setup() {
         wdt.begin(wdt_cfg);
     }
 
+    buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
     Serial.println("FLIGHT COMPUTER READY. WAITING FOR ARM SWITCH.");
 }
 
@@ -141,6 +146,7 @@ void loop() {
                 alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
                 if (fsm_arm(&fsm, &pyros, true)) {
                     logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
+                    buzzer_set(&buzz, BUZZ_ARMED);
                     Serial.println("[ARM] Armed.");
                 } else {
                     Serial.println("[ARM] Arm rejected — not in IDLE.");
@@ -149,6 +155,7 @@ void loop() {
                 // Falling edge: disarm
                 fsm_disarm(&fsm, &pyros);
                 logger_checkpoint(STATE_IDLE, alt_est.altitude_m);
+                buzzer_set(&buzz, BUZZ_IDLE);
                 Serial.println("[ARM] Disarmed.");
             }
         }
@@ -235,12 +242,14 @@ void loop() {
                 break;
             case STATE_LANDED:
                 servo_disable();
+                buzzer_set(&buzz, BUZZ_LOCATOR);
                 Serial.println("[INFO] Landed. Send 'R' to USB-dump flight log.");
                 logger_finalize();
                 break;
             case STATE_ABORT:
                 pyro_safe_all(&pyros);
                 servo_center();
+                buzzer_off(&buzz);
                 break;
             default:
                 break;
@@ -263,6 +272,7 @@ void loop() {
     // ── 6. HOUSEKEEPING ───────────────────────────────────────
     pyro_update(&pyros);
     indicator_update(&indicator, fsm.state);
+    buzzer_update(&buzz);
 
     // ── 7. LOGGING ────────────────────────────────────────────
     LogRecord rec;

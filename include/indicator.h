@@ -1,36 +1,15 @@
 #pragma once
-
-#include <Arduino.h>
+/* Buzzer patterns moved to buzzer.h / buzzer.c (T13).
+ * This header is retained as a stub; indicator_update() is a no-op. */
 #include "flight_sm.h"
-#include "board_pins.h"
 
-// PIN_BUZZER (3) comes from board_pins.h.
-// H7: No controllable LED exists on this board. Buzzer only.
+typedef struct { uint8_t _unused; } IndicatorState;
 
-// Beep pattern timing [ms]
-#define BEEP_SHORT    80
-#define BEEP_LONG     400
-#define BEEP_GAP      120
-#define PATTERN_GAP   1500  // pause between pattern repeats
-
-// --------------------------------------------------------
-// INDICATOR STATE
-// --------------------------------------------------------
-
-typedef struct {
-    uint32_t last_update_ms;
-    uint8_t  step;
-    bool     buzzer_on;
-} IndicatorState;
-
-// --------------------------------------------------------
-// PUBLIC API
-// --------------------------------------------------------
-
-void indicator_init(IndicatorState *ind);
-
-/**
- * Update buzzer pattern based on current flight state.
- * Non-blocking — call every loop iteration.
- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void indicator_init  (IndicatorState *ind);
 void indicator_update(IndicatorState *ind, FlightState state);
+#ifdef __cplusplus
+}
+#endif

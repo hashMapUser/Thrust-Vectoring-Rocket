@@ -36,6 +36,9 @@
 #include "mag_calib.h"
 #include "logger.h"
 #include "servo_driver.h"
+#include "buzzer.h"
+
+extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 
 // PIN_FLASH_CS removed — use PIN_FLASH_CS (36) from board_pins.h
 
@@ -721,40 +724,37 @@ static void test_leds() {
 }
 
 // ============================================================
-//  TEST B — Buzzer (PIN_BUZZER = 3)
+//  TEST B — Buzzer HAL (PIN_BUZZER = 3, hardware PWM via FlexPWM)
 // ============================================================
-static void beep(uint32_t on_ms, uint32_t off_ms) {
-    digitalWrite(PIN_BUZZER, HIGH); delay(on_ms);
-    digitalWrite(PIN_BUZZER, LOW);  delay(off_ms);
+static void run_pattern(buzzer_t *b, buzzer_pattern_t p,
+                        const char *name, uint32_t listen_ms) {
+    Serial.print(F("  ")); Serial.print(name); Serial.print(F(" ... "));
+    buzzer_set(b, p);
+    uint32_t t0 = millis();
+    while (millis() - t0 < listen_ms) buzzer_update(b);
+    buzzer_off(b);
+    delay(300);
+    Serial.println(F("done"));
 }
 
 static void test_buzzer() {
-    print_banner("TEST B: Buzzer (pin 3)");
-    pinMode(PIN_BUZZER, OUTPUT);
-    digitalWrite(PIN_BUZZER, LOW);
+    print_banner("TEST B: Buzzer HAL (hardware PWM, pin 3)");
+    Serial.print(F("  Frequency: ")); Serial.print(BUZZER_FREQ_HZ);
+    Serial.println(F(" Hz  (edit BUZZER_FREQ_HZ in board_pins.h after sweep)"));
 
-    Serial.println(F("  IDLE    — 1 short beep")); delay(300);
-    beep(100, 900);
+    buzzer_t b;
+    buzzer_init(&b, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
 
-    Serial.println(F("  ARMED   — 2 short beeps")); delay(300);
-    beep(100, 100); beep(100, 900);
+    run_pattern(&b, BUZZ_BOOT,          "BOOT         (1 chirp, holds)", 500);
+    run_pattern(&b, BUZZ_SELFTEST_PASS, "SELFTEST PASS (2 chirps, holds)", 700);
+    run_pattern(&b, BUZZ_SELFTEST_FAIL, "SELFTEST FAIL (3 long tones)",   2000);
+    run_pattern(&b, BUZZ_IDLE,          "IDLE          (chirp/3s, 4s)",   4000);
+    run_pattern(&b, BUZZ_ARMED,         "ARMED         (dbl chirp/1s, 3s)", 3000);
+    run_pattern(&b, BUZZ_LOCATOR,       "LOCATOR       (1 Hz, 3s)",       3000);
 
-    Serial.println(F("  POWERED — 3 short beeps")); delay(300);
-    beep(100, 100); beep(100, 100); beep(100, 900);
-
-    Serial.println(F("  APOGEE  — 1 long beep")); delay(300);
-    beep(600, 900);
-
-    Serial.println(F("  DESCENT — 4 short beeps")); delay(300);
-    beep(100, 100); beep(100, 100); beep(100, 100); beep(100, 900);
-
-    Serial.println(F("  LANDED  — 3 long beeps")); delay(300);
-    beep(600, 200); beep(600, 200); beep(600, 900);
-
-    Serial.println(F("  ABORT   — rapid burst")); delay(300);
-    for (int i = 0; i < 8; i++) beep(80, 80);
-
-    pass("Buzzer PASSED — if you heard all patterns");
+    Serial.println(F("  Frequency sweep tip: change BUZZER_FREQ_HZ in 100 Hz steps"));
+    Serial.println(F("  (1500-4500 Hz) and re-run 'B' — pick the loudest frequency."));
+    pass("Buzzer PASSED — confirm tone was audible on each pattern");
 }
 
 // ============================================================
