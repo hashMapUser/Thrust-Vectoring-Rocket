@@ -20,11 +20,11 @@ static inline void cs_low()  { digitalWriteFast(PIN_FLASH_CS, LOW);  }
 static inline void cs_high() { digitalWriteFast(PIN_FLASH_CS, HIGH); }
 
 static void write_enable() {
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_WRITE_ENABLE);
+    SPI2.transfer(CMD_WRITE_ENABLE);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
 }
 
 // --------------------------------------------------------
@@ -32,40 +32,40 @@ static void write_enable() {
 // --------------------------------------------------------
 
 void flash_wait_ready() {
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_READ_STATUS1);
-    while (SPI1.transfer(0x00) & STATUS_WIP) {}
+    SPI2.transfer(CMD_READ_STATUS1);
+    while (SPI2.transfer(0x00) & STATUS_WIP) {}
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
 }
 
 bool flash_init() {
     pinMode(PIN_FLASH_CS, OUTPUT);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
 
-    SPI1.setMOSI(PIN_FLASH_MOSI);
-    SPI1.setMISO(PIN_FLASH_MISO);
-    SPI1.setSCK(PIN_FLASH_SCK);
-    SPI1.begin();
+    SPI2.setMOSI(PIN_FLASH_MOSI);
+    SPI2.setMISO(PIN_FLASH_MISO);
+    SPI2.setSCK(PIN_FLASH_SCK);
+    SPI2.begin();
 
     // Release from power-down; safe no-op if already awake
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_RELEASE_PD);
+    SPI2.transfer(CMD_RELEASE_PD);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
     delayMicroseconds(30);  // tRES1: 20 µs max
 
     // Verify JEDEC ID
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_JEDEC_ID);
-    uint8_t mfr = SPI1.transfer(0x00);
-    uint8_t mem = SPI1.transfer(0x00);
-    uint8_t cap = SPI1.transfer(0x00);
+    SPI2.transfer(CMD_JEDEC_ID);
+    uint8_t mfr = SPI2.transfer(0x00);
+    uint8_t mem = SPI2.transfer(0x00);
+    uint8_t cap = SPI2.transfer(0x00);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
 
     if (mfr != GD25Q128_MFR_ID || mem != GD25Q128_MEM_TYPE || cap != GD25Q128_CAPACITY) {
         Serial.print("[FLASH] JEDEC mismatch: 0x");
@@ -79,53 +79,53 @@ bool flash_init() {
 }
 
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_READ_DATA);
-    SPI1.transfer((addr >> 16) & 0xFF);
-    SPI1.transfer((addr >>  8) & 0xFF);
-    SPI1.transfer((addr >>  0) & 0xFF);
-    for (uint32_t i = 0; i < len; i++) buf[i] = SPI1.transfer(0x00);
+    SPI2.transfer(CMD_READ_DATA);
+    SPI2.transfer((addr >> 16) & 0xFF);
+    SPI2.transfer((addr >>  8) & 0xFF);
+    SPI2.transfer((addr >>  0) & 0xFF);
+    for (uint32_t i = 0; i < len; i++) buf[i] = SPI2.transfer(0x00);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
 }
 
 void flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len) {
     write_enable();
     flash_wait_ready();
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_PAGE_PROGRAM);
-    SPI1.transfer((addr >> 16) & 0xFF);
-    SPI1.transfer((addr >>  8) & 0xFF);
-    SPI1.transfer((addr >>  0) & 0xFF);
-    for (uint16_t i = 0; i < len; i++) SPI1.transfer(data[i]);
+    SPI2.transfer(CMD_PAGE_PROGRAM);
+    SPI2.transfer((addr >> 16) & 0xFF);
+    SPI2.transfer((addr >>  8) & 0xFF);
+    SPI2.transfer((addr >>  0) & 0xFF);
+    for (uint16_t i = 0; i < len; i++) SPI2.transfer(data[i]);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
     flash_wait_ready();
 }
 
 void flash_erase_sector(uint32_t addr) {
     write_enable();
     flash_wait_ready();
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_SECTOR_ERASE);
-    SPI1.transfer((addr >> 16) & 0xFF);
-    SPI1.transfer((addr >>  8) & 0xFF);
-    SPI1.transfer((addr >>  0) & 0xFF);
+    SPI2.transfer(CMD_SECTOR_ERASE);
+    SPI2.transfer((addr >> 16) & 0xFF);
+    SPI2.transfer((addr >>  8) & 0xFF);
+    SPI2.transfer((addr >>  0) & 0xFF);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
     flash_wait_ready();
 }
 
 void flash_erase_chip() {
     write_enable();
     flash_wait_ready();
-    SPI1.beginTransaction(kCfg);
+    SPI2.beginTransaction(kCfg);
     cs_low();
-    SPI1.transfer(CMD_CHIP_ERASE);
+    SPI2.transfer(CMD_CHIP_ERASE);
     cs_high();
-    SPI1.endTransaction();
+    SPI2.endTransaction();
     flash_wait_ready();
 }

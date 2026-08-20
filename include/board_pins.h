@@ -10,7 +10,7 @@
 #define PIN_IMU_MISO     12
 #define PIN_IMU_SCK      13
 
-// --- SPI1 (microSD — DO NOT INSERT CARD, H6: SD VDD wired to 5V) ---
+// --- SPI1 (microSD — H6 fixed: SD VDD rewired to 3.3V, card now safe) ---
 #define PIN_SD_CS        0
 #define PIN_SD_MISO      1
 #define PIN_SD_MOSI      26

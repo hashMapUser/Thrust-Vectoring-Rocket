@@ -181,8 +181,10 @@ void loop() {
                 }
             }
         } else if (c == 'R') {
-            // T9: USB dump (T8 logger_finalize happens inside logger_usb_dump)
-            logger_usb_dump();
+            // Manual dump trigger — normally logger_finalize() runs
+            // automatically on STATE_LANDED; this covers bench testing
+            // or forcing a dump before landing is detected.
+            logger_finalize();
         }
     }
 
@@ -243,8 +245,8 @@ void loop() {
             case STATE_LANDED:
                 servo_disable();
                 buzzer_set(&buzz, BUZZ_LOCATOR);
-                Serial.println("[INFO] Landed. Send 'R' to USB-dump flight log.");
                 logger_finalize();
+                Serial.println("[INFO] Landed. Flight log written to SD.");
                 break;
             case STATE_ABORT:
                 pyro_safe_all(&pyros);

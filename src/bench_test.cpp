@@ -85,23 +85,23 @@ static void info(const char *msg) {
 //  standalone without depending on logger.cpp internals)
 // ============================================================
 static void flash_wait_ready_bt() {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_READ_STATUS1);
+    SPI2.transfer(FCMD_READ_STATUS1);
     uint32_t t0 = millis();
-    while (SPI.transfer(0x00) & FSTATUS_WIP) {
+    while (SPI2.transfer(0x00) & FSTATUS_WIP) {
         if (millis() - t0 > 5000) { Serial.println("  [WARN] Flash WIP timeout"); break; }
     }
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
 }
 
 static void flash_write_enable_bt() {
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_WRITE_ENABLE);
+    SPI2.transfer(FCMD_WRITE_ENABLE);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
 }
 
 // ============================================================
@@ -378,14 +378,14 @@ static void test_flash() {
     print_banner("TEST 4: GD25Q128 NOR Flash (SPI)");
 
     // --- JEDEC ID ---
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_JEDEC_ID);
-    uint8_t mfr = SPI.transfer(0);
-    uint8_t mem = SPI.transfer(0);
-    uint8_t cap = SPI.transfer(0);
+    SPI2.transfer(FCMD_JEDEC_ID);
+    uint8_t mfr = SPI2.transfer(0);
+    uint8_t mem = SPI2.transfer(0);
+    uint8_t cap = SPI2.transfer(0);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
 
     Serial.print(F("  JEDEC ID: 0x"));
     Serial.print(mfr, HEX); Serial.print(F(" 0x"));
@@ -396,7 +396,7 @@ static void test_flash() {
     if (mfr != 0xC8 || mem != 0x40 || cap != 0x18) {
         fail("JEDEC ID mismatch — chip not responding or wrong part");
         Serial.println(F("  Checklist:"));
-        Serial.println(F("    - PIN_FLASH_CS = 9 correct?"));
+        Serial.println(F("    - PIN_FLASH_CS = 36 correct?"));
         Serial.println(F("    - WP# and HOLD# pins pulled HIGH via 10k to 3.3V?"));
         Serial.println(F("    - SPI MODE0, MSBFIRST?"));
         Serial.println(F("    - 3.3V on VCC?"));
@@ -410,28 +410,28 @@ static void test_flash() {
     Serial.print(TEST_ADDR, HEX); Serial.print(F(" ... "));
 
     flash_write_enable_bt();
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_SECTOR_ERASE);
-    SPI.transfer((TEST_ADDR >> 16) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  8) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  0) & 0xFF);
+    SPI2.transfer(FCMD_SECTOR_ERASE);
+    SPI2.transfer((TEST_ADDR >> 16) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  8) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  0) & 0xFF);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
     flash_wait_ready_bt();
     Serial.println(F("done"));
 
     // Verify erased (all 0xFF)
     uint8_t read_buf[32];
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_READ_DATA);
-    SPI.transfer((TEST_ADDR >> 16) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  8) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  0) & 0xFF);
-    for (int i = 0; i < 32; i++) read_buf[i] = SPI.transfer(0);
+    SPI2.transfer(FCMD_READ_DATA);
+    SPI2.transfer((TEST_ADDR >> 16) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  8) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  0) & 0xFF);
+    for (int i = 0; i < 32; i++) read_buf[i] = SPI2.transfer(0);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
 
     bool erased_ok = true;
     for (int i = 0; i < 32; i++) if (read_buf[i] != 0xFF) { erased_ok = false; break; }
@@ -443,27 +443,27 @@ static void test_flash() {
     for (int i = 0; i < 32; i++) write_buf[i] = (uint8_t)(i * 7 + 0xA0);  // deterministic pattern
 
     flash_write_enable_bt();
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_PAGE_PROGRAM);
-    SPI.transfer((TEST_ADDR >> 16) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  8) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  0) & 0xFF);
-    for (int i = 0; i < 32; i++) SPI.transfer(write_buf[i]);
+    SPI2.transfer(FCMD_PAGE_PROGRAM);
+    SPI2.transfer((TEST_ADDR >> 16) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  8) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  0) & 0xFF);
+    for (int i = 0; i < 32; i++) SPI2.transfer(write_buf[i]);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
     flash_wait_ready_bt();
 
     // Read back and verify
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_READ_DATA);
-    SPI.transfer((TEST_ADDR >> 16) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  8) & 0xFF);
-    SPI.transfer((TEST_ADDR >>  0) & 0xFF);
-    for (int i = 0; i < 32; i++) read_buf[i] = SPI.transfer(0);
+    SPI2.transfer(FCMD_READ_DATA);
+    SPI2.transfer((TEST_ADDR >> 16) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  8) & 0xFF);
+    SPI2.transfer((TEST_ADDR >>  0) & 0xFF);
+    for (int i = 0; i < 32; i++) read_buf[i] = SPI2.transfer(0);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
 
     bool write_ok = true;
     for (int i = 0; i < 32; i++) {
@@ -504,9 +504,8 @@ static void test_sd() {
         fail("SD.begin() failed");
         Serial.println(F("  Checklist:"));
         Serial.println(F("    - Card inserted in Hirose DM3AT connector?"));
-        Serial.println(F("    - PIN_SD_CS = 7 correct?"));
+        Serial.println(F("    - PIN_SD_CS = 0 correct?"));
         Serial.println(F("    - Card formatted FAT32? (not exFAT, not NTFS)"));
-        Serial.println(F("    - SPI bus shared with flash — flash CS must be HIGH during SD init"));
         Serial.println(F("    - Try a different SD card (some cards fail at 3.3V)"));
         return;
     }
@@ -552,25 +551,19 @@ static void test_sd() {
 
 // ============================================================
 //  TEST 6 — Full logger round-trip
-//  Writes 50 fake LogRecords via logger_write(), finalises the
-//  flash header, then streams via USB dump (TVCR protocol).
-//  Host side: tools/dump_flash.py — see T9 in FC_V2_SPEC.md.
-//  SD card is disabled for this flight (H6: SD VDD at 5 V).
+//  Writes 50 fake LogRecords via logger_write() (RAM ring buffer only),
+//  then logger_finalize() dumps them straight to FLIGHT_XXX.CSV on the
+//  SD card. GD25Q128 flash is not used for flight logging — it's wired
+//  incorrectly on this board (see FC_V2_1_PIN_REFERENCE.md).
 // ============================================================
 static void test_logger_roundtrip() {
-    print_banner("TEST 6: Logger Round-Trip (flash → USB TVCR dump)");
+    print_banner("TEST 6: Logger Round-Trip (RAM buffer → SD CSV)");
 
-    info("Erasing flash and reinitialising logger...");
-    // logger_erase() is declared in the updated logger.h
-    // If it doesn't exist yet, do it manually via a chip erase:
-    //   flash_write_enable_bt(); ...CMD_CHIP_ERASE... (takes ~30s)
-    // For the bench test we'll just re-init without erasing so we
-    // don't spend 30 s on every test run.
+    info("Reinitialising logger (SD.begin() + next FLIGHT_XXX.CSV slot)...");
 
     bool ok = logger_init();
     if (!ok) {
-        // logger_init returns true if flash OR SD is up
-        Serial.println(F("  [WARN] logger_init() returned false — check flash and SD"));
+        Serial.println(F("  [WARN] logger_init() returned false — check SD card"));
     }
 
     // Write 50 fake records with known values
@@ -610,21 +603,17 @@ static void test_logger_roundtrip() {
     }
     pass("All 50 records written");
 
-    Serial.println(F("  Finalising flash header..."));
+    Serial.println(F("  Dumping RAM buffer to SD..."));
     logger_finalize();
-    pass("Flash header written");
-
-    Serial.println(F("  Streaming TVCR dump over USB Serial..."));
-    Serial.println(F("  Run tools/dump_flash.py on the host to capture and decode."));
-    logger_usb_dump();
+    pass("CSV written to SD");
 
     Serial.println();
-    Serial.println(F("  ── USB DUMP RETRIEVAL GUIDE ───────────────────────────"));
+    Serial.println(F("  ── SD RETRIEVAL GUIDE ─────────────────────────────────"));
     Serial.println(F("  After a real flight:"));
-    Serial.println(F("    1. Connect USB; open tools/dump_flash.py on the host"));
-    Serial.println(F("    2. Send 'R' over Serial — Teensy streams TVCR binary"));
-    Serial.println(F("    3. Script verifies CRC32 and converts to flight.csv"));
-    Serial.println(F("    4. DO NOT insert the SD card (H6: SD VDD at 5 V)"));
+    Serial.println(F("    1. Eject the SD card (or send 'R' to force a dump early)"));
+    Serial.println(F("    2. Read FLIGHT_XXX.CSV directly on a PC — no host script"));
+    Serial.println(F("       needed, it's already plain CSV"));
+    Serial.println(F("    3. FLIGHT_XXX.LOG holds the state-transition checkpoints"));
     Serial.println(F("  ────────────────────────────────────────────────────────"));
 
     pass("Logger round-trip PASSED");
@@ -787,7 +776,7 @@ static void print_menu() {
     Serial.println(F("║  3 - MMC5603NJ Magnetometer (I2C Wire1)  ║"));
     Serial.println(F("║  4 - GD25Q128 NOR Flash (SPI)            ║"));
     Serial.println(F("║  5 - SD Card (SPI)                       ║"));
-    Serial.println(F("║  6 - Logger round-trip (flash → SD CSV)  ║"));
+    Serial.println(F("║  6 - Logger round-trip (RAM → SD CSV)    ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
@@ -810,16 +799,17 @@ void setup() {
     pinMode(PIN_SD_CS,     OUTPUT); digitalWriteFast(PIN_SD_CS,     HIGH);
 
     SPI.begin();
+    SPI2.begin();
     Wire.begin();
     Wire1.begin();
     delay(100);
 
     // Release flash from power-down
-    SPI.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
+    SPI2.beginTransaction(SPISettings(FLASH_SPI_FREQ, MSBFIRST, FLASH_SPI_MODE));
     digitalWriteFast(PIN_FLASH_CS, LOW);
-    SPI.transfer(FCMD_RELEASE_PD);
+    SPI2.transfer(FCMD_RELEASE_PD);
     digitalWriteFast(PIN_FLASH_CS, HIGH);
-    SPI.endTransaction();
+    SPI2.endTransaction();
     delayMicroseconds(30);
 
     print_menu();

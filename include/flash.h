@@ -28,7 +28,7 @@
 // --------------------------------------------------------
 
 /**
- * Configure SPI1 pins, release the chip from power-down, and verify
+ * Configure SPI2 pins, release the chip from power-down, and verify
  * the JEDEC ID (0xC8 / 0x40 / 0x18).
  * Must be called before any other flash function.
  * @return true if GD25Q128 responds correctly; false if absent or wrong ID.
