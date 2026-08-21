@@ -54,13 +54,23 @@ static inline bool read_arm_sense() {
     return analogRead(PIN_ARM_SENSE) >= ARM_SENSE_THRESHOLD;
 }
 
+// ARM_SENSE divider: 10K/4.7K, ratio 0.3197. The pyro pack voltage isn't
+// sensed directly on this board, but ARM_SENSE gives it indirectly.
+#define ARM_SENSE_DIVIDER_RATIO 0.3197f
+
+static inline float read_pack_voltage() {
+    float arm_sense_v = analogRead(PIN_ARM_SENSE) * 3.30f / 4095.0f;
+    return arm_sense_v / ARM_SENSE_DIVIDER_RATIO;
+}
+
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000) {}
 
     // 1. ANALOG + PIN SETUP
-    analogReadResolution(12);   // 12-bit ADC for ARM_SENSE
+    analogReadResolution(12);   // 12-bit ADC for ARM_SENSE, PYRO1_SENSE
     pinMode(PIN_ARM_SENSE, INPUT);
+    pinMode(PIN_PYRO1_SENSE, INPUT);   // main-chute continuity sense; channel 2 unused this flight
 
     // IMU CS must be HIGH before SPI.begin() (keeps CS deasserted during bus init)
     pinMode(PIN_IMU_CS, OUTPUT);
@@ -144,7 +154,19 @@ void loop() {
             if (raw) {
                 // Rising edge: attempt to arm
                 alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
-                if (fsm_arm(&fsm, &pyros, true)) {
+
+                float pack_v  = read_pack_voltage();
+                bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
+                Serial.print("[ARM] Pyro1 (main) continuity: ");
+                Serial.print(cont_ok ? "OK" : "OPEN");
+                Serial.print("  pack=");
+                Serial.print(pack_v, 2);
+                Serial.println(" V");
+
+                if (!cont_ok) {
+                    buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
+                    Serial.println("[ARM] Arm rejected — main chute e-match continuity failed.");
+                } else if (fsm_arm(&fsm, &pyros, true)) {
                     logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
                     buzzer_set(&buzz, BUZZ_ARMED);
                     Serial.println("[ARM] Armed.");

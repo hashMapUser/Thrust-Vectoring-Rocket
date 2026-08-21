@@ -15,7 +15,7 @@
 #define PIN_SD_MISO      1
 #define PIN_SD_MOSI      26
 #define PIN_SD_SCK       27
-#define PIN_SD_CD        7    // card detect — INPUT_PULLDOWN; floats with no card
+#define PIN_SD_CD        7    // card detect — plain INPUT (R701 pulls up); LOW = card present
 
 // --- SPI2 (NOR flash — GD25Q128) ---
 #define PIN_FLASH_MISO   34
@@ -39,7 +39,7 @@
 #define PIN_BUZZER       3
 // Measured resonant peak for this board's transducer.
 // Sweep 1500-4500 Hz on the bench and update to the loudest frequency.
-#define BUZZER_FREQ_HZ   3450   /* CMT-1203 nominal — measure and tune */
+#define BUZZER_FREQ_HZ   3400   /* CMT-1203 nominal — measure and tune */
 #define PIN_PYRO1_FIRE   32   // main chute (single-deploy flight)
 #define PIN_PYRO2_FIRE   31   // unused this flight
 
@@ -52,7 +52,12 @@
 // ~2.69 V armed (SW401 closed, PYRO_PWR present), 0 V safe
 #define PIN_ARM_SENSE    24
 
+// --- Pyro continuity sense (analog in) ---
+// Both channels have ADC (A8/A9) and populated 15K/5.1K dividers — see
+// pyro_check_continuity() in pyro.cpp. Only channel 1 (main chute) is
+// checked this flight; channel 2 is unused.
+#define PIN_PYRO1_SENSE  22   // A8
+#define PIN_PYRO2_SENSE  23   // A9
+
 // --- Documented-only pins (do not drive during flight) ---
 // PIN_BAT_VOLTAGE    = 14  (A0, analog — no firmware use this revision)
-// PIN_PYRO1_SENSE    = 22  (A8, no continuity telemetry per H5)
-// PIN_PYRO2_SENSE    = 23  (A9, no continuity telemetry per H5)

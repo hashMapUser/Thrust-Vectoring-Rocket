@@ -20,11 +20,21 @@
 // ============================================================
 
 #include <Arduino.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <string.h>
 #include <stdio.h>
 #include "logger.h"
 #include "board_pins.h"
+
+// SdFat, bound explicitly to &SPI1 — the SD card is wired to SPI1
+// (pins 0/1/26/27). The Arduino SD wrapper's begin(csPin) has no way to
+// select a non-default bus: it always drives the default SPI object
+// (SPI0, pins 11/12/13 — the IMU's bus) regardless of which CS pin is
+// passed. SdSpiConfig's explicit port argument is the only way around that.
+#define SD_CLOCK_MHZ 16
+#define SD_CONFIG SdSpiConfig(PIN_SD_CS, SHARED_SPI, SD_SCK_MHZ(SD_CLOCK_MHZ), &SPI1)
+
+static SdFs _sd;
 
 // ============================================================
 //  RAM ring buffer
@@ -49,7 +59,7 @@ static char _log_name[20];
 static void find_filenames() {
     for (int i = 1; i <= 999; i++) {
         snprintf(_csv_name, sizeof(_csv_name), "FLIGHT_%03d.CSV", i);
-        if (!SD.exists(_csv_name)) {
+        if (!_sd.exists(_csv_name)) {
             snprintf(_log_name, sizeof(_log_name), "FLIGHT_%03d.LOG", i);
             return;
         }
@@ -68,7 +78,7 @@ static const char *CSV_HEADER =
     "servo_pitch_us,servo_yaw_us,pid_pitch_out,pid_yaw_out,"
     "flight_state,imu_valid,baro_valid,mag_valid\n";
 
-static void write_csv_row(File &f, const LogRecord &r) {
+static void write_csv_row(FsFile &f, const LogRecord &r) {
     char line[256];
     int n = snprintf(line, sizeof(line),
         "%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,"
@@ -97,8 +107,13 @@ bool logger_init() {
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
 
-    if (!SD.begin(PIN_SD_CS)) {
-        Serial.println("[LOGGER] SD.begin() failed — logging to RAM only, nothing will be saved");
+    SPI1.setMISO(PIN_SD_MISO);
+    SPI1.setMOSI(PIN_SD_MOSI);
+    SPI1.setSCK(PIN_SD_SCK);
+
+    if (!_sd.begin(SD_CONFIG)) {
+        Serial.println("[LOGGER] SD init failed — logging to RAM only, nothing will be saved");
+        _sd.initErrorPrint(&Serial);   // reports CMD0/CMD8/ACMD41 stage
         _sd_ready = false;
         return false;
     }
@@ -132,7 +147,7 @@ void logger_checkpoint(FlightState state, float altitude_m) {
 
     if (!_sd_ready) return;
 
-    File f = SD.open(_log_name, FILE_WRITE);
+    FsFile f = _sd.open(_log_name, O_WRONLY | O_CREAT | O_APPEND);
     if (!f) {
         Serial.println("[LOGGER] Checkpoint write failed — could not open log file");
         return;
@@ -157,7 +172,7 @@ void logger_finalize() {
         return;
     }
 
-    File f = SD.open(_csv_name, FILE_WRITE);
+    FsFile f = _sd.open(_csv_name, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) {
         Serial.println("[LOGGER] Could not open CSV file for writing");
         return;
@@ -172,7 +187,7 @@ void logger_finalize() {
         write_csv_row(f, _buf[idx]);
     }
 
-    f.flush();
+    f.sync();
     f.close();
 
     Serial.print("[LOGGER] Wrote ");

@@ -55,12 +55,22 @@ void pyro_init(PyroState *pyro) {
 }
 
 bool pyro_arm(PyroState *pyro) {
-    // Continuity sensing disabled (H5: sense pins have no ADC this flight).
-    // ARM_SENSE gate is enforced upstream in fsm_arm() / main loop.
+    // ARM_SENSE and continuity gates are enforced upstream, before this is called.
     pyro->drogue_armed = true;
     pyro->main_armed   = true;
     Serial.println("[PYRO] Armed");
     return true;
+}
+
+bool pyro_check_continuity(uint8_t sense_pin, float pack_v) {
+    uint32_t acc = 0;
+    for (int i = 0; i < 16; i++) {
+        acc += analogRead(sense_pin);
+        delayMicroseconds(200);
+    }
+    float v        = ((float)acc / 16.0f) * 3.30f / 4095.0f;
+    float expected = pack_v * PYRO_CONT_DIVIDER_RATIO;
+    return v > (expected * PYRO_CONT_FRACTION);
 }
 
 void pyro_disarm(PyroState *pyro) {

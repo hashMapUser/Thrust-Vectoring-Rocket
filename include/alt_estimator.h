@@ -13,7 +13,7 @@
 // 0.98 is a standard starting point for a ~100 Hz loop.
 #define ALT_ALPHA               0.98f
 
-// Acceleration due to gravity [m/s²] — used to convert accel g to m/s²
+// Acceleration due to gravity 
 #define ALT_GRAVITY             9.80665f
 
 // Sea-level standard pressure [hPa] — used for barometric altitude formula

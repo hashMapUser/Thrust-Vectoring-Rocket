@@ -18,13 +18,15 @@
 //    5 — Test SD card              (SPI)
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
+//    A — Altitude estimator self-check (no hardware needed)
+//    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
 //    R — Reset / reprint menu
 // ============================================================
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <EEPROM.h>
 #include <math.h>
 
@@ -37,8 +39,18 @@
 #include "logger.h"
 #include "servo_driver.h"
 #include "buzzer.h"
+#include "alt_estimator.h"
+#include "pyro.h"
 
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
+
+// SdFat, bound explicitly to &SPI1 — the SD card is wired to SPI1
+// (pins 0/1/26/27). SD.begin(csPin) has no way to select a non-default
+// bus: it always drives SPI0 (11/12/13, the IMU's bus) regardless of CS
+// pin. See src/logger.cpp for the same fix in the flight logger.
+#define BENCH_SD_CLOCK_MHZ 16
+#define BENCH_SD_CONFIG SdSpiConfig(PIN_SD_CS, SHARED_SPI, SD_SCK_MHZ(BENCH_SD_CLOCK_MHZ), &SPI1)
+static SdFs _bench_sd;
 
 // PIN_FLASH_CS removed — use PIN_FLASH_CS (36) from board_pins.h
 
@@ -497,11 +509,16 @@ static void test_sd() {
 
     Serial.println(F("  SD card setup: FAT32, any size up to 32 GB."));
     Serial.println(F("  No pre-formatting needed for modern cards already FAT32."));
-    Serial.println(F("  If SD.begin() fails on a new card, format it FAT32 on your PC first."));
+    Serial.println(F("  If init fails on a new card, format it FAT32 on your PC first."));
     Serial.println();
 
-    if (!SD.begin(PIN_SD_CS)) {
-        fail("SD.begin() failed");
+    SPI1.setMISO(PIN_SD_MISO);
+    SPI1.setMOSI(PIN_SD_MOSI);
+    SPI1.setSCK(PIN_SD_SCK);
+
+    if (!_bench_sd.begin(BENCH_SD_CONFIG)) {
+        fail("SD init failed");
+        _bench_sd.initErrorPrint(&Serial);
         Serial.println(F("  Checklist:"));
         Serial.println(F("    - Card inserted in Hirose DM3AT connector?"));
         Serial.println(F("    - PIN_SD_CS = 0 correct?"));
@@ -509,13 +526,13 @@ static void test_sd() {
         Serial.println(F("    - Try a different SD card (some cards fail at 3.3V)"));
         return;
     }
-    pass("SD.begin() OK — card mounted");
+    pass("SD init OK — card mounted");
 
     // Write a test file
     const char *TESTFILE = "BENCH.TXT";
-    if (SD.exists(TESTFILE)) SD.remove(TESTFILE);
+    if (_bench_sd.exists(TESTFILE)) _bench_sd.remove(TESTFILE);
 
-    File f = SD.open(TESTFILE, FILE_WRITE);
+    FsFile f = _bench_sd.open(TESTFILE, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) {
         fail("Could not create BENCH.TXT");
         return;
@@ -524,12 +541,12 @@ static void test_sd() {
     f.print(F("timestamp_ms="));
     f.println(millis());
     f.println(F("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"));
-    f.flush();
+    f.sync();
     f.close();
     pass("BENCH.TXT written and closed");
 
     // Read it back
-    f = SD.open(TESTFILE, FILE_READ);
+    f = _bench_sd.open(TESTFILE, O_RDONLY);
     if (!f) {
         fail("Could not re-open BENCH.TXT for reading");
         return;
@@ -543,9 +560,9 @@ static void test_sd() {
     pass("BENCH.TXT read back successfully");
 
     // Check available space
-    // SD library doesn't expose free space on all platforms, so just report card type
+    // SdFat doesn't expose free space cheaply here, so just report card type
     Serial.println(F("  SD card responding correctly."));
-    SD.remove(TESTFILE);
+    _bench_sd.remove(TESTFILE);
     pass("SD Card PASSED — write, read, and delete all OK");
 }
 
@@ -559,7 +576,7 @@ static void test_sd() {
 static void test_logger_roundtrip() {
     print_banner("TEST 6: Logger Round-Trip (RAM buffer → SD CSV)");
 
-    info("Reinitialising logger (SD.begin() + next FLIGHT_XXX.CSV slot)...");
+    info("Reinitialising logger (SD init on SPI1 + next FLIGHT_XXX.CSV slot)...");
 
     bool ok = logger_init();
     if (!ok) {
@@ -713,6 +730,86 @@ static void test_leds() {
 }
 
 // ============================================================
+//  TEST C — Pyro Continuity (LEDs as visual aid)
+//  Requires the pyro battery connected (SW401 closed) — continuity
+//  can't be measured through a dead divider. Not run by '7' since it
+//  needs pyro power live and physical eyes on the LEDs.
+// ============================================================
+
+// ARM_SENSE divider: 10K/4.7K, ratio 0.3197. Same math as
+// main_control_loop.cpp's read_pack_voltage() — duplicated here so this
+// harness compiles standalone, matching this file's existing pattern for
+// the flash command set.
+#define BENCH_ARM_SENSE_DIVIDER_RATIO 0.3197f
+
+static void test_pyro_continuity() {
+    print_banner("TEST C: Pyro Continuity (GREEN=OK, RED=OPEN, WHITE=testing)");
+
+    pinMode(PIN_LED_GREEN, OUTPUT);
+    pinMode(PIN_LED_WHITE, OUTPUT);
+    pinMode(PIN_LED_RED,   OUTPUT);
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_WHITE, LOW);
+    digitalWrite(PIN_LED_RED,   LOW);
+
+    analogReadResolution(12);
+    pinMode(PIN_ARM_SENSE,   INPUT);
+    pinMode(PIN_PYRO1_SENSE, INPUT);
+    pinMode(PIN_PYRO2_SENSE, INPUT);
+
+    float arm_sense_v = analogRead(PIN_ARM_SENSE) * 3.30f / 4095.0f;
+    float pack_v       = arm_sense_v / BENCH_ARM_SENSE_DIVIDER_RATIO;
+    Serial.print(F("  Pyro pack voltage (via ARM_SENSE): "));
+    Serial.print(pack_v, 2);
+    Serial.println(F(" V"));
+
+    if (pack_v < 3.0f) {
+        Serial.println(F("  [WARN] Pack reads too low for a live check —"));
+        Serial.println(F("         connect the pyro battery (SW401 closed) and retry."));
+    }
+
+    struct { const char *name; uint8_t sense_pin; } channels[] = {
+        { "PYRO1 (MAIN, used this flight)", PIN_PYRO1_SENSE },
+        { "PYRO2 (unused this flight)",     PIN_PYRO2_SENSE },
+    };
+
+    bool main_ok = false;
+    bool all_ok  = true;
+
+    for (uint8_t i = 0; i < 2; i++) {
+        digitalWrite(PIN_LED_WHITE, HIGH);   // WHITE = this channel under test
+        bool ok = pyro_check_continuity(channels[i].sense_pin, pack_v);
+        if (i == 0) main_ok = ok;
+        all_ok = all_ok && ok;
+
+        Serial.print(F("  ")); Serial.print(channels[i].name);
+        Serial.print(F(": ")); Serial.println(ok ? F("CONTINUITY OK") : F("OPEN / NO MATCH"));
+
+        digitalWrite(PIN_LED_GREEN, ok ? HIGH : LOW);
+        digitalWrite(PIN_LED_RED,   ok ? LOW  : HIGH);
+        delay(1500);
+        digitalWrite(PIN_LED_WHITE, LOW);
+        digitalWrite(PIN_LED_GREEN, LOW);
+        digitalWrite(PIN_LED_RED,   LOW);
+        delay(300);
+    }
+
+    // Final hold: light the result for the channel actually used this
+    // flight, so there's a lasting visual readout at the pad.
+    digitalWrite(PIN_LED_GREEN, main_ok ? HIGH : LOW);
+    digitalWrite(PIN_LED_RED,   main_ok ? LOW  : HIGH);
+    Serial.println(F("  GREEN = main chute continuity OK, RED = OPEN. Send any key to clear."));
+
+    if (all_ok) {
+        pass("Pyro Continuity PASSED — both channels show continuity");
+    } else if (main_ok) {
+        fail("Pyro Continuity — PYRO2 open (unused this flight, but check wiring)");
+    } else {
+        fail("Pyro Continuity — MAIN chute e-match reads OPEN. Do not arm.");
+    }
+}
+
+// ============================================================
 //  TEST B — Buzzer HAL (PIN_BUZZER = 3, hardware PWM via FlexPWM)
 // ============================================================
 static void run_pattern(buzzer_t *b, buzzer_pattern_t p,
@@ -747,6 +844,141 @@ static void test_buzzer() {
 }
 
 // ============================================================
+//  TEST A — Altitude Estimator (complementary filter self-check)
+//  Pure math, no hardware involved — exercises alt_estimator.cpp
+//  directly with synthetic pressure/accel inputs.
+// ============================================================
+static void test_altitude_estimator() {
+    print_banner("TEST A: Altitude Estimator (complementary filter)");
+
+    const float P0 = 1013.25f;   // hPa at sea level -> simulated pad
+    const float DT = 0.02f;      // 50 Hz
+    int failed = 0;
+
+    auto check = [&](const char *name, bool cond) {
+        if (cond) pass(name);
+        else { fail(name); failed++; }
+    };
+
+    info("Sub-test 1: init caches ground altitude");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        check("initialised flag set",   est.initialised);
+        check("ground_pressure stored", fabsf(est.ground_pressure - P0) < 0.001f);
+        check("ground_altitude ~0 m for sea-level pressure",
+              fabsf(est.ground_altitude_m) < 0.1f);
+        check("accel_bias starts at 0", fabsf(est.accel_bias_ms2) < 1e-6f);
+    }
+
+    info("Sub-test 2: calibration with perfect 1g samples");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.0f);
+        bool ok = alt_calibrate_finish(&est);
+        check("finish returns true with >= ALT_MIN_CAL_SAMPLES", ok);
+        check("computed bias is ~0", fabsf(est.accel_bias_ms2) < 1e-4f);
+    }
+
+    info("Sub-test 3: calibration recovers a known +0.01g bias");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.01f);
+        bool ok = alt_calibrate_finish(&est);
+        check("finish returns true", ok);
+        // 0.01 g * 9.80665 = 0.0980665 m/s^2
+        check("computed bias matches expected 0.0981 m/s^2",
+              fabsf(est.accel_bias_ms2 - 0.0980665f) < 1e-4f);
+    }
+
+    info("Sub-test 4: insufficient calibration samples");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        for (int i = 0; i < 10; i++) alt_calibrate_sample(&est, 1.01f);   // < ALT_MIN_CAL_SAMPLES
+        bool ok = alt_calibrate_finish(&est);
+        check("finish returns false with too few samples", !ok);
+        check("bias remains at 0", fabsf(est.accel_bias_ms2) < 1e-6f);
+    }
+
+    info("Sub-test 5: post-calibration pad-static velocity drift");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        const float pad_reading_g = 1.005f;   // simulated +0.005g sensor bias
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, pad_reading_g);
+        alt_calibrate_finish(&est);
+
+        for (int i = 0; i < 500; i++) alt_update(&est, P0, pad_reading_g, DT);   // 10 s on pad
+
+        Serial.print(F("    velocity after 10 s on pad: "));
+        Serial.print(est.velocity_ms, 4); Serial.println(F(" m/s"));
+        Serial.print(F("    altitude after 10 s on pad: "));
+        Serial.print(est.altitude_m, 4); Serial.println(F(" m"));
+        check("velocity drift < 0.05 m/s", fabsf(est.velocity_ms) < 0.05f);
+        check("altitude drift < 1 m",      fabsf(est.altitude_m)  < 1.0f);
+    }
+
+    info("Sub-test 6: NaN guards");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.0f);
+        alt_calibrate_finish(&est);
+
+        alt_update(&est, P0, 1.0f, DT);
+        float alt_before = est.altitude_m;
+        float vel_before = est.velocity_ms;
+
+        alt_update(&est, NAN, 1.0f, DT);   // NaN pressure
+        check("NaN pressure leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
+        check("NaN pressure leaves velocity unchanged", fabsf(est.velocity_ms - vel_before) < 1e-6f);
+
+        alt_update(&est, P0, NAN, DT);     // NaN accel
+        check("NaN accel leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
+
+        alt_update(&est, P0, 1.0f, NAN);   // NaN dt
+        check("NaN dt leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
+
+        for (int i = 0; i < 50; i++) alt_update(&est, P0, 1.0f, DT);
+        check("estimator recovers and produces finite altitude", isfinite(est.altitude_m));
+    }
+
+    info("Sub-test 7: rate-independent bias convergence");
+    {
+        const float TRUE_BIAS_G = 0.02f;   // sensor reads 1.02 g on the pad
+        const float WALL_TIME_S = 30.0f;
+
+        auto run = [&](float fs) {
+            AltEstimator est;
+            alt_init(&est, P0);
+            float dt = 1.0f / fs;
+            int n_ticks = (int)(WALL_TIME_S * fs);
+            for (int i = 0; i < n_ticks; i++) alt_update(&est, P0, 1.0f + TRUE_BIAS_G, dt);
+            return est.accel_bias_ms2;
+        };
+
+        float bias_50Hz  = run(50.0f);
+        float bias_100Hz = run(100.0f);
+        Serial.print(F("    bias after 30 s @  50 Hz: ")); Serial.print(bias_50Hz, 4);  Serial.println(F(" m/s^2"));
+        Serial.print(F("    bias after 30 s @ 100 Hz: ")); Serial.print(bias_100Hz, 4); Serial.println(F(" m/s^2"));
+        check("50 Hz and 100 Hz converge to same bias (within 5%)",
+              fabsf(bias_50Hz - bias_100Hz) < (0.05f * fabsf(bias_50Hz) + 0.001f));
+    }
+
+    Serial.println();
+    if (failed == 0) {
+        pass("Altitude Estimator PASSED — all sub-checks OK");
+    } else {
+        Serial.print(F("  [FAIL] Altitude Estimator — "));
+        Serial.print(failed);
+        Serial.println(F(" sub-check(s) failed"));
+    }
+}
+
+// ============================================================
 //  Run all tests
 // ============================================================
 static void run_all() {
@@ -756,11 +988,12 @@ static void run_all() {
     test_flash();
     test_sd();
     test_logger_roundtrip();
+    test_altitude_estimator();
 
     Serial.println();
     print_banner("ALL TESTS COMPLETE");
     Serial.println(F("  Review each test above for PASS/FAIL."));
-    Serial.println(F("  Send individual command (1-6) to re-run a specific test."));
+    Serial.println(F("  Send individual command (1-6, A) to re-run a specific test."));
 }
 
 // ============================================================
@@ -781,6 +1014,8 @@ static void print_menu() {
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
+    Serial.println(F("║  A - Altitude estimator self-check       ║"));
+    Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
     Serial.println(F("Send a character to begin."));
@@ -831,6 +1066,8 @@ void loop() {
         case 'S': case 's': test_servos(); break;
         case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
+        case 'A': case 'a': test_altitude_estimator(); break;
+        case 'C': case 'c': test_pyro_continuity(); break;
         case 'R': case 'r': print_menu(); break;
         default:
             Serial.print(F("Unknown command: "));
