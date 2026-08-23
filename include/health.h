@@ -237,7 +237,8 @@ void health_print_page(const HealthMonitor *h, uint32_t now_ms, FlightState st);
  * HEALTH_FRAME_INTERVAL_MS. Safe to call every loop iteration.
  *
  * Format (NMEA-style XOR checksum over everything between $ and *):
- *   $HLTH,<t_ms>,<state_name>,NAME=st:flags:consec:fails:age_ms,...*XX
+ *   $HLTH,<t_ms>,<state_name>,NAME=st:flags:consec:fails:age_ms:rate_dhz,...*XX
+ * rate_dhz is the channel's sample rate in decihertz (rate_hz * 10, rounded).
  */
 void health_emit_frame(HealthMonitor *h, uint32_t now_ms, FlightState st);
 

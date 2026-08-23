@@ -391,13 +391,15 @@ void health_emit_frame(HealthMonitor *h, uint32_t now_ms, FlightState st) {
     for (int i = 0; i < HC_COUNT && n > 0 && n < (int)sizeof(body); i++) {
         const ChannelHealth *c = &h->ch[i];
         const uint32_t age = c->ever_good ? (now_ms - c->last_good_ms) : 0UL;
-        n += snprintf(body + n, sizeof(body) - n, ",%s=%u:%u:%u:%lu:%lu",
+        const unsigned dhz = (unsigned)(c->rate_hz * 10.0f + 0.5f);   // decihertz
+        n += snprintf(body + n, sizeof(body) - n, ",%s=%u:%u:%u:%lu:%lu:%u",
                       CH_POLICY[i].name,
                       (unsigned)c->state,
                       (unsigned)c->flags,
                       (unsigned)c->consec_fails,
                       (unsigned long)c->fails,
-                      (unsigned long)age);
+                      (unsigned long)age,
+                      dhz);
     }
 
     uint8_t cks = 0;

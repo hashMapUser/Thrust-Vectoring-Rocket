@@ -6,9 +6,9 @@ A desktop GUI for hardware bring-up. Reads the $HLTH frames emitted by
 health_emit_frame() and drives the serial command menus in bench_test.cpp
 and main_control_loop.cpp.
 
-    python3 tools/bench_gui.py              # pick a port in the UI
-    python3 tools/bench_gui.py -p COM3
-    python3 tools/bench_gui.py --demo       # synthesised data, no hardware
+    python src/bench_gui.py                 # pick a port in the UI
+    python src/bench_gui.py -p COM3
+    python src/bench_gui.py --demo          # synthesised data, no hardware
 
 Requires only pyserial (already a PlatformIO dependency) and tkinter, which
 ships with CPython on Windows and macOS. On Debian/Ubuntu:
@@ -420,6 +420,7 @@ class BenchPanel:
         ("1  Baro", "1"), ("2  IMU", "2"), ("3  Mag", "3"), ("4  Flash", "4"),
         ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"),
         ("S  Servos", "S"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
+        ("A  Altitude", "A"), ("C  Continuity", "C"),
         ("M  Monitor", "M"), ("R  Menu", "R"),
     ]
 

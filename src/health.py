@@ -5,18 +5,19 @@ Live sensor status dashboard for the TVC flight computer.
 Reads the $HLTH frames emitted by health_emit_frame() over USB serial and
 renders them as a continuously updating terminal dashboard.
 
-    python3 tools/health_monitor.py                  # auto-detect the Teensy
-    python3 tools/health_monitor.py -p /dev/ttyACM0
-    python3 tools/health_monitor.py --replay capture.txt
+    python src/health.py                    # auto-detect the Teensy
+    python src/health.py -p /dev/ttyACM0
+    python src/health.py --replay capture.txt
 
 Only dependency is pyserial (already required by PlatformIO's monitor).
 Replay mode needs nothing at all.
 
 Frame format produced by the firmware:
 
-    $HLTH,<t_ms>,<state>,NAME=st:flags:consec:fails:age_ms,...*XX
+    $HLTH,<t_ms>,<state>,NAME=st:flags:consec:fails:age_ms:rate_dhz,...*XX
 
-where XX is an XOR checksum over every character between $ and *.
+where XX is an XOR checksum over every character between $ and *, and
+rate_dhz is the channel's sample rate in decihertz (rate_hz * 10).
 """
 
 import argparse
@@ -78,6 +79,7 @@ class Channel:
     consec: int = 0
     fails: int = 0
     age_ms: int = 0
+    rate_dhz: int = 0   # decihertz (rate_hz * 10); 0 = no rate estimate yet
 
 
 @dataclass
@@ -123,7 +125,7 @@ def parse_frame(line: str):
             continue
         name, _, rest = tok.partition("=")
         parts = rest.split(":")
-        if len(parts) != 5:
+        if len(parts) != 6:
             continue
         try:
             frame.channels.append(

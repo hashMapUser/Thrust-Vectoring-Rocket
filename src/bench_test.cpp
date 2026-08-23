@@ -20,6 +20,7 @@
 //    7 — Run ALL tests in sequence
 //    A — Altitude estimator self-check (no hardware needed)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
+//    M — Live health monitor ($HLTH frames for bench_gui.py / health_monitor.py)
 //    R — Reset / reprint menu
 // ============================================================
 
@@ -41,6 +42,7 @@
 #include "buzzer.h"
 #include "alt_estimator.h"
 #include "pyro.h"
+#include "health.h"
 
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 
@@ -639,35 +641,36 @@ static void test_logger_roundtrip() {
 // ============================================================
 //  TEST S — Servos (PIN_SERVO_X=5, PIN_SERVO_Y=6)
 //  Watch the TVC mount physically while this runs.
-//  Expected travel: ±7° (SERVO_MAX_ANGLE_DEG) from centre.
+//  Expected travel: ±72° pitch, ±36° yaw (SERVO_*_MAX_ANGLE_DEG) from centre.
 // ============================================================
 static void test_servos() {
     print_banner("TEST S: TVC Servos (X=pin5, Y=pin6)");
     servo_init();
 
-    auto sweep = [](const char *name, auto set_fn) {
+    auto sweep = [](const char *name, auto set_fn, float max_angle_deg, float centre_us) {
         Serial.print(F("  ")); Serial.print(name);
 
-        Serial.print(F(" -> centre (1500 us) ... "));
+        Serial.print(F(" -> centre (")); Serial.print(centre_us, 0); Serial.print(F(" us) ... "));
         set_fn(0.0f); delay(600);
 
-        Serial.print(F("+7deg ... "));
-        set_fn(SERVO_MAX_ANGLE_DEG); delay(800);
+        Serial.print(max_angle_deg, 1); Serial.print(F("deg ... "));
+        set_fn(max_angle_deg); delay(800);
 
-        Serial.print(F("-7deg ... "));
-        set_fn(-SERVO_MAX_ANGLE_DEG); delay(800);
+        Serial.print(-max_angle_deg, 1); Serial.print(F("deg ... "));
+        set_fn(-max_angle_deg); delay(800);
 
         Serial.println(F("centre"));
         set_fn(0.0f); delay(600);
     };
 
-    sweep("SERVO X (pitch)", servo_set_pitch);
-    sweep("SERVO Y (yaw)  ", servo_set_yaw);
+    sweep("SERVO X (pitch)", servo_set_pitch, SERVO_PITCH_MAX_ANGLE_DEG, SERVO_PITCH_CENTER_US);
+    sweep("SERVO Y (yaw)  ", servo_set_yaw,   SERVO_YAW_MAX_ANGLE_DEG,   SERVO_YAW_CENTER_US);
 
     // Diagonal corners to verify independence
     Serial.println(F("  Corner sweep (both axes together):"));
-    const float ang = SERVO_MAX_ANGLE_DEG;
-    float corners[4][2] = { {ang,ang}, {ang,-ang}, {-ang,-ang}, {-ang,ang} };
+    const float pitch_ang = SERVO_PITCH_MAX_ANGLE_DEG;
+    const float yaw_ang   = SERVO_YAW_MAX_ANGLE_DEG;
+    float corners[4][2] = { {pitch_ang,yaw_ang}, {pitch_ang,-yaw_ang}, {-pitch_ang,-yaw_ang}, {-pitch_ang,yaw_ang} };
     for (int i = 0; i < 4; i++) {
         Serial.print(F("    pitch=")); Serial.print(corners[i][0], 1);
         Serial.print(F("  yaw="));    Serial.println(corners[i][1], 1);
@@ -682,7 +685,11 @@ static void test_servos() {
     Serial.print(servo_get_pitch_us(), 0);
     Serial.print(F(" us  Y: "));
     Serial.print(servo_get_yaw_us(), 0);
-    Serial.println(F(" us  (both should be ~1500)"));
+    Serial.print(F(" us  (X should be ~"));
+    Serial.print(SERVO_PITCH_CENTER_US);
+    Serial.print(F(", Y should be ~"));
+    Serial.print(SERVO_YAW_CENTER_US);
+    Serial.println(F(")"));
 
     pass("Servos PASSED — confirm physical travel matched printout");
 }
@@ -979,6 +986,69 @@ static void test_altitude_estimator() {
 }
 
 // ============================================================
+//  TEST M — Live Health Monitor
+//  Streams $HLTH frames (see health.h) for tools/bench_gui.py and
+//  tools/health_monitor.py. Brings up IMU/baro/SD once, then polls
+//  continuously until any key is pressed. MAG/FLASH/PYRO1/PYRO2/BATT
+//  stay at their policy-driven N/FIT state — this board doesn't fit
+//  the mag, and the others need their own dedicated bench test to
+//  produce a real reading.
+// ============================================================
+static HealthMonitor _health;
+static bool           _health_ready = false;
+
+static void health_bench_init() {
+    health_init(&_health);
+
+    bool imu_ok = lsm6dsox_init();
+    health_set_init(&_health, HC_IMU, imu_ok);
+    if (!imu_ok) Serial.println(F("  [WARN] IMU init failed — monitor will show IMU as FAILED"));
+
+    bool baro_ok = lps22hb_init();
+    health_set_init(&_health, HC_BARO, baro_ok);
+    if (!baro_ok) Serial.println(F("  [WARN] Baro init failed — monitor will show BARO as FAILED"));
+
+    bool sd_ok = logger_init();
+    health_update_log(&_health, sd_ok, millis());
+
+    analogReadResolution(12);
+    pinMode(PIN_ARM_SENSE, INPUT);
+
+    _health_ready = true;
+}
+
+static void test_monitor() {
+    print_banner("TEST M: Live Health Monitor ($HLTH frames)");
+    Serial.println(F("  Streaming for bench_gui.py / health_monitor.py."));
+    Serial.println(F("  Send any character to stop and return to the menu."));
+
+    if (!_health_ready) health_bench_init();
+
+    while (Serial.available()) Serial.read();   // clear the 'M' that got us here
+
+    while (!Serial.available()) {
+        uint32_t now = millis();
+
+        LSM6DSOX_Data imu_d;
+        lsm6dsox_read(&imu_d, nullptr);
+        health_update_imu(&_health, &imu_d, now, true);   // bench = on pad
+
+        LPS22HB_Data baro_d;
+        lps22hb_read(&baro_d);
+        health_update_baro(&_health, &baro_d, now);
+
+        health_update_arm(&_health, (uint16_t)analogRead(PIN_ARM_SENSE), now);
+
+        health_tick(&_health, now);
+        health_emit_frame(&_health, now, STATE_IDLE);
+
+        delay(8);   // ~125 Hz, matches the flight loop rate
+    }
+    while (Serial.available()) Serial.read();
+    pass("Monitor stopped");
+}
+
+// ============================================================
 //  Run all tests
 // ============================================================
 static void run_all() {
@@ -1016,6 +1086,7 @@ static void print_menu() {
     Serial.println(F("║  B - Buzzer patterns                      ║"));
     Serial.println(F("║  A - Altitude estimator self-check       ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
+    Serial.println(F("║  M - Live health monitor ($HLTH frames)  ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
     Serial.println(F("Send a character to begin."));
@@ -1068,6 +1139,7 @@ void loop() {
         case 'B': case 'b': test_buzzer(); break;
         case 'A': case 'a': test_altitude_estimator(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
+        case 'M': case 'm': test_monitor(); break;
         case 'R': case 'r': print_menu(); break;
         default:
             Serial.print(F("Unknown command: "));

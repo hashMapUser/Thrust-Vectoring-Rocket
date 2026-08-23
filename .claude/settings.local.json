@@ -5,7 +5,9 @@
       "Bash(Select-Object FullName)",
       "Bash(Sort-Object FullName)",
       "Bash(ConvertTo-Csv -NoTypeInformation)",
-      "Bash(Out-String)"
+      "Bash(Out-String)",
+      "PowerShell(Get-Command pio -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command platformio -ErrorAction SilentlyContinue)"
     ]
   }
 }
