@@ -43,19 +43,15 @@ static buzzer_t       buzz;
 const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
 uint32_t last_loop_time = 0;
 
-// --- ARM SENSE DEBOUNCE ---
-// Read PIN_ARM_SENSE via 12-bit analogRead.
-// Threshold 1614 ≈ 1.3 V on a 3.3 V reference.
-static bool arm_sense_stable  = false;
-static bool arm_sense_raw     = false;
-static uint32_t arm_edge_ms   = 0;
-
-static inline bool read_arm_sense() {
-    return analogRead(PIN_ARM_SENSE) >= ARM_SENSE_THRESHOLD;
-}
+// --- AUTO-ARM ---
+// No physical arm switch this flight: IDLE's pad-rest latch (fsm.pad_rest_satisfied)
+// stands in for it. Once the vehicle has sat still and upright on the pad for
+// PAD_REST_MS, we run the same continuity/pack-voltage check the switch used
+// to gate and arm automatically.
+static bool pad_rest_prev = false;
 
 // ARM_SENSE divider: 10K/4.7K, ratio 0.3197. The pyro pack voltage isn't
-// sensed directly on this board, but ARM_SENSE gives it indirectly.
+// sensed directly on this board, but the ARM_SENSE pin gives it indirectly.
 #define ARM_SENSE_DIVIDER_RATIO 0.3197f
 
 static inline float read_pack_voltage() {
@@ -130,7 +126,7 @@ void setup() {
     }
 
     buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
-    Serial.println("FLIGHT COMPUTER READY. WAITING FOR ARM SWITCH.");
+    Serial.println("FLIGHT COMPUTER READY. WILL AUTO-ARM ON PAD-REST.");
 }
 
 void loop() {
@@ -145,42 +141,36 @@ void loop() {
 
     uint32_t now_ms = millis();
 
-    // ── 1. ARM SENSE (T3) ─────────────────────────────────────
+    // ── 1. AUTO-ARM (T3) ──────────────────────────────────────
+    // No arm switch this flight. fsm_update() below latches pad_rest_satisfied
+    // once the vehicle has sat still and upright for PAD_REST_MS; on that
+    // latch's rising edge we run the same continuity/pack-voltage check the
+    // switch used to gate, then arm automatically.
     {
-        bool raw = read_arm_sense();
-        if (raw != arm_sense_raw) { arm_sense_raw = raw; arm_edge_ms = now_ms; }
-        if ((now_ms - arm_edge_ms) >= 50 && raw != arm_sense_stable) {
-            arm_sense_stable = raw;
-            if (raw) {
-                // Rising edge: attempt to arm
-                alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
+        bool pad_rest_now = (fsm.state == STATE_IDLE) && fsm.pad_rest_satisfied;
+        if (pad_rest_now && !pad_rest_prev) {
+            alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
 
-                float pack_v  = read_pack_voltage();
-                bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
-                Serial.print("[ARM] Pyro1 (main) continuity: ");
-                Serial.print(cont_ok ? "OK" : "OPEN");
-                Serial.print("  pack=");
-                Serial.print(pack_v, 2);
-                Serial.println(" V");
+            float pack_v  = read_pack_voltage();
+            bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
+            Serial.print("[ARM] Pyro1 (main) continuity: ");
+            Serial.print(cont_ok ? "OK" : "OPEN");
+            Serial.print("  pack=");
+            Serial.print(pack_v, 2);
+            Serial.println(" V");
 
-                if (!cont_ok) {
-                    buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
-                    Serial.println("[ARM] Arm rejected — main chute e-match continuity failed.");
-                } else if (fsm_arm(&fsm, &pyros, true)) {
-                    logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
-                    buzzer_set(&buzz, BUZZ_ARMED);
-                    Serial.println("[ARM] Armed.");
-                } else {
-                    Serial.println("[ARM] Arm rejected — not in IDLE.");
-                }
+            if (!cont_ok) {
+                buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
+                Serial.println("[ARM] Auto-arm rejected — main chute e-match continuity failed.");
+            } else if (fsm_arm(&fsm, &pyros, true)) {
+                logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
+                buzzer_set(&buzz, BUZZ_ARMED);
+                Serial.println("[ARM] Auto-armed on pad-rest.");
             } else {
-                // Falling edge: disarm
-                fsm_disarm(&fsm, &pyros);
-                logger_checkpoint(STATE_IDLE, alt_est.altitude_m);
-                buzzer_set(&buzz, BUZZ_IDLE);
-                Serial.println("[ARM] Disarmed.");
+                Serial.println("[ARM] Auto-arm rejected — not in IDLE.");
             }
         }
+        pad_rest_prev = pad_rest_now;
     }
 
     // Serial commands

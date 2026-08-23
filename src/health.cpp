@@ -365,9 +365,8 @@ void health_print_page(const HealthMonitor *h, uint32_t now_ms, FlightState st) 
     Serial.println(" ---------------------------------------------------------------");
     Serial.printf(" %u ok / %u degraded / %u failed-or-unknown / %u not fitted\n",
                   n_ok, n_deg, n_fail, n_nf);
-    Serial.printf(" ARM_SENSE: %u counts (%.2f V)  threshold %u\n",
-                  h->arm_counts, (double)h->arm_counts * 3.3 / 4095.0,
-                  (unsigned)ARM_SENSE_THRESHOLD);
+    Serial.printf(" ARM_SENSE (pyro pack voltage): %u counts (%.2f V)\n",
+                  h->arm_counts, (double)h->arm_counts * 3.3 / 4095.0);
 
     Serial.println(" NOTES:");
     for (int i = 0; i < HC_COUNT; i++) {

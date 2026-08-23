@@ -16,41 +16,71 @@ static void enter_state(FlightSM *fsm, FlightState new_state) {
     Serial.println(STATE_NAMES[new_state]);
 }
 
+// G1 — Pad-rest latch: vehicle must be stationary and vertical for
+// PAD_REST_MS before it's considered settled on the pad. Shared by IDLE
+// (gates auto-arm) and ARMED (gates launch detection).
+static void update_pad_rest(FlightSM *fsm, float accel_mag_g, float gyro_rate_dps,
+                             float accel_up_g, float altitude_m, uint32_t now) {
+    bool accel_ok   = (accel_mag_g  >= PAD_REST_ACCEL_LOW_G &&
+                        accel_mag_g  <= PAD_REST_ACCEL_HIGH_G);
+    bool gyro_ok    = (gyro_rate_dps < PAD_REST_GYRO_DPS);
+    bool upright_ok = (accel_up_g    > PAD_REST_ACCEL_UP_G);
+
+    if (accel_ok && gyro_ok && upright_ok) {
+        if (fsm->pad_rest_start_ms == 0)
+            fsm->pad_rest_start_ms = now;
+        if (!fsm->pad_rest_satisfied && (now - fsm->pad_rest_start_ms) >= PAD_REST_MS) {
+            fsm->pad_rest_satisfied      = true;
+            fsm->pad_rest_baseline_alt_m = altitude_m;
+        }
+    } else {
+        // Any condition break clears the latch — cannot be satisfied
+        // mid-carry and then immediately satisfy launch detect.
+        fsm->pad_rest_start_ms  = 0;
+        fsm->pad_rest_satisfied = false;
+    }
+}
+
 // --------------------------------------------------------
 // PUBLIC API
 // --------------------------------------------------------
 
 void fsm_init(FlightSM *fsm) {
-    fsm->state              = STATE_IDLE;
-    fsm->prev_state         = STATE_IDLE;
-    fsm->state_entry_ms     = millis();
-    fsm->launch_detect_ms   = 0;
-    fsm->powered_entry_ms   = 0;
-    fsm->prev_velocity_ms   = 0.0f;
-    fsm->peak_velocity_ms   = 0.0f;
-    fsm->drogue_fired       = false;
-    fsm->main_fired         = false;
-    fsm->tvc_enabled        = false;
-    fsm->pad_rest_satisfied = false;
-    fsm->pad_rest_start_ms  = 0;
-    fsm->imu_fault          = false;
+    fsm->state                   = STATE_IDLE;
+    fsm->prev_state              = STATE_IDLE;
+    fsm->state_entry_ms          = millis();
+    fsm->launch_detect_ms        = 0;
+    fsm->powered_entry_ms        = 0;
+    fsm->prev_velocity_ms        = 0.0f;
+    fsm->peak_velocity_ms        = 0.0f;
+    fsm->drogue_fired            = false;
+    fsm->main_fired              = false;
+    fsm->tvc_enabled             = false;
+    fsm->pad_rest_satisfied      = false;
+    fsm->pad_rest_start_ms       = 0;
+    fsm->pad_rest_baseline_alt_m = 0.0f;
+    fsm->imu_fault               = false;
 }
 
 bool fsm_arm(FlightSM *fsm, PyroState *pyro, bool arm_sense_ok) {
     if (fsm->state != STATE_IDLE) return false;
 
-    // T3: Refuse IDLE→ARMED unless pyro power is confirmed present (SW401 closed).
+    // T3: Refuse IDLE→ARMED unless the caller has confirmed pyro power/continuity.
     if (!arm_sense_ok) {
-        Serial.println("[FSM] ARM REJECTED — ARM_SENSE below threshold");
+        Serial.println("[FSM] ARM REJECTED — pyro power/continuity not confirmed");
         return false;
     }
 
     pyro_arm(pyro);
     enter_state(fsm, STATE_ARMED);
-    fsm->tvc_enabled        = true;
-    fsm->pad_rest_satisfied = false;
-    fsm->pad_rest_start_ms  = 0;
-    fsm->peak_velocity_ms   = 0.0f;
+    fsm->tvc_enabled             = true;
+    // Re-latch pad-rest fresh in ARMED — an extra stability window right up
+    // to launch detection, on top of the one that gated auto-arm.
+    fsm->pad_rest_satisfied      = false;
+    fsm->pad_rest_start_ms       = 0;
+    fsm->pad_rest_baseline_alt_m = 0.0f;
+    fsm->launch_detect_ms        = 0;
+    fsm->peak_velocity_ms        = 0.0f;
     return true;
 }
 
@@ -102,37 +132,38 @@ void fsm_update(FlightSM *fsm,
     switch (fsm->state) {
 
         case STATE_IDLE:
+            // No arm switch this flight — the pad-rest latch computed here
+            // is polled by the caller to auto-arm once the vehicle has sat
+            // still and upright for PAD_REST_MS.
+            update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
             break;
 
         case STATE_ARMED: {
             // G1 — Pad-rest precondition: vehicle must be stationary and
             // vertical for PAD_REST_MS before a launch signature is accepted.
-            bool accel_ok   = (accel_mag_g  >= PAD_REST_ACCEL_LOW_G &&
-                                accel_mag_g  <= PAD_REST_ACCEL_HIGH_G);
-            bool gyro_ok    = (gyro_rate_dps < PAD_REST_GYRO_DPS);
-            bool upright_ok = (accel_up_g    > PAD_REST_ACCEL_UP_G);
+            update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
 
-            if (accel_ok && gyro_ok && upright_ok) {
-                if (fsm->pad_rest_start_ms == 0)
-                    fsm->pad_rest_start_ms = now;
-                if ((now - fsm->pad_rest_start_ms) >= PAD_REST_MS)
-                    fsm->pad_rest_satisfied = true;
-            } else {
-                // Any condition break clears the latch — cannot be satisfied
-                // mid-carry and then immediately satisfy launch detect.
-                fsm->pad_rest_start_ms  = 0;
-                fsm->pad_rest_satisfied = false;
-            }
-
-            // G2 — Launch detection: 4 g sustained for 200 ms.
+            // G2 — Launch detection: 4 g sustained for 200 ms, AND altitude
+            // must have gained LAUNCH_ALT_DELTA_M within LAUNCH_CONFIRM_MS of
+            // that latch starting. Accel alone can't tell a launch from a
+            // knock/bump on the pad; altitude confirms real liftoff.
             // Only allowed after G1 is satisfied.
             if (fsm->pad_rest_satisfied && accel_up_g > LAUNCH_ACCEL_THRESHOLD_G) {
                 if (fsm->launch_detect_ms == 0) {
                     fsm->launch_detect_ms = now;
-                } else if ((now - fsm->launch_detect_ms) >= LAUNCH_ACCEL_MS) {
-                    fsm->powered_entry_ms = now;
-                    enter_state(fsm, STATE_POWERED);
-                    fsm->launch_detect_ms = 0;
+                } else {
+                    uint32_t held_ms    = now - fsm->launch_detect_ms;
+                    bool alt_confirmed  = (altitude_m - fsm->pad_rest_baseline_alt_m) >= LAUNCH_ALT_DELTA_M;
+
+                    if (held_ms >= LAUNCH_ACCEL_MS && alt_confirmed) {
+                        fsm->powered_entry_ms = now;
+                        enter_state(fsm, STATE_POWERED);
+                        fsm->launch_detect_ms = 0;
+                    } else if (held_ms >= LAUNCH_CONFIRM_MS) {
+                        // Accel held long enough but altitude never came —
+                        // false trigger. Reset and keep waiting on the pad.
+                        fsm->launch_detect_ms = 0;
+                    }
                 }
             } else {
                 fsm->launch_detect_ms = 0;
@@ -209,5 +240,4 @@ void fsm_update(FlightSM *fsm,
     }
 
     fsm->prev_velocity_ms = velocity_ms;
-    (void)altitude_m;  // used by caller for G5 — passed to pyro_fire_main()
 }

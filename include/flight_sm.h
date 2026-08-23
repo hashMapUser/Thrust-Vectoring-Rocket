@@ -22,6 +22,11 @@
 #define LAUNCH_ACCEL_THRESHOLD_G   4.0f   // model motors deliver 5-15 g; 4 g has margin
 #define LAUNCH_ACCEL_MS            200    // sustained hold time
 
+// G2b — Altitude confirmation: a real launch must also show altitude gain,
+// not just an accel spike (rules out a bump/knock while sitting on the pad).
+#define LAUNCH_ALT_DELTA_M         3.0f   // m AGL gain required, measured from pad-rest baseline
+#define LAUNCH_CONFIRM_MS          300    // total window (from accel latch start) to see that gain
+
 // POWERED → COAST: motor burnout
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f
 
@@ -50,9 +55,6 @@
 #define LANDED_ACCEL_HIGH_G        1.35f
 #define LANDED_GYRO_THRESHOLD_DPS  10.0f
 #define LANDED_TIME_MS             5000
-
-// ARM_SENSE threshold: 1.3 V on 3.3 V 12-bit ADC = ~1614 counts
-#define ARM_SENSE_THRESHOLD        1614
 
 // --------------------------------------------------------
 // STATES
@@ -94,9 +96,11 @@ typedef struct {
     bool     main_fired;
     bool     tvc_enabled;
 
-    // G1 — pad-rest latch
+    // G1 — pad-rest latch (evaluated in IDLE to gate auto-arm, and again in
+    // ARMED to gate launch detection)
     bool     pad_rest_satisfied;
     uint32_t pad_rest_start_ms;
+    float    pad_rest_baseline_alt_m;  // altitude snapshot when latch is satisfied
 
     // Fault flags
     bool     imu_fault;
@@ -122,7 +126,10 @@ void fsm_update(FlightSM *fsm,
 
 /**
  * Arm. Only valid from STATE_IDLE.
- * @param arm_sense_ok  true if PIN_ARM_SENSE analog read confirms pyro power present.
+ * No physical arm switch this flight — the caller invokes this automatically
+ * once IDLE's pad-rest latch (fsm->pad_rest_satisfied) is true and its own
+ * continuity/pack-voltage check has passed.
+ * @param arm_sense_ok  true if the caller has confirmed pyro power present.
  * @return true if arm accepted.
  */
 bool fsm_arm(FlightSM *fsm, PyroState *pyro, bool arm_sense_ok);

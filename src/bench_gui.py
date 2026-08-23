@@ -58,7 +58,7 @@ INOP_REASON = {
     "BATT":  "no firmware use yet",
 }
 
-ARM_THRESHOLD_COUNTS = 1614   # ARM_SENSE_THRESHOLD in flight_sm.h
+ARM_THRESHOLD_COUNTS = 1614   # reference marker only — no arm switch in firmware; ~1.3 V on ARM_SENSE indicates pyro pack present
 
 # ----------------------------------------------------------------------
 # Panel palette — cool instrument slate, not near-black, so the lit lamps
