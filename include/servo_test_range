@@ -1,0 +1,397 @@
+#pragma once
+
+// ============================================================
+//  test_servo_range.h — TVC servo range finder (bench command C)
+//
+//  Measures what servo_driver.h currently only assumes: the pulse
+//  widths at the gimbal's mechanical limits, the pulse width at true
+//  mechanical centre, and the nozzle deflection in degrees at each
+//  limit. Emits a block of #defines to paste into servo_driver.h.
+//
+//  WHY THIS EXISTS
+//  The shipped driver assumes centre = 1500 us and that +/-500 us maps
+//  linearly to +/-7 deg, symmetrically, on both axes. Three of those
+//  four assumptions are usually wrong on a real linkage:
+//    - Horn splines are coarse (typically 15-25 teeth), so the nozzle
+//      is rarely aligned at exactly 1500 us.
+//    - Ball-link geometry makes travel asymmetric about centre.
+//    - Total travel depends on horn arm length and link geometry, and
+//      is set by the gimbal's hard stops, not by the servo's range.
+//  A wrong scale factor means the PID's degree output does not produce
+//  the deflection it thinks it does, which shows up as an effective
+//  gain error in flight.
+//
+//  SAFETY
+//    - No motor installed. No propellant anywhere near the bench.
+//    - Gimbal must move freely by hand before starting.
+//    - Jog outward SLOWLY. Stop the instant the nozzle stops moving or
+//      the servo starts buzzing/straining: that is a hard stop, and a
+//      stalled servo draws locked-rotor current, heats fast, and can
+//      strip its gear train or brown out the board.
+//    - Back off a few us from where motion stops. Never set a limit AT
+//      the stop.
+// ============================================================
+
+#include <Arduino.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include "board_pins.h"
+#include "servo_driver.h"
+
+// --- Jog bounds. Deliberately tighter than the 1000-2000 us the servo
+//     will accept: the gimbal hits its stops well before the servo does,
+//     and there is no reason to explore past that.
+#define RANGE_JOG_MIN_US     900
+#define RANGE_JOG_MAX_US    2100
+#define RANGE_COARSE_STEP     10
+#define RANGE_FINE_STEP        1
+
+struct AxisCal {
+    int   center_us;
+    int   min_us;
+    int   max_us;
+    float angle_at_min_deg;
+    float angle_at_max_deg;
+    bool  have_center;
+    bool  have_min;
+    bool  have_max;
+};
+
+static AxisCal cal_x, cal_y;
+
+// ------------------------------------------------------------
+//  Small blocking serial helpers (bench-only; never used in flight)
+// ------------------------------------------------------------
+
+static void range_flush_input() {
+    while (Serial.available()) Serial.read();
+}
+
+/** Block until a line is entered; return it parsed as a float. */
+static float range_read_float(const char *prompt) {
+    Serial.print(prompt);
+    range_flush_input();
+
+    char buf[24];
+    uint8_t n = 0;
+    while (true) {
+        while (!Serial.available()) { /* wait for the operator */ }
+        char c = Serial.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+            buf[n] = '\0';
+            Serial.println();
+            return atof(buf);
+        }
+        if (n < sizeof(buf) - 1) {
+            buf[n++] = c;
+            Serial.print(c);          // echo so the operator sees the entry
+        }
+    }
+}
+
+// ------------------------------------------------------------
+//  Display
+// ------------------------------------------------------------
+
+static void range_print_help() {
+    Serial.println();
+    Serial.println(F("  ── JOG ────────────────────────────────────────"));
+    Serial.println(F("   a / d    jog -10 / +10 us"));
+    Serial.println(F("   A / D    jog  -1 /  +1 us   (fine)"));
+    Serial.println(F("   0        return to 1500 us"));
+    Serial.println(F("  ── MARK ───────────────────────────────────────"));
+    Serial.println(F("   c        set CENTRE at current position"));
+    Serial.println(F("   n        set NEGATIVE limit at current position"));
+    Serial.println(F("   x        set POSITIVE limit at current position"));
+    Serial.println(F("  ── OTHER ──────────────────────────────────────"));
+    Serial.println(F("   t        toggle axis  (X pitch <-> Y yaw)"));
+    Serial.println(F("   m        enter measured nozzle angles for this axis"));
+    Serial.println(F("   s        sweep the recorded limits (verify)"));
+    Serial.println(F("   r        report + emit #defines"));
+    Serial.println(F("   ?        reprint this help"));
+    Serial.println(F("   q        quit to menu (servos centred)"));
+    Serial.println();
+}
+
+static void range_print_state(bool axis_x, int pos_us) {
+    const AxisCal *c = axis_x ? &cal_x : &cal_y;
+    Serial.print(F("  ["));
+    Serial.print(axis_x ? F("X pitch") : F("Y yaw  "));
+    Serial.print(F("]  pos = "));
+    Serial.print(pos_us);
+    Serial.print(F(" us   marks:"));
+    Serial.print(F("  min="));
+    if (c->have_min) Serial.print(c->min_us); else Serial.print(F("--"));
+    Serial.print(F("  ctr="));
+    if (c->have_center) Serial.print(c->center_us); else Serial.print(F("--"));
+    Serial.print(F("  max="));
+    if (c->have_max) Serial.print(c->max_us); else Serial.print(F("--"));
+    Serial.println();
+}
+
+// ------------------------------------------------------------
+//  Measurement entry
+// ------------------------------------------------------------
+
+static void range_enter_angles(bool axis_x) {
+    AxisCal *c = axis_x ? &cal_x : &cal_y;
+    if (!c->have_min || !c->have_max || !c->have_center) {
+        Serial.println(F("  [!] Mark centre, min and max on this axis first."));
+        return;
+    }
+
+    Serial.println();
+    Serial.println(F("  Measure the NOZZLE deflection, not the servo horn."));
+    Serial.println(F("  A digital angle gauge on the nozzle face is easiest;"));
+    Serial.println(F("  a printed protractor behind the nozzle also works."));
+    Serial.println(F("  Sign convention: same sign as the commanded angle."));
+    Serial.println();
+
+    void (*set_us)(int) = axis_x ? servo_write_pitch_us : servo_write_yaw_us;
+
+    set_us(c->center_us);
+    delay(700);
+    Serial.println(F("  Nozzle is now at recorded CENTRE."));
+    Serial.println(F("  Zero your gauge here, then press ENTER."));
+    range_read_float("  > ");
+
+    set_us(c->min_us);
+    delay(700);
+    c->angle_at_min_deg = range_read_float("  Angle at NEGATIVE limit [deg, e.g. -6.2]: ");
+
+    set_us(c->max_us);
+    delay(700);
+    c->angle_at_max_deg = range_read_float("  Angle at POSITIVE limit [deg, e.g.  6.8]: ");
+
+    set_us(c->center_us);
+
+    if (c->angle_at_min_deg >= 0.0f || c->angle_at_max_deg <= 0.0f) {
+        Serial.println(F("  [!] Signs look wrong: negative limit should read"));
+        Serial.println(F("      negative and positive limit positive. If the"));
+        Serial.println(F("      nozzle moves opposite to the command, that is"));
+        Serial.println(F("      what SERVO_X_INVERT / SERVO_Y_INVERT are for."));
+    }
+    Serial.println(F("  Recorded."));
+}
+
+// ------------------------------------------------------------
+//  Verification sweep
+// ------------------------------------------------------------
+
+static void range_sweep(bool axis_x) {
+    AxisCal *c = axis_x ? &cal_x : &cal_y;
+    if (!c->have_min || !c->have_max || !c->have_center) {
+        Serial.println(F("  [!] Mark centre, min and max first."));
+        return;
+    }
+    void (*set_us)(int) = axis_x ? servo_write_pitch_us : servo_write_yaw_us;
+
+    Serial.println(F("  Sweeping recorded limits — watch for any binding."));
+    for (int i = 0; i < 2; i++) {
+        set_us(c->center_us); delay(500);
+        set_us(c->max_us);    delay(700);
+        set_us(c->center_us); delay(500);
+        set_us(c->min_us);    delay(700);
+    }
+    set_us(c->center_us);
+    Serial.println(F("  Sweep complete, centred."));
+}
+
+// ------------------------------------------------------------
+//  Report
+// ------------------------------------------------------------
+
+static void range_emit_axis(const char *tag, const AxisCal *c) {
+    if (!c->have_center || !c->have_min || !c->have_max) {
+        Serial.print(F("// "));
+        Serial.print(tag);
+        Serial.println(F(" — INCOMPLETE, not calibrated"));
+        return;
+    }
+
+    Serial.print(F("#define SERVO_")); Serial.print(tag);
+    Serial.print(F("_CENTER_US        ")); Serial.println(c->center_us);
+    Serial.print(F("#define SERVO_")); Serial.print(tag);
+    Serial.print(F("_MIN_US           ")); Serial.println(c->min_us);
+    Serial.print(F("#define SERVO_")); Serial.print(tag);
+    Serial.print(F("_MAX_US           ")); Serial.println(c->max_us);
+    Serial.print(F("#define SERVO_")); Serial.print(tag);
+    Serial.print(F("_ANGLE_AT_MIN_DEG "));
+    Serial.print(c->angle_at_min_deg, 2); Serial.println(F("f"));
+    Serial.print(F("#define SERVO_")); Serial.print(tag);
+    Serial.print(F("_ANGLE_AT_MAX_DEG "));
+    Serial.print(c->angle_at_max_deg, 2); Serial.println(F("f"));
+}
+
+static void range_report() {
+    Serial.println();
+    Serial.println(F("============================================================"));
+    Serial.println(F("  SERVO CALIBRATION — paste into include/servo_driver.h"));
+    Serial.println(F("============================================================"));
+    range_emit_axis("X", &cal_x);
+    Serial.println();
+    range_emit_axis("Y", &cal_y);
+    Serial.println();
+
+    // The commanded authority limit must fit inside BOTH axes' mechanical
+    // travel in BOTH directions, or the PID can ask for deflection the
+    // gimbal cannot reach and the controller silently saturates.
+    bool complete = cal_x.have_min && cal_x.have_max &&
+                    cal_y.have_min && cal_y.have_max;
+    if (complete) {
+        float lim = fabsf(cal_x.angle_at_min_deg);
+        lim = fminf(lim, fabsf(cal_x.angle_at_max_deg));
+        lim = fminf(lim, fabsf(cal_y.angle_at_min_deg));
+        lim = fminf(lim, fabsf(cal_y.angle_at_max_deg));
+
+        const float usable = floorf(lim * 10.0f) / 10.0f;   // round DOWN
+        Serial.print(F("#define SERVO_MAX_ANGLE_DEG  "));
+        Serial.print(usable, 1);
+        Serial.println(F("f"));
+        Serial.println(F("// ^ smallest travel across both axes and both"));
+        Serial.println(F("//   directions, rounded down. This is the command"));
+        Serial.println(F("//   authority limit the PID saturates against."));
+
+        Serial.println();
+        Serial.print(F("// Scale check — X: "));
+        Serial.print((cal_x.max_us - cal_x.center_us) /
+                     fmaxf(cal_x.angle_at_max_deg, 0.01f), 1);
+        Serial.print(F(" us/deg positive, "));
+        Serial.print((cal_x.center_us - cal_x.min_us) /
+                     fmaxf(-cal_x.angle_at_min_deg, 0.01f), 1);
+        Serial.println(F(" us/deg negative"));
+        Serial.print(F("// Scale check — Y: "));
+        Serial.print((cal_y.max_us - cal_y.center_us) /
+                     fmaxf(cal_y.angle_at_max_deg, 0.01f), 1);
+        Serial.print(F(" us/deg positive, "));
+        Serial.print((cal_y.center_us - cal_y.min_us) /
+                     fmaxf(-cal_y.angle_at_min_deg, 0.01f), 1);
+        Serial.println(F(" us/deg negative"));
+        Serial.println(F("// Large positive/negative asymmetry on one axis"));
+        Serial.println(F("// usually means the horn is off-centre on its"));
+        Serial.println(F("// spline — re-index it one tooth and re-run."));
+    } else {
+        Serial.println(F("// SERVO_MAX_ANGLE_DEG — both axes must be measured"));
+    }
+    Serial.println(F("============================================================"));
+    Serial.println();
+}
+
+// ------------------------------------------------------------
+//  Main interactive loop
+// ------------------------------------------------------------
+
+static void test_servo_range() {
+    Serial.println();
+    Serial.println(F("============================================================"));
+    Serial.println(F("  TVC SERVO RANGE FINDER"));
+    Serial.println(F("============================================================"));
+    Serial.println(F("  BEFORE STARTING:"));
+    Serial.println(F("    - No motor installed."));
+    Serial.println(F("    - Gimbal moves freely by hand, no binding."));
+    Serial.println(F("    - Servo horns attached, links connected."));
+    Serial.println();
+    Serial.println(F("  Jog outward slowly. STOP as soon as the nozzle stops"));
+    Serial.println(F("  moving or the servo buzzes — that is a hard stop, and"));
+    Serial.println(F("  holding against it will cook the servo. Back off a few"));
+    Serial.println(F("  us, then mark the limit."));
+
+    memset(&cal_x, 0, sizeof(cal_x));
+    memset(&cal_y, 0, sizeof(cal_y));
+    cal_x.center_us = cal_y.center_us = SERVO_CENTER_US;
+
+    servo_init();
+    servo_center();
+
+    bool axis_x = true;
+    int  pos_us = SERVO_CENTER_US;
+
+    range_print_help();
+    range_print_state(axis_x, pos_us);
+
+    while (true) {
+        while (!Serial.available()) { /* idle, holding position */ }
+        char c = Serial.read();
+        if (c == '\r' || c == '\n') continue;
+
+        AxisCal *cal = axis_x ? &cal_x : &cal_y;
+        void (*set_us)(int) = axis_x ? servo_write_pitch_us : servo_write_yaw_us;
+        int step = 0;
+        bool moved = false;
+
+        switch (c) {
+            case 'a': step = -RANGE_COARSE_STEP; moved = true; break;
+            case 'd': step = +RANGE_COARSE_STEP; moved = true; break;
+            case 'A': step = -RANGE_FINE_STEP;   moved = true; break;
+            case 'D': step = +RANGE_FINE_STEP;   moved = true; break;
+
+            case '0':
+                pos_us = SERVO_CENTER_US;
+                set_us(pos_us);
+                range_print_state(axis_x, pos_us);
+                break;
+
+            case 'c':
+                cal->center_us = pos_us;
+                cal->have_center = true;
+                Serial.print(F("  CENTRE set at ")); Serial.print(pos_us);
+                Serial.println(F(" us"));
+                break;
+
+            case 'n':
+                cal->min_us = pos_us;
+                cal->have_min = true;
+                Serial.print(F("  NEGATIVE limit set at ")); Serial.print(pos_us);
+                Serial.println(F(" us"));
+                break;
+
+            case 'x':
+                cal->max_us = pos_us;
+                cal->have_max = true;
+                Serial.print(F("  POSITIVE limit set at ")); Serial.print(pos_us);
+                Serial.println(F(" us"));
+                break;
+
+            case 't':
+                servo_center();
+                axis_x = !axis_x;
+                pos_us = (axis_x ? cal_x.center_us : cal_y.center_us);
+                (axis_x ? servo_write_pitch_us : servo_write_yaw_us)(pos_us);
+                range_print_state(axis_x, pos_us);
+                break;
+
+            case 'm': range_enter_angles(axis_x); break;
+            case 's': range_sweep(axis_x);        break;
+            case 'r': range_report();             break;
+            case '?': range_print_help();         break;
+
+            case 'q':
+                servo_center();
+                Serial.println(F("  Servos centred. Leaving range finder."));
+                range_report();
+                return;
+
+            default:
+                Serial.print(F("  Unknown key: ")); Serial.println(c);
+                break;
+        }
+
+        if (moved) {
+            const int next = pos_us + step;
+            if (next < RANGE_JOG_MIN_US || next > RANGE_JOG_MAX_US) {
+                Serial.print(F("  [!] Jog limit reached ("));
+                Serial.print(RANGE_JOG_MIN_US); Serial.print(F("-"));
+                Serial.print(RANGE_JOG_MAX_US);
+                Serial.println(F(" us). If the nozzle still has travel,"));
+                Serial.println(F("      the linkage geometry needs changing,"));
+                Serial.println(F("      not the pulse width."));
+            } else {
+                pos_us = next;
+                set_us(pos_us);
+                range_print_state(axis_x, pos_us);
+            }
+        }
+    }
+}

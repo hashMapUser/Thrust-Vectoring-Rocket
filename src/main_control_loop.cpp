@@ -76,17 +76,20 @@ void setup() {
     Wire.begin();
     delay(100);
 
-    // 2. HARDWARE OUTPUTS
+    // 2. HARDWARE OUTPUTS — indicator/buzzer/pyro only. Pyro pins go LOW
+    // here for safety (see pyro_init()'s own ordering requirement), and the
+    // buzzer needs to be ready before the sensor-init fail path below can
+    // use it. servo_init() is deferred past sensor init — see step 3.
     indicator_init(&indicator);
     buzzer_init(&buzz, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
     buzzer_set(&buzz, BUZZ_BOOT);
     pyro_init(&pyros);
-    servo_init();
 
-    // 3. LOGGER
-    logger_init();
-
-    // 4. SENSOR INIT
+    // 3. SENSOR INIT — before servo_init() attaches and centers the servos.
+    // That draws a current spike, and lsm6dsox_init() is a one-shot
+    // WHO_AM_I check with no retry — if the spike sags the rail during
+    // that window, boot fails hard with no recovery. Sense first, then
+    // bring up the actuator that competes for power.
     if (!lps22hb_init()) {
         Serial.println("[WARN] LPS22HB not found — baro disabled");
     }
@@ -97,6 +100,11 @@ void setup() {
         while (true) { buzzer_update(&buzz); delay(10); }
     }
     lsm6dsox_load_bias(&gyro_bias);
+
+    servo_init();
+
+    // 4. LOGGER
+    logger_init();
 
     // 5. ALTITUDE ESTIMATOR INIT
     // Take a ground pressure snapshot (baro must be initialised first).
