@@ -425,8 +425,8 @@ class BenchPanel:
     ]
 
     FLIGHT_CMDS = [
-        ("H  Status page", "H"), ("G  Calibrate gyro", "G"),
-        ("D  Disarm", "D"), ("X  Abort", "X"), ("R  Dump log", "R"),
+        ("H  Status page", "H"), ("G  Calibrate gyro", "G"), ("X  Abort", "X"),
+        ("R  Finalize log", "R"), ("U  USB dump", "U"),
     ]
 
     def __init__(self, root, args):

@@ -78,7 +78,10 @@ static const char *CSV_HEADER =
     "servo_pitch_us,servo_yaw_us,pid_pitch_out,pid_yaw_out,"
     "flight_state,imu_valid,baro_valid,mag_valid\n";
 
-static void write_csv_row(FsFile &f, const LogRecord &r) {
+// Print& rather than FsFile& — both FsFile (via SdFat's Stream base) and
+// Serial (via HardwareSerial's Stream base) implement Print, so this same
+// function serialises a row to either the SD card or straight over USB.
+static void write_csv_row(Print &out, const LogRecord &r) {
     char line[256];
     int n = snprintf(line, sizeof(line),
         "%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,"
@@ -90,7 +93,20 @@ static void write_csv_row(FsFile &f, const LogRecord &r) {
         r.temperature_c, r.pressure_hpa, r.altitude_m, r.velocity_ms,
         r.servo_pitch_us, r.servo_yaw_us, r.pid_pitch_out, r.pid_yaw_out,
         (unsigned)r.flight_state, (int)r.imu_valid, (int)r.baro_valid, (int)r.mag_valid);
-    if (n > 0) f.write((const uint8_t *)line, (size_t)n);
+    if (n > 0) out.write((const uint8_t *)line, (size_t)n);
+}
+
+static void dump_csv_over_serial() {
+    Serial.println("[LOGGER] SD unavailable — streaming CSV over USB serial instead.");
+    Serial.println("[LOGGER] Copy everything between the BEGIN/END markers into a .csv file.");
+    Serial.println("-----BEGIN FLIGHT CSV-----");
+    Serial.print(CSV_HEADER);
+    uint16_t start = _wrapped ? _head : 0;
+    for (uint16_t i = 0; i < _count; i++) {
+        uint16_t idx = (start + i) % LOG_RAM_CAPACITY;
+        write_csv_row(Serial, _buf[idx]);
+    }
+    Serial.println("-----END FLIGHT CSV-----");
 }
 
 // ============================================================
@@ -168,13 +184,14 @@ void logger_finalize() {
     Serial.println(" records in RAM buffer");
 
     if (!_sd_ready) {
-        Serial.println("[LOGGER] SD not ready — nothing written");
+        dump_csv_over_serial();
         return;
     }
 
     FsFile f = _sd.open(_csv_name, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) {
-        Serial.println("[LOGGER] Could not open CSV file for writing");
+        Serial.println("[LOGGER] Could not open CSV file for writing — falling back to USB serial");
+        dump_csv_over_serial();
         return;
     }
 
@@ -194,6 +211,10 @@ void logger_finalize() {
     Serial.print(_count);
     Serial.print(" records to ");
     Serial.println(_csv_name);
+}
+
+void logger_usb_dump() {
+    dump_csv_over_serial();
 }
 
 uint16_t logger_record_count() { return _count; }

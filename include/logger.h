@@ -11,6 +11,10 @@
 // GD25Q128 NOR flash is wired incorrectly on this board and cannot be used
 // for flight logging. Flight data is held in a RAM ring buffer in flight,
 // then dumped to the SD card (FLIGHT_XXX.CSV) when logger_finalize() runs.
+// If the SD card isn't present or its init failed, the RAM buffer is the
+// only copy of the data — logger_finalize() falls back to streaming it as
+// CSV over USB serial instead of silently discarding it, and
+// logger_usb_dump() does the same thing on demand.
 
 // RAM ring buffer — absorbs high-rate writes during flight.
 // 4000 records × sizeof(LogRecord) bytes. DMAMEM places this in OCRAM2.
@@ -84,8 +88,19 @@ void logger_checkpoint(FlightState state, float altitude_m);
 /**
  * Dump the RAM ring buffer to the SD .CSV file, oldest record first, and
  * close it out. Call on landing. Idempotent — a second call is a no-op.
+ * Falls back to logger_usb_dump() if the SD card isn't ready or the file
+ * can't be opened, so a failed card never means lost data.
  */
 void logger_finalize();
+
+/**
+ * Stream the RAM ring buffer as CSV directly over USB serial, between
+ * "-----BEGIN FLIGHT CSV-----" / "-----END FLIGHT CSV-----" markers.
+ * Use this to retrieve flight data when there's no SD card, or to inspect
+ * it without pulling the card. Safe to call any time; not gated by
+ * logger_finalize()'s idempotence, so it can be called repeatedly.
+ */
+void logger_usb_dump();
 
 /**
  * How many records are currently in the RAM ring buffer.

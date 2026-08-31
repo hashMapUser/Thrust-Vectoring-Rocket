@@ -103,6 +103,15 @@ bool lsm6dsox_init() {
     // 5. Gyro: 833 Hz, ±2000 dps
     write_register(LSM6DSOX_REG_CTRL2_G, LSM6DSOX_G_833HZ_2000DPS);
 
+    // 6. Turn-on settling — the gyro's MEMS resonator and internal filter
+    // need time to converge after being enabled. Measured on the bench:
+    // the first sample after this write can show a transient of 100+ dps
+    // on a stationary board, decaying to <1 dps within ~60 ms. Accel shows
+    // no equivalent transient (no resonant drive, settles far faster), so
+    // this is specific to the gyro path. Block here rather than making
+    // every caller discard its first few reads.
+    delay(100);
+
     return true;
 }
 

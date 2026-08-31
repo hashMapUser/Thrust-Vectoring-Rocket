@@ -10,32 +10,52 @@ static void enter_state(FlightSM *fsm, FlightState new_state) {
     fsm->state          = new_state;
     fsm->state_entry_ms = millis();
 
-    Serial.print("[FSM] ");
+    Serial.print("\n========================================\n");
+    Serial.print("[FSM] STATE TRANSITION: ");
     Serial.print(STATE_NAMES[fsm->prev_state]);
     Serial.print(" → ");
     Serial.println(STATE_NAMES[new_state]);
+    Serial.print("========================================\n");
 }
 
-// G1 — Pad-rest latch: vehicle must be stationary and vertical for
-// PAD_REST_MS before it's considered settled on the pad. Shared by IDLE
-// (gates auto-arm) and ARMED (gates launch detection).
+// Bench aid: non-blocking green-LED flash on pad-rest latch, so it's
+// visible without a serial monitor open. No delay() here — this runs
+// inside the 125 Hz flight loop and must not stall sensor reads / PID /
+// pyro fire-duration timing for however long a blocking flash would take.
+#define PAD_REST_LED_FLASH_MS 300
+static uint32_t pad_rest_led_off_ms = 0;
+
 static void update_pad_rest(FlightSM *fsm, float accel_mag_g, float gyro_rate_dps,
                              float accel_up_g, float altitude_m, uint32_t now) {
+    if (pad_rest_led_off_ms != 0 && (int32_t)(now - pad_rest_led_off_ms) >= 0) {
+        digitalWriteFast(PIN_LED_GREEN, LOW);
+        pad_rest_led_off_ms = 0;
+    }
+
     bool accel_ok   = (accel_mag_g  >= PAD_REST_ACCEL_LOW_G &&
                         accel_mag_g  <= PAD_REST_ACCEL_HIGH_G);
     bool gyro_ok    = (gyro_rate_dps < PAD_REST_GYRO_DPS);
     bool upright_ok = (accel_up_g    > PAD_REST_ACCEL_UP_G);
 
     if (accel_ok && gyro_ok && upright_ok) {
-        if (fsm->pad_rest_start_ms == 0)
+        if (fsm->pad_rest_start_ms == 0) {
             fsm->pad_rest_start_ms = now;
+            Serial.println("[FSM] Pad rest timer started...");
+        }
         if (!fsm->pad_rest_satisfied && (now - fsm->pad_rest_start_ms) >= PAD_REST_MS) {
             fsm->pad_rest_satisfied      = true;
             fsm->pad_rest_baseline_alt_m = altitude_m;
+            Serial.print("[FSM] PAD REST SATISFIED. Baseline Alt: ");
+            Serial.print(altitude_m);
+            Serial.println(" m. Ready for launch.");
+
+            digitalWriteFast(PIN_LED_GREEN, HIGH);
+            pad_rest_led_off_ms = now + PAD_REST_LED_FLASH_MS;
         }
     } else {
-        // Any condition break clears the latch — cannot be satisfied
-        // mid-carry and then immediately satisfy launch detect.
+        if (fsm->pad_rest_start_ms != 0 || fsm->pad_rest_satisfied) {
+            Serial.println("[FSM] Pad rest LOST (movement detected). Resetting latch.");
+        }
         fsm->pad_rest_start_ms  = 0;
         fsm->pad_rest_satisfied = false;
     }
@@ -60,35 +80,8 @@ void fsm_init(FlightSM *fsm) {
     fsm->pad_rest_start_ms       = 0;
     fsm->pad_rest_baseline_alt_m = 0.0f;
     fsm->imu_fault               = false;
-}
-
-bool fsm_arm(FlightSM *fsm, PyroState *pyro, bool arm_sense_ok) {
-    if (fsm->state != STATE_IDLE) return false;
-
-    // T3: Refuse IDLE→ARMED unless the caller has confirmed pyro power/continuity.
-    if (!arm_sense_ok) {
-        Serial.println("[FSM] ARM REJECTED — pyro power/continuity not confirmed");
-        return false;
-    }
-
-    pyro_arm(pyro);
-    enter_state(fsm, STATE_ARMED);
-    fsm->tvc_enabled             = true;
-    // Re-latch pad-rest fresh in ARMED — an extra stability window right up
-    // to launch detection, on top of the one that gated auto-arm.
-    fsm->pad_rest_satisfied      = false;
-    fsm->pad_rest_start_ms       = 0;
-    fsm->pad_rest_baseline_alt_m = 0.0f;
-    fsm->launch_detect_ms        = 0;
-    fsm->peak_velocity_ms        = 0.0f;
-    return true;
-}
-
-void fsm_disarm(FlightSM *fsm, PyroState *pyro) {
-    if (fsm->state != STATE_ARMED) return;
-    pyro_disarm(pyro);
-    fsm->tvc_enabled = false;
-    enter_state(fsm, STATE_IDLE);
+    
+    Serial.println("[FSM] Initialized. Awaiting pad rest.");
 }
 
 void fsm_abort(FlightSM *fsm) {
@@ -124,6 +117,7 @@ void fsm_update(FlightSM *fsm,
 
     if (fsm->imu_fault &&
         (fsm->state == STATE_POWERED || fsm->state == STATE_COAST)) {
+        Serial.println("[FSM] CRITICAL: IMU FAULT DURING FLIGHT!");
         fsm_abort(fsm);
         return;
     }
@@ -132,63 +126,58 @@ void fsm_update(FlightSM *fsm,
     switch (fsm->state) {
 
         case STATE_IDLE:
-            // No arm switch this flight — the pad-rest latch computed here
-            // is polled by the caller to auto-arm once the vehicle has sat
-            // still and upright for PAD_REST_MS.
-            update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
-            break;
-
-        case STATE_ARMED: {
-            // G1 — Pad-rest precondition: vehicle must be stationary and
-            // vertical for PAD_REST_MS before a launch signature is accepted.
-            update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
-
-            // G2 — Launch detection: 4 g sustained for 200 ms, AND altitude
-            // must have gained LAUNCH_ALT_DELTA_M within LAUNCH_CONFIRM_MS of
-            // that latch starting. Accel alone can't tell a launch from a
-            // knock/bump on the pad; altitude confirms real liftoff.
-            // Only allowed after G1 is satisfied.
+            // No arm step — there's no arming mechanism on this board.
+            // Pad-rest gates launch detection directly: once latched,
+            // watch for a real launch signature and go straight to
+            // POWERED. (This used to be a two-stage IDLE -> ARMED ->
+            // POWERED flow with a re-latch in between; collapsed to one
+            // stage since there's nothing left to gate the ARMED step on.)
             if (fsm->pad_rest_satisfied && accel_up_g > LAUNCH_ACCEL_THRESHOLD_G) {
                 if (fsm->launch_detect_ms == 0) {
                     fsm->launch_detect_ms = now;
+                    Serial.println("[FSM] >> LAUNCH ACCEL DETECTED! Waiting for hold time and altitude gain...");
                 } else {
                     uint32_t held_ms    = now - fsm->launch_detect_ms;
                     bool alt_confirmed  = (altitude_m - fsm->pad_rest_baseline_alt_m) >= LAUNCH_ALT_DELTA_M;
 
                     if (held_ms >= LAUNCH_ACCEL_MS && alt_confirmed) {
+                        Serial.println("[FSM] >> LIFTOFF CONFIRMED!");
                         fsm->powered_entry_ms = now;
+                        fsm->tvc_enabled      = true;
                         enter_state(fsm, STATE_POWERED);
                         fsm->launch_detect_ms = 0;
                     } else if (held_ms >= LAUNCH_CONFIRM_MS) {
-                        // Accel held long enough but altitude never came —
-                        // false trigger. Reset and keep waiting on the pad.
+                        Serial.println("[FSM] >> FALSE LAUNCH TRIGGER: Altitude gain failed. Resetting.");
                         fsm->launch_detect_ms = 0;
+                        fsm->pad_rest_satisfied = false;
                     }
                 }
             } else {
                 fsm->launch_detect_ms = 0;
+                update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
             }
             break;
-        }
+
+        // STATE_ARMED is unused — kept in the enum only so log/telemetry
+        // numbering doesn't shift. The FSM never transitions into it.
+        case STATE_ARMED:
+            break;
 
         case STATE_POWERED:
-            // G3 — Track peak velocity for flight-proof latch.
             if (velocity_ms > fsm->peak_velocity_ms)
                 fsm->peak_velocity_ms = velocity_ms;
 
-            // Burnout: thrust gone → falls toward 0 g.
             if (accel_up_g < BURNOUT_ACCEL_THRESHOLD_G) {
+                Serial.println("[FSM] >> MOTOR BURNOUT DETECTED. Coasting...");
                 fsm->tvc_enabled = false;
                 enter_state(fsm, STATE_COAST);
             }
             break;
 
         case STATE_COAST:
-            // G3 — Continue tracking peak velocity.
             if (velocity_ms > fsm->peak_velocity_ms)
                 fsm->peak_velocity_ms = velocity_ms;
 
-            // Gates G3 and G4 must both be satisfied before apogee is reachable.
             {
                 uint32_t time_since_powered = now - fsm->powered_entry_ms;
                 bool g3 = (fsm->peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS);
@@ -197,10 +186,13 @@ void fsm_update(FlightSM *fsm,
 
                 if (g3 && g4) {
                     bool vel_apogee = (fsm->prev_velocity_ms > 0.0f && velocity_ms <= 0.0f);
-                    // G7 — Timeout backstop only fires when G3+G4 are satisfied.
                     bool timeout    = (fsm_time_in_state(fsm) >= APOGEE_TIMEOUT_MS);
 
-                    if (vel_apogee || timeout) {
+                    if (vel_apogee) {
+                        Serial.println("[FSM] >> APOGEE DETECTED: Vertical velocity crossed 0.");
+                        enter_state(fsm, STATE_APOGEE);
+                    } else if (timeout) {
+                        Serial.println("[FSM] >> APOGEE DETECTED: Coast timeout reached.");
                         enter_state(fsm, STATE_APOGEE);
                     }
                 }
@@ -208,28 +200,26 @@ void fsm_update(FlightSM *fsm,
             break;
 
         case STATE_APOGEE:
-            // Single-chute flight: jump directly to STATE_MAIN.
-            // Pyro fire is handled by main loop on STATE_MAIN entry.
+            Serial.println("[FSM] >> DEPLOYING MAIN CHUTE");
             enter_state(fsm, STATE_MAIN);
             break;
 
         case STATE_DESCENT:
-            // Not reached on single-chute flights.
             break;
 
         case STATE_MAIN:
-            // Landing detection: accel magnitude near 1 g AND gyro near zero,
-            // held for LANDED_TIME_MS.
             {
                 bool accel_ok = (accel_mag_g >= LANDED_ACCEL_LOW_G &&
                                  accel_mag_g <= LANDED_ACCEL_HIGH_G);
                 bool gyro_ok  = (gyro_rate_dps < LANDED_GYRO_THRESHOLD_DPS);
 
                 if (accel_ok && gyro_ok) {
-                    if (fsm_time_in_state(fsm) >= LANDED_TIME_MS)
+                    if (fsm_time_in_state(fsm) >= LANDED_TIME_MS) {
+                        Serial.println("[FSM] >> TOUCHDOWN CONFIRMED.");
                         enter_state(fsm, STATE_LANDED);
+                    }
                 } else {
-                    fsm->state_entry_ms = now;  // reset timer while still moving
+                    fsm->state_entry_ms = now;  
                 }
             }
             break;

@@ -117,6 +117,8 @@ typedef struct {
  *   digitalWrite(PIN_IMU_CS, HIGH);
  *
  * Issues a software reset, verifies WHO_AM_I, then configures accel + gyro.
+ * Blocks ~100 ms after enabling the gyro so its turn-on transient settles
+ * before returning — the first lsm6dsox_read() after this call is clean.
  *
  * @return true on success; false if WHO_AM_I mismatches.
  */

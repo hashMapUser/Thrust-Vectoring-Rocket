@@ -73,15 +73,6 @@ bool pyro_check_continuity(uint8_t sense_pin, float pack_v) {
     return v > (expected * PYRO_CONT_FRACTION);
 }
 
-void pyro_disarm(PyroState *pyro) {
-    pyro->drogue_armed = false;
-    pyro->main_armed   = false;
-    digitalWrite(PIN_PYRO1_FIRE, LOW);
-    digitalWrite(PIN_PYRO2_FIRE, LOW);
-    pyro->drogue_firing = false;
-    pyro->main_firing   = false;
-    Serial.println("[PYRO] Disarmed");
-}
 
 void pyro_fire_drogue(PyroState *pyro) {
     if (!pyro->drogue_armed) { Serial.println("[PYRO] Drogue fire blocked — not armed"); return; }

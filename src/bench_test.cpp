@@ -21,6 +21,7 @@
 //    A — Altitude estimator self-check (no hardware needed)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
 //    M — Live health monitor ($HLTH frames for bench_gui.py / health_monitor.py)
+//    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
 // ============================================================
 
@@ -622,20 +623,40 @@ static void test_logger_roundtrip() {
     }
     pass("All 50 records written");
 
-    Serial.println(F("  Dumping RAM buffer to SD..."));
+    Serial.println(F("  Finalising (SD if ready, USB serial fallback if not)..."));
     logger_finalize();
-    pass("CSV written to SD");
 
-    Serial.println();
-    Serial.println(F("  ── SD RETRIEVAL GUIDE ─────────────────────────────────"));
-    Serial.println(F("  After a real flight:"));
-    Serial.println(F("    1. Eject the SD card (or send 'R' to force a dump early)"));
-    Serial.println(F("    2. Read FLIGHT_XXX.CSV directly on a PC — no host script"));
-    Serial.println(F("       needed, it's already plain CSV"));
-    Serial.println(F("    3. FLIGHT_XXX.LOG holds the state-transition checkpoints"));
-    Serial.println(F("  ────────────────────────────────────────────────────────"));
+    if (ok) {
+        pass("CSV written to SD");
+        Serial.println();
+        Serial.println(F("  ── SD RETRIEVAL GUIDE ─────────────────────────────────"));
+        Serial.println(F("  After a real flight:"));
+        Serial.println(F("    1. Eject the SD card (or send 'R' to force a dump early)"));
+        Serial.println(F("    2. Read FLIGHT_XXX.CSV directly on a PC — no host script"));
+        Serial.println(F("       needed, it's already plain CSV"));
+        Serial.println(F("    3. FLIGHT_XXX.LOG holds the state-transition checkpoints"));
+        Serial.println(F("  ────────────────────────────────────────────────────────"));
+    } else {
+        pass("No SD card — fell back to USB serial dump above (check for the "
+             "BEGIN/END FLIGHT CSV markers)");
+    }
 
     pass("Logger round-trip PASSED");
+}
+
+// ============================================================
+//  TEST U — USB Log Dump
+//  Streams whatever is currently in the RAM ring buffer as CSV over
+//  serial, on demand — the retrieval path when there's no SD card.
+//  Run '6' first if the buffer is empty; this just dumps, it doesn't
+//  write any records itself.
+// ============================================================
+static void test_usb_dump() {
+    print_banner("TEST U: USB Log Dump (RAM buffer -> Serial CSV)");
+    Serial.print(F("  Records currently buffered: "));
+    Serial.println(logger_record_count());
+    logger_usb_dump();
+    pass("USB dump complete — check for the BEGIN/END FLIGHT CSV markers above");
 }
 
 // ============================================================
@@ -1087,6 +1108,7 @@ static void print_menu() {
     Serial.println(F("║  A - Altitude estimator self-check       ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
     Serial.println(F("║  M - Live health monitor ($HLTH frames)  ║"));
+    Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
     Serial.println(F("Send a character to begin."));
@@ -1140,6 +1162,7 @@ void loop() {
         case 'A': case 'a': test_altitude_estimator(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
         case 'M': case 'm': test_monitor(); break;
+        case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;
         default:
             Serial.print(F("Unknown command: "));

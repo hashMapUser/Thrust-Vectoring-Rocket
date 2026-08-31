@@ -30,7 +30,7 @@
 // POWERED → COAST: motor burnout
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f
 
-// G1 — Pad-rest precondition (must latch before ARMED → POWERED is allowed)
+// G1 — Pad-rest precondition (must latch before launch detection is armed)
 #define PAD_REST_MS                2000   // ms of continuous pad-rest
 #define PAD_REST_ACCEL_LOW_G       0.90f
 #define PAD_REST_ACCEL_HIGH_G      1.10f
@@ -62,7 +62,7 @@
 
 typedef enum {
     STATE_IDLE          = 0,
-    STATE_ARMED         = 1,
+    STATE_ARMED         = 1,   // unused — no arming mechanism on this board; kept so numbering doesn't shift
     STATE_POWERED       = 2,
     STATE_COAST         = 3,
     STATE_APOGEE        = 4,
@@ -96,8 +96,8 @@ typedef struct {
     bool     main_fired;
     bool     tvc_enabled;
 
-    // G1 — pad-rest latch (evaluated in IDLE to gate auto-arm, and again in
-    // ARMED to gate launch detection)
+    // G1 — pad-rest latch (evaluated in IDLE; once true, gates launch
+    // detection directly — no arm step in between)
     bool     pad_rest_satisfied;
     uint32_t pad_rest_start_ms;
     float    pad_rest_baseline_alt_m;  // altitude snapshot when latch is satisfied
@@ -123,19 +123,6 @@ void fsm_update(FlightSM *fsm,
                 float gyro_rate_dps,
                 float altitude_m,
                 bool  imu_valid);
-
-/**
- * Arm. Only valid from STATE_IDLE.
- * No physical arm switch this flight — the caller invokes this automatically
- * once IDLE's pad-rest latch (fsm->pad_rest_satisfied) is true and its own
- * continuity/pack-voltage check has passed.
- * @param arm_sense_ok  true if the caller has confirmed pyro power present.
- * @return true if arm accepted.
- */
-bool fsm_arm(FlightSM *fsm, PyroState *pyro, bool arm_sense_ok);
-
-/** Disarm — valid from ARMED only. */
-void fsm_disarm(FlightSM *fsm, PyroState *pyro);
 
 /** Emergency abort — safes all outputs, sets STATE_ABORT. */
 void fsm_abort(FlightSM *fsm);

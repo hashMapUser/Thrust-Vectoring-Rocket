@@ -43,11 +43,12 @@ static buzzer_t       buzz;
 const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
 uint32_t last_loop_time = 0;
 
-// --- AUTO-ARM ---
-// No physical arm switch this flight: IDLE's pad-rest latch (fsm.pad_rest_satisfied)
-// stands in for it. Once the vehicle has sat still and upright on the pad for
-// PAD_REST_MS, we run the same continuity/pack-voltage check the switch used
-// to gate and arm automatically.
+// --- ARMING ---
+// There is no arming mechanism on this board — pyro_arm() is called
+// unconditionally in setup(). The FSM just watches for a launch signature
+// (see flight_sm.cpp's STATE_IDLE case) and goes straight to POWERED.
+// This flag only tracks the pad-rest rising edge, to lock in the accel
+// bias calibration at the same moment the old auto-arm step used to.
 static bool pad_rest_prev = false;
 
 // ARM_SENSE divider: 10K/4.7K, ratio 0.3197. The pyro pack voltage isn't
@@ -84,6 +85,25 @@ void setup() {
     buzzer_init(&buzz, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
     buzzer_set(&buzz, BUZZ_BOOT);
     pyro_init(&pyros);
+
+    // No arming mechanism on this board — armed unconditionally. See
+    // simple_fsm.h (finned_control_loop.cpp) for the same trade-off and
+    // its full safety note. Continuity is checked here as a diagnostic
+    // only — it does not gate anything.
+    pyro_arm(&pyros);
+    {
+        float pack_v  = read_pack_voltage();
+        bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
+        Serial.print("[PYRO] Armed at boot. Pyro1 (main) continuity: ");
+        Serial.print(cont_ok ? "OK" : "OPEN");
+        Serial.print("  pack=");
+        Serial.print(pack_v, 2);
+        Serial.println(" V");
+    }
+
+    // Green LED — bench aid, flashed by flight_sm.cpp on pad-rest latch.
+    pinMode(PIN_LED_GREEN, OUTPUT);
+    digitalWrite(PIN_LED_GREEN, LOW);
 
     // 3. SENSOR INIT — before servo_init() attaches and centers the servos.
     // That draws a current spike, and lsm6dsox_init() is a one-shot
@@ -134,7 +154,7 @@ void setup() {
     }
 
     buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
-    Serial.println("FLIGHT COMPUTER READY. WILL AUTO-ARM ON PAD-REST.");
+    Serial.println("FLIGHT COMPUTER READY. PYRO ARMED. WAITING FOR LAUNCH.");
 }
 
 void loop() {
@@ -149,34 +169,16 @@ void loop() {
 
     uint32_t now_ms = millis();
 
-    // ── 1. AUTO-ARM (T3) ──────────────────────────────────────
-    // No arm switch this flight. fsm_update() below latches pad_rest_satisfied
-    // once the vehicle has sat still and upright for PAD_REST_MS; on that
-    // latch's rising edge we run the same continuity/pack-voltage check the
-    // switch used to gate, then arm automatically.
+    // ── 1. ACCEL BIAS LOCK ─────────────────────────────────────
+    // No arm step — pyro is already armed from setup(). This just locks
+    // in the accel calibration bias the moment pad-rest first latches,
+    // same timing the old auto-arm step used.
     {
         bool pad_rest_now = (fsm.state == STATE_IDLE) && fsm.pad_rest_satisfied;
         if (pad_rest_now && !pad_rest_prev) {
             alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
-
-            float pack_v  = read_pack_voltage();
-            bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
-            Serial.print("[ARM] Pyro1 (main) continuity: ");
-            Serial.print(cont_ok ? "OK" : "OPEN");
-            Serial.print("  pack=");
-            Serial.print(pack_v, 2);
-            Serial.println(" V");
-
-            if (!cont_ok) {
-                buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
-                Serial.println("[ARM] Auto-arm rejected — main chute e-match continuity failed.");
-            } else if (fsm_arm(&fsm, &pyros, true)) {
-                logger_checkpoint(STATE_ARMED, alt_est.altitude_m);
-                buzzer_set(&buzz, BUZZ_ARMED);
-                Serial.println("[ARM] Auto-armed on pad-rest.");
-            } else {
-                Serial.println("[ARM] Auto-arm rejected — not in IDLE.");
-            }
+            buzzer_set(&buzz, BUZZ_ARMED);
+            Serial.println("[INIT] Pad-rest latched — accel bias locked in.");
         }
         pad_rest_prev = pad_rest_now;
     }
@@ -184,10 +186,7 @@ void loop() {
     // Serial commands
     if (Serial.available()) {
         char c = Serial.read();
-        if (c == 'D') {
-            fsm_disarm(&fsm, &pyros);
-            Serial.println("[ARM] Disarmed via serial.");
-        } else if (c == 'X') {
+        if (c == 'X') {
             fsm_abort(&fsm);
             pyro_safe_all(&pyros);
             Serial.println("[ARM] Abort via serial.");
@@ -205,6 +204,14 @@ void loop() {
             // automatically on STATE_LANDED; this covers bench testing
             // or forcing a dump before landing is detected.
             logger_finalize();
+        } else if (c == 'U') {
+            // USB CSV dump, independent of logger_finalize()'s idempotence.
+            // The auto-finalize at STATE_LANDED fires the moment it's
+            // reached, whether or not a USB cable is plugged in at that
+            // exact instant — if it wasn't, that dump went nowhere. This
+            // re-streams the RAM buffer on demand after recovery, any
+            // number of times, as long as power hasn't been lost.
+            logger_usb_dump();
         }
     }
 
@@ -297,6 +304,14 @@ void loop() {
     buzzer_update(&buzz);
 
     // ── 7. LOGGING ────────────────────────────────────────────
+    // Stop once landed. logger_write() runs unconditionally otherwise, so
+    // the ring buffer would keep recording nothing but ground noise after
+    // touchdown — with no SD card, that overwrites the actual flight data
+    // within LOG_RAM_CAPACITY/125Hz (~32 s) if nobody's retrieved it yet.
+    // STATE_ABORT keeps logging — that's when you want the most data, not
+    // the least, and it doesn't wrap into STATE_LANDED on its own.
+    if (fsm.state == STATE_LANDED) return;
+
     LogRecord rec;
 
     rec.timestamp_ms = now_ms;

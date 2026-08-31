@@ -66,10 +66,10 @@ void pyro_init(PyroState *pyro);
 
 /**
  * Arm both pyro channels unconditionally.
- * Continuity is not checked here — call pyro_check_continuity() upstream
- * (e.g. at the ARM_SENSE rising edge) and gate the call to this function
- * on the result, so a bad e-match blocks arming rather than firing.
- * @return always true (kept for API compat with fsm_arm caller).
+ * There is no arming mechanism on this board — callers arm once at boot
+ * and never disarm. Continuity is not checked here; callers may run
+ * pyro_check_continuity() separately as a diagnostic if they want one.
+ * @return always true (kept for API compat).
  */
 bool pyro_arm(PyroState *pyro);
 
@@ -88,11 +88,6 @@ bool pyro_arm(PyroState *pyro);
  * @return true if continuity is present.
  */
 bool pyro_check_continuity(uint8_t sense_pin, float pack_v);
-
-/**
- * Disarm both channels and set outputs LOW.
- */
-void pyro_disarm(PyroState *pyro);
 
 /**
  * Fire the drogue charge. Non-blocking. Call pyro_update() every loop.
