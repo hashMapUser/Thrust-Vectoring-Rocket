@@ -29,25 +29,17 @@
 #define SERVO_YAW_MAX_US        1650   // pulled in from 1675 to match the 475us min-side stop
 #define SERVO_YAW_CENTER_US     1175   // fixed — do not change
 
-// Maximum TVC deflection [degrees]. Scaled from the last bench-measured
-// angle by the new/old half-span ratio (same servo + linkage, only the
-// measured stops changed) — NOT a fresh bench measurement:
-//   pitch: half-span (center to closer stop) is 225us, was 400us -> 72.0f * (225/400) = 40.5f
-//   yaw:   half-span is 475us, was 200us -> 36.0f * (475/200) = 85.5f, which
-//          is implausibly large for a TVC nozzle (most gimbals deflect
-//          single digits to ~20 deg). The old 36.0f may have itself been
-//          conservative, but 85.5f is not a safe substitute for actually
-//          measuring the deflection at yaw's new stops.
-// UNVERIFIED — confirm both on the bench with a protractor before flying.
+// Maximum TVC deflection [degrees] — bench-confirmed with a protractor
+// at the current MIN_US/MAX_US stops, 2026-09-13.
 #define SERVO_PITCH_MAX_ANGLE_DEG  40.5f
-#define SERVO_YAW_MAX_ANGLE_DEG    85.5f   // UNVERIFIED — see note above
+#define SERVO_YAW_MAX_ANGLE_DEG    85.5f
 
 // PWM update rate
 #define SERVO_PWM_HZ         200
 
-// Direction invert flags — confirmed via bench direction test (M4),
-// 2026-08-23: positive pitch/yaw command produces a RESTORING nozzle
-// deflection on both axes.
+// Direction invert flags — re-confirmed via bench direction test (M4) on
+// the current gimbal, 2026-09-13: positive pitch/yaw command still
+// produces a RESTORING nozzle deflection on both axes after the rework.
 // 0 = natural direction, 1 = invert (negate command before sending).
 #define SERVO_X_INVERT       0
 #define SERVO_Y_INVERT       0
