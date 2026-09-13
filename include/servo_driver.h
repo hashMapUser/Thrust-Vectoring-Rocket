@@ -11,21 +11,36 @@
 // SERVO CONFIG
 // --------------------------------------------------------
 
-// Per-axis PWM pulse widths [microseconds] — from bench range test (M3),
-// 2026-08-23. Pitch and yaw are on separate linkages and are NOT symmetric
-// around the same center — do not collapse these back into shared constants.
-#define SERVO_PITCH_MIN_US      1100
-#define SERVO_PITCH_MAX_US      1900
-#define SERVO_PITCH_CENTER_US   1500
+// Per-axis PWM pulse widths [microseconds]. CENTER_US is the verified
+// neutral/trim position and is NOT to be moved to make the math convenient
+// — it stays fixed at whatever the physical zero-deflection point is.
+// MIN_US/MAX_US were re-measured hard stops as of 2026-09-13; they were
+// asymmetric around CENTER_US, so the farther side on each axis has been
+// pulled in to match the closer (more constraining) side, trading away
+// some of that axis's extra travel to keep a single symmetric
+// MAX_ANGLE_DEG safe in both directions. Pitch and yaw are on separate
+// linkages with different spans — do not collapse these into shared
+// constants.
+#define SERVO_PITCH_MIN_US      975    // pulled in from 625 to match the 225us max-side stop
+#define SERVO_PITCH_MAX_US      1425   // true stop — closer side, unchanged
+#define SERVO_PITCH_CENTER_US   1200   // fixed — do not change
 
-#define SERVO_YAW_MIN_US        1175
-#define SERVO_YAW_MAX_US        1575
-#define SERVO_YAW_CENTER_US     1375
+#define SERVO_YAW_MIN_US        700    // true stop — closer side, unchanged
+#define SERVO_YAW_MAX_US        1650   // pulled in from 1675 to match the 475us min-side stop
+#define SERVO_YAW_CENTER_US     1175   // fixed — do not change
 
-// Maximum TVC deflection [degrees] — from bench measurement (M3), assuming
-// 180° servos on both axes.
-#define SERVO_PITCH_MAX_ANGLE_DEG  72.0f
-#define SERVO_YAW_MAX_ANGLE_DEG    36.0f
+// Maximum TVC deflection [degrees]. Scaled from the last bench-measured
+// angle by the new/old half-span ratio (same servo + linkage, only the
+// measured stops changed) — NOT a fresh bench measurement:
+//   pitch: half-span (center to closer stop) is 225us, was 400us -> 72.0f * (225/400) = 40.5f
+//   yaw:   half-span is 475us, was 200us -> 36.0f * (475/200) = 85.5f, which
+//          is implausibly large for a TVC nozzle (most gimbals deflect
+//          single digits to ~20 deg). The old 36.0f may have itself been
+//          conservative, but 85.5f is not a safe substitute for actually
+//          measuring the deflection at yaw's new stops.
+// UNVERIFIED — confirm both on the bench with a protractor before flying.
+#define SERVO_PITCH_MAX_ANGLE_DEG  40.5f
+#define SERVO_YAW_MAX_ANGLE_DEG    85.5f   // UNVERIFIED — see note above
 
 // PWM update rate
 #define SERVO_PWM_HZ         200
