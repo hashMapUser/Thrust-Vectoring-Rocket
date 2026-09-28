@@ -14,8 +14,15 @@
 // 150 ms is ample for ignition; shorter pulse limits contact energy if match fails open.
 #define PYRO_FIRE_DURATION_MS 150
 
-// Minimum altitude to allow main deploy [m AGL]
-#define PYRO_MAIN_MIN_ALT_M   50.0f
+// Minimum altitude to allow main deploy [m AGL].
+// This flight is single-deploy at apogee: ground protection against an
+// accidental fire comes from the FSM's launch-confirm gates (a real
+// altitude gain + sustained accel is required before the state machine
+// will even reach STATE_APOGEE), not from an altitude floor here. A floor
+// only makes sense for a *dual-deploy* main charge fired well below
+// apogee — if this board ever flies that way, put the floor back for the
+// main only, never for the apogee/drogue charge.
+#define PYRO_MAIN_MIN_ALT_M   0.0f
 
 // EEPROM — persist fired flags across brownouts so a reset cannot re-arm a spent channel.
 #define PYRO_EEPROM_ADDR      30   // bytes 30-33 (after gyro bias at 10-23)
@@ -66,12 +73,22 @@ void pyro_init(PyroState *pyro);
 
 /**
  * Arm both pyro channels unconditionally.
- * There is no arming mechanism on this board — callers arm once at boot
- * and never disarm. Continuity is not checked here; callers may run
+ * The arming switch (SW401) is a hardware interlock that physically cuts
+ * PYRO PWR — it is not read here. Callers arm once at boot and never
+ * disarm in software; a flaky ARM_SENSE reading must never be able to
+ * block a deployment. Continuity is not checked here; callers may run
  * pyro_check_continuity() separately as a diagnostic if they want one.
  * @return always true (kept for API compat).
  */
 bool pyro_arm(PyroState *pyro);
+
+/**
+ * Clear both "fired" flags (RAM and EEPROM) to arm a new flight.
+ * Call this on the arming switch's off -> on edge while on the pad (see
+ * main_control_loop.cpp), never unconditionally at boot — a mid-flight
+ * reset must keep the flags so a spent channel cannot re-fire.
+ */
+void pyro_clear_fired(PyroState *pyro);
 
 /**
  * Check e-match continuity on one pyro channel.

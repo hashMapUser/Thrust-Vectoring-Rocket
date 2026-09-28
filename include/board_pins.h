@@ -39,7 +39,7 @@
 #define PIN_BUZZER       3
 // Measured resonant peak for this board's transducer.
 // Sweep 1500-4500 Hz on the bench and update to the loudest frequency.
-#define BUZZER_FREQ_HZ   2500   /* CMT-1203 nominal — measure and tune */
+#define BUZZER_FREQ_HZ   2500   /* SMT-0840-T — re-measure with the bench sweep ('B') and tune if this board's peak differs */
 #define PIN_PYRO1_FIRE   32   // main chute (single-deploy flight)
 #define PIN_PYRO2_FIRE   31   // unused this flight
 

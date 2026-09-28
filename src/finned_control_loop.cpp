@@ -2,8 +2,11 @@
 //  finned_control_loop.cpp
 //
 //  Minimal flight firmware for a finned (no-TVC) recovery-only flight.
-//  Uses simple_fsm.h instead of flight_sm.h — no arm/disarm step, no
-//  pad-rest latch, no continuity gate, no PID/servo control.
+//  Uses simple_fsm.h instead of flight_sm.h — no ARMED flight-state, no
+//  pad-rest latch, no PID/servo control. The arming switch (SW401) is
+//  still read here (see the "ARMING SWITCH" block below) to clear the
+//  EEPROM fired-flags and check continuity for each new flight, but it
+//  does not gate launch detection the way flight_sm.h's does.
 //
 //  SAFETY: the pyro channel is armed once at boot, unconditionally.
 //  See include/simple_fsm.h for the full safety note before powering
@@ -42,9 +45,38 @@ static buzzer_t     buzz;
 const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
 uint32_t last_loop_time = 0;
 
+// --- ARMING SWITCH (SW401) ---
+// simple_fsm.h is deliberately minimal and has no ARMED state — pyro_arm()
+// is called unconditionally at boot, same as before. What SW401 DOES still
+// need to drive here: clearing the EEPROM "fired" flags for a new flight
+// (see pyro_clear_fired()) and giving the pad crew an audible continuity
+// check, same as main_control_loop.cpp. See that file's arming-switch
+// block for the full policy this is a lighter version of.
+#define ARM_SENSE_DIVIDER_RATIO 0.3197f
+#define ARM_SENSE_ARMED_V       1.2f
+#define ARM_DEBOUNCE_MS         100
+
+static inline float read_arm_sense_v() {
+    return analogRead(PIN_ARM_SENSE) * 3.30f / 4095.0f;
+}
+static inline float read_pack_voltage() {
+    return read_arm_sense_v() / ARM_SENSE_DIVIDER_RATIO;
+}
+
+static bool     arm_raw_prev  = false;
+static uint32_t arm_edge_ms   = 0;
+static bool     arm_now       = false;
+static bool     arm_prev      = false;
+static bool     seen_disarmed = false;
+
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000) {}
+
+    // ARM_SENSE / PYRO1_SENSE — see the arming-switch block in loop()
+    analogReadResolution(12);
+    pinMode(PIN_ARM_SENSE, INPUT);
+    pinMode(PIN_PYRO1_SENSE, INPUT);
 
     // IMU CS must be HIGH before SPI.begin()
     pinMode(PIN_IMU_CS, OUTPUT);
@@ -98,6 +130,15 @@ void setup() {
     // Do not power this up with a live e-match connected unless you are
     // at the pad, ready to fly.
     pyro_arm(&pyros);
+    {
+        bool arm_raw_boot = read_arm_sense_v() > ARM_SENSE_ARMED_V;
+        Serial.print("[PYRO] Armed (software). SW401 reads: ");
+        Serial.println(arm_raw_boot ? "CLOSED (armed)" : "OPEN (safe)");
+        if (arm_raw_boot) {
+            Serial.println("[ARM] SW401 already closed at boot — likely a mid-flight reset. "
+                            "Fired flags kept.");
+        }
+    }
 
     {
         WDT_timings_t wdt_cfg;
@@ -118,6 +159,33 @@ void loop() {
 
     wdt.feed();
     uint32_t now_ms = millis();
+
+    // ── ARMING SWITCH (SW401) ─────────────────────────────────
+    // Lighter version of main_control_loop.cpp's block: this build has
+    // no ARMED state, so all it does is clear the fired flags and give
+    // an audible continuity check on a genuine new-flight arming edge.
+    {
+        bool arm_raw = read_arm_sense_v() > ARM_SENSE_ARMED_V;
+        if (arm_raw != arm_raw_prev) { arm_edge_ms = now_ms; arm_raw_prev = arm_raw; }
+        if ((now_ms - arm_edge_ms) >= ARM_DEBOUNCE_MS) arm_now = arm_raw;
+
+        if (!arm_now) seen_disarmed = true;
+
+        bool on_pad = (fsm.state == SIMPLE_STATE_IDLE);
+
+        if (on_pad && arm_now && !arm_prev && seen_disarmed) {
+            pyro_clear_fired(&pyros);
+            float pack_v  = read_pack_voltage();
+            bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
+            buzzer_set(&buzz, cont_ok ? BUZZ_ARMED : BUZZ_CONT_OPEN);
+            Serial.print("[ARM] SW401 CLOSED — new flight armed. Continuity: ");
+            Serial.println(cont_ok ? "OK" : "OPEN");
+        } else if (on_pad && !arm_now && arm_prev) {
+            buzzer_set(&buzz, BUZZ_IDLE);
+            Serial.println("[ARM] SW401 OPEN — disarmed.");
+        }
+        arm_prev = arm_now;
+    }
 
     // Serial commands
     if (Serial.available()) {

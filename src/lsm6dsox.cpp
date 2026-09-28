@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <EEPROM.h>
+#include <string.h>
 #include "lsm6dsox.h"
 
 // --------------------------------------------------------
@@ -115,9 +116,38 @@ bool lsm6dsox_init() {
     return true;
 }
 
+// Consecutive-sample fault tracking — see LSM6DSOX_FROZEN_STREAK /
+// LSM6DSOX_FAULT_STREAK in lsm6dsox.h for why this is streak-based rather
+// than a single-sample check.
+static uint8_t _prev_raw[12];
+static bool    _have_prev_raw    = false;
+static uint8_t _identical_streak = 0;
+static uint8_t _bad_streak       = 0;
+
 void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias) {
     uint8_t data[12];
     read_registers(LSM6DSOX_REG_OUTX_L_G, 12, data);
+
+    bool all_ff = true, all_00 = true;
+    for (int i = 0; i < 12; i++) {
+        if (data[i] != 0xFF) all_ff = false;
+        if (data[i] != 0x00) all_00 = false;
+    }
+
+    if (_have_prev_raw && memcmp(data, _prev_raw, sizeof(data)) == 0) {
+        if (_identical_streak < 0xFF) _identical_streak++;
+    } else {
+        _identical_streak = 0;
+    }
+    memcpy(_prev_raw, data, sizeof(data));
+    _have_prev_raw = true;
+
+    bool sample_bad = all_ff || all_00 || (_identical_streak >= LSM6DSOX_FROZEN_STREAK);
+    if (sample_bad) {
+        if (_bad_streak < 0xFF) _bad_streak++;
+    } else {
+        _bad_streak = 0;
+    }
 
     out->gx = to_int16(data[0], data[1]) * LSM6DSOX_GYRO_SCALE;
     out->gy = to_int16(data[2], data[3]) * LSM6DSOX_GYRO_SCALE;
@@ -133,7 +163,7 @@ void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias) {
         out->gz -= bias->z;
     }
 
-    out->valid = true;
+    out->valid = (_bad_streak < LSM6DSOX_FAULT_STREAK);
 }
 
 bool lsm6dsox_calibrate_gyro(GyroBias *bias) {

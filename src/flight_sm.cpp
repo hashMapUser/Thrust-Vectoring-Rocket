@@ -73,6 +73,7 @@ void fsm_init(FlightSM *fsm) {
     fsm->powered_entry_ms        = 0;
     fsm->prev_velocity_ms        = 0.0f;
     fsm->peak_velocity_ms        = 0.0f;
+    fsm->peak_altitude_m         = 0.0f;
     fsm->drogue_fired            = false;
     fsm->main_fired              = false;
     fsm->tvc_enabled             = false;
@@ -82,6 +83,16 @@ void fsm_init(FlightSM *fsm) {
     fsm->imu_fault               = false;
     
     Serial.println("[FSM] Initialized. Awaiting pad rest.");
+}
+
+void fsm_set_armed(FlightSM *fsm, bool armed) {
+    if (armed && fsm->state == STATE_IDLE) {
+        enter_state(fsm, STATE_ARMED);
+    } else if (!armed && fsm->state == STATE_ARMED) {
+        enter_state(fsm, STATE_IDLE);
+    }
+    // Any other state: launch already latched or flight is underway —
+    // the switch's ARM_SENSE reading is logged upstream but ignored here.
 }
 
 void fsm_abort(FlightSM *fsm) {
@@ -113,59 +124,87 @@ void fsm_update(FlightSM *fsm,
     uint32_t now = millis();
 
     // ── FAULT DETECTION ──────────────────────────────────────────
+    // lsm6dsox_read() only reports invalid after several consecutive bad
+    // samples (see lsm6dsox.cpp), so this latch is fed a filtered signal,
+    // not a single-glitch trigger.
     if (!imu_valid) fsm->imu_fault = true;
 
-    if (fsm->imu_fault &&
-        (fsm->state == STATE_POWERED || fsm->state == STATE_COAST)) {
-        Serial.println("[FSM] CRITICAL: IMU FAULT DURING FLIGHT!");
-        fsm_abort(fsm);
-        return;
+    if (fsm->imu_fault) {
+        if (fsm->state == STATE_IDLE || fsm->state == STATE_ARMED) {
+            // On the pad: nothing has flown yet, and launch detection /
+            // pad-rest both need the IMU. Safe everything.
+            Serial.println("[FSM] CRITICAL: IMU FAULT ON THE PAD!");
+            fsm_abort(fsm);
+            return;
+        }
+        if ((fsm->state == STATE_POWERED || fsm->state == STATE_COAST) &&
+            fsm->tvc_enabled) {
+            // In flight: stop steering, but keep recovery running.
+            // fsm_abort()/pyro_safe_all() must NOT be called here — that
+            // would disable the chute along with everything else. Apogee
+            // still has the baro-drop and launch-timeout backstops below,
+            // independent of the (possibly IMU-derived) velocity estimate.
+            Serial.println("[FSM] IMU FAULT IN FLIGHT — TVC disabled, recovery continues.");
+            fsm->tvc_enabled = false;
+        }
     }
 
     // ── STATE TRANSITIONS ─────────────────────────────────────────
     switch (fsm->state) {
 
+        // Launch detection runs in both IDLE and ARMED — if the crew
+        // forgets to close the arming switch, the motor still lights and
+        // the rocket still flies, so TVC must still steer and recovery
+        // must still work. Only the pyro fire path cares whether the
+        // switch is actually closed (it physically cuts PYRO PWR).
         case STATE_IDLE:
-            // No arm step — there's no arming mechanism on this board.
-            // Pad-rest gates launch detection directly: once latched,
-            // watch for a real launch signature and go straight to
-            // POWERED. (This used to be a two-stage IDLE -> ARMED ->
-            // POWERED flow with a re-latch in between; collapsed to one
-            // stage since there's nothing left to gate the ARMED step on.)
-            if (fsm->pad_rest_satisfied && accel_up_g > LAUNCH_ACCEL_THRESHOLD_G) {
-                if (fsm->launch_detect_ms == 0) {
+        case STATE_ARMED:
+            if (fsm->launch_detect_ms == 0) {
+                if (fsm->pad_rest_satisfied && accel_up_g > LAUNCH_ACCEL_THRESHOLD_G) {
                     fsm->launch_detect_ms = now;
-                    Serial.println("[FSM] >> LAUNCH ACCEL DETECTED! Waiting for hold time and altitude gain...");
+                    fsm->tvc_enabled      = true;   // steer from first motion, not just after confirmation
+                    Serial.println("[FSM] >> LAUNCH ACCEL DETECTED! TVC live. Waiting for hold time and altitude gain...");
                 } else {
-                    uint32_t held_ms    = now - fsm->launch_detect_ms;
-                    bool alt_confirmed  = (altitude_m - fsm->pad_rest_baseline_alt_m) >= LAUNCH_ALT_DELTA_M;
-
-                    if (held_ms >= LAUNCH_ACCEL_MS && alt_confirmed) {
-                        Serial.println("[FSM] >> LIFTOFF CONFIRMED!");
-                        fsm->powered_entry_ms = now;
-                        fsm->tvc_enabled      = true;
-                        enter_state(fsm, STATE_POWERED);
-                        fsm->launch_detect_ms = 0;
-                    } else if (held_ms >= LAUNCH_CONFIRM_MS) {
-                        Serial.println("[FSM] >> FALSE LAUNCH TRIGGER: Altitude gain failed. Resetting.");
-                        fsm->launch_detect_ms = 0;
-                        fsm->pad_rest_satisfied = false;
-                    }
+                    update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
                 }
             } else {
-                fsm->launch_detect_ms = 0;
-                update_pad_rest(fsm, accel_mag_g, gyro_rate_dps, accel_up_g, altitude_m, now);
-            }
-            break;
+                uint32_t held_ms = now - fsm->launch_detect_ms;
 
-        // STATE_ARMED is unused — kept in the enum only so log/telemetry
-        // numbering doesn't shift. The FSM never transitions into it.
-        case STATE_ARMED:
+                // Accel only has to hold for the short bump-rejection
+                // window — once past that, a transient dip while
+                // genuinely climbing must not cancel the launch.
+                if (held_ms < LAUNCH_ACCEL_MS && accel_up_g < LAUNCH_ACCEL_THRESHOLD_G) {
+                    Serial.println("[FSM] >> Accel dropped before hold time — treating as a bump.");
+                    fsm->launch_detect_ms = 0;
+                    fsm->tvc_enabled      = false;
+                    break;
+                }
+
+                bool alt_confirmed = (altitude_m - fsm->pad_rest_baseline_alt_m) >= LAUNCH_ALT_DELTA_M;
+
+                if (held_ms >= LAUNCH_ACCEL_MS && alt_confirmed) {
+                    if (fsm->state == STATE_IDLE)
+                        Serial.println("[FSM] >> WARNING: LIFTOFF CONFIRMED WHILE DISARMED (switch open)!");
+                    else
+                        Serial.println("[FSM] >> LIFTOFF CONFIRMED!");
+                    fsm->powered_entry_ms = now;
+                    fsm->tvc_enabled      = true;
+                    enter_state(fsm, STATE_POWERED);
+                    fsm->launch_detect_ms = 0;
+                } else if (held_ms >= LAUNCH_CONFIRM_MS) {
+                    Serial.println("[FSM] >> FALSE LAUNCH TRIGGER: Altitude gain failed. Resetting.");
+                    fsm->launch_detect_ms   = 0;
+                    fsm->tvc_enabled        = false;
+                    fsm->pad_rest_satisfied = false;
+                }
+            }
             break;
 
         case STATE_POWERED:
             if (velocity_ms > fsm->peak_velocity_ms)
                 fsm->peak_velocity_ms = velocity_ms;
+            if (altitude_m > fsm->peak_altitude_m)
+                fsm->peak_altitude_m = altitude_m;
 
             if (accel_up_g < BURNOUT_ACCEL_THRESHOLD_G) {
                 Serial.println("[FSM] >> MOTOR BURNOUT DETECTED. Coasting...");
@@ -177,24 +216,27 @@ void fsm_update(FlightSM *fsm,
         case STATE_COAST:
             if (velocity_ms > fsm->peak_velocity_ms)
                 fsm->peak_velocity_ms = velocity_ms;
+            if (altitude_m > fsm->peak_altitude_m)
+                fsm->peak_altitude_m = altitude_m;
 
             {
-                uint32_t time_since_powered = now - fsm->powered_entry_ms;
-                bool g3 = (fsm->peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS);
-                bool g4 = (time_since_powered >= MIN_FLIGHT_TIME_MS) &&
-                          (fsm_time_in_state(fsm) >= COAST_APOGEE_MIN_MS);
+                uint32_t since_launch = now - fsm->powered_entry_ms;
+                bool gate = (fsm->peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS) &&
+                            (fsm_time_in_state(fsm) >= COAST_APOGEE_MIN_MS);
 
-                if (g3 && g4) {
-                    bool vel_apogee = (fsm->prev_velocity_ms > 0.0f && velocity_ms <= 0.0f);
-                    bool timeout    = (fsm_time_in_state(fsm) >= APOGEE_TIMEOUT_MS);
+                bool vel_apogee  = gate && (velocity_ms <= 0.0f);   // level, not edge-triggered
+                bool baro_apogee = gate && ((fsm->peak_altitude_m - altitude_m) >= APOGEE_BARO_DROP_M);
+                bool timeout     = (since_launch >= APOGEE_TIMEOUT_FROM_LAUNCH_MS);   // no extra gates
 
-                    if (vel_apogee) {
-                        Serial.println("[FSM] >> APOGEE DETECTED: Vertical velocity crossed 0.");
-                        enter_state(fsm, STATE_APOGEE);
-                    } else if (timeout) {
-                        Serial.println("[FSM] >> APOGEE DETECTED: Coast timeout reached.");
-                        enter_state(fsm, STATE_APOGEE);
-                    }
+                if (vel_apogee) {
+                    Serial.println("[FSM] >> APOGEE DETECTED: Vertical velocity crossed 0.");
+                    enter_state(fsm, STATE_APOGEE);
+                } else if (baro_apogee) {
+                    Serial.println("[FSM] >> APOGEE DETECTED: Barometric altitude dropped from peak.");
+                    enter_state(fsm, STATE_APOGEE);
+                } else if (timeout) {
+                    Serial.println("[FSM] >> APOGEE DETECTED: Timeout from launch reached.");
+                    enter_state(fsm, STATE_APOGEE);
                 }
             }
             break;

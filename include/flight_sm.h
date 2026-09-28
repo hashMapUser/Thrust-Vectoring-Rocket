@@ -18,14 +18,18 @@
 // STATE TRANSITION THRESHOLDS
 // --------------------------------------------------------
 
-// G2 — Harder launch detection (was 2.5 g / 100 ms)
-#define LAUNCH_ACCEL_THRESHOLD_G   4.0f   // model motors deliver 5-15 g; 4 g has margin
-#define LAUNCH_ACCEL_MS            200    // sustained hold time
+// G2 — Launch detection, sized for this motor/airframe (F-15 @ 0.9 kg:
+// peak accel reading ~2.9 g, sustained ~1.6 g). Threshold sits between the
+// pad-rest ceiling (1.10 g) and the worst-case peak (~2.45 g, weak motor).
+// Only needs to hold for a short bump-rejection window — the altitude gain
+// check below is what actually confirms a real launch.
+#define LAUNCH_ACCEL_THRESHOLD_G   1.8f
+#define LAUNCH_ACCEL_MS            100    // accel must hold this long (bump rejection)
 
 // G2b — Altitude confirmation: a real launch must also show altitude gain,
 // not just an accel spike (rules out a bump/knock while sitting on the pad).
-#define LAUNCH_ALT_DELTA_M         3.0f   // m AGL gain required, measured from pad-rest baseline
-#define LAUNCH_CONFIRM_MS          300    // total window (from accel latch start) to see that gain
+#define LAUNCH_ALT_DELTA_M         2.0f    // m AGL gain required, measured from pad-rest baseline
+#define LAUNCH_CONFIRM_MS          1000    // total window (from accel latch start) to see that gain
 
 // POWERED → COAST: motor burnout
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f
@@ -37,18 +41,30 @@
 #define PAD_REST_GYRO_DPS          5.0f
 #define PAD_REST_ACCEL_UP_G        0.85f  // vehicle must be vertical
 
-// G3 — Flight-proof velocity latch
-#define MIN_FLIGHT_VELOCITY_MS     25.0f  // m/s — unreachable on the ground
+// G3 — Flight-proof velocity latch. All simulated cases (weak motor to
+// heavy) peak between 16 and 24 m/s, so 25 was unreachable — set below
+// the weakest case with margin.
+#define MIN_FLIGHT_VELOCITY_MS     10.0f  // m/s — unreachable on the ground
 
-// G4 — Minimum flight time from POWERED entry
-#define MIN_FLIGHT_TIME_MS         2500
-#define COAST_APOGEE_MIN_MS        1500   // minimum coast time (was 1000)
+// G4 — Minimum coast time before apogee gates are allowed to fire, so a
+// noisy velocity/altitude reading right at burnout can't look like apogee.
+#define COAST_APOGEE_MIN_MS        500
 
-// G5 — Altitude lockout for main deploy
-#define PYRO_MAIN_MIN_ALT_M        50.0f  // m AGL (real altitude required)
+// G5 — Altitude lockout for main deploy. NOTE: the real gate lives in
+// pyro.h's PYRO_MAIN_MIN_ALT_M — this build is single-deploy, so that
+// floor is 0 (ground protection comes from the launch-confirm gates
+// above, not an altitude floor on the apogee charge).
 
-// G7 — Timeout backstop (only fires if G3 + G4 are also satisfied)
-#define APOGEE_TIMEOUT_MS          8000
+// G6 — Independent apogee backstop: fire on altitude drop from peak, not
+// just on velocity crossing zero, in case the integrated-velocity
+// estimate is noisy or the IMU has faulted (see fsm_update()'s IMU-fault
+// handling — TVC gets disabled in flight, but apogee detection must not).
+#define APOGEE_BARO_DROP_M              3.0f
+
+// G7 — Timeout backstop, measured from LAUNCH (powered_entry_ms), not
+// from COAST entry — a short/weak flight can land before an
+// entry-relative timeout would ever fire.
+#define APOGEE_TIMEOUT_FROM_LAUNCH_MS   7000
 
 // Landing detection
 #define LANDED_ACCEL_LOW_G         0.75f
@@ -61,8 +77,8 @@
 // --------------------------------------------------------
 
 typedef enum {
-    STATE_IDLE          = 0,
-    STATE_ARMED         = 1,   // unused — no arming mechanism on this board; kept so numbering doesn't shift
+    STATE_IDLE          = 0,   // on the pad, disarmed (SW401 open)
+    STATE_ARMED         = 1,   // on the pad, armed (SW401 closed) — see fsm_set_armed()
     STATE_POWERED       = 2,
     STATE_COAST         = 3,
     STATE_APOGEE        = 4,
@@ -87,10 +103,11 @@ typedef struct {
 
     uint32_t state_entry_ms;
     uint32_t launch_detect_ms;
-    uint32_t powered_entry_ms;  // G4: time POWERED was entered
+    uint32_t powered_entry_ms;  // time POWERED was entered; also the G7 timeout reference
 
     float    prev_velocity_ms;
     float    peak_velocity_ms;  // G3: max velocity seen in POWERED+COAST
+    float    peak_altitude_m;   // G6: max altitude seen in POWERED+COAST, for the baro-drop backstop
 
     bool     drogue_fired;
     bool     main_fired;
@@ -114,7 +131,7 @@ void fsm_init(FlightSM *fsm);
 
 /**
  * Update state machine. Call every loop iteration.
- * @param altitude_m  Estimated altitude AGL [m] — used for G5 main deploy gate.
+ * @param altitude_m  Estimated altitude AGL [m] — used for the apogee baro-drop backstop.
  */
 void fsm_update(FlightSM *fsm,
                 float accel_up_g,
@@ -124,7 +141,16 @@ void fsm_update(FlightSM *fsm,
                 float altitude_m,
                 bool  imu_valid);
 
-/** Emergency abort — safes all outputs, sets STATE_ABORT. */
+/**
+ * Reflect the arming switch (SW401) into the FSM. Only transitions
+ * IDLE <-> ARMED — a no-op once launch detection has latched or flight
+ * has begun. The switch is a hardware interlock (it cuts PYRO PWR); this
+ * is display/logging only and must never gate whether a pyro can fire —
+ * see main_control_loop.cpp's arming-switch handling for the full policy.
+ */
+void fsm_set_armed(FlightSM *fsm, bool armed);
+
+/** Emergency abort — safes all outputs, sets STATE_ABORT. Pad-side faults only. */
 void fsm_abort(FlightSM *fsm);
 
 /** Returns true on the first call after a state transition (one-shot). */

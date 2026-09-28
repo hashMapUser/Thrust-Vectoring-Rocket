@@ -73,6 +73,22 @@
 // Typical bench vibration is < 1 deg/s; this catches accidental knocks.
 #define GYRO_MOTION_THRESHOLD   3.0f
 
+// --------------------------------------------------------
+// FAULT DETECTION
+// --------------------------------------------------------
+
+// A dead or disconnected sensor returns all-0xFF or all-0x00 on every
+// byte, which decodes to a near-zero sample that would otherwise pass as
+// real data (and can look like free-fall to the flight FSM). Also catch
+// a frozen sensor: the same 12 raw bytes read back several times in a row.
+#define LSM6DSOX_FROZEN_STREAK   5    // identical raw reads in a row -> frozen
+
+// Only report a fault after this many consecutive bad samples — one
+// glitched read must not latch a permanent fault. At the 125 Hz rate
+// lsm6dsox_read() is actually called from the flight loop, 10 samples
+// is ~80 ms.
+#define LSM6DSOX_FAULT_STREAK    10
+
 // EEPROM address where the bias struct is stored.
 // Teensy 4.0 has 1080 bytes of emulated EEPROM.
 // Leave address 0 free in case other code uses it; start at 10.
@@ -99,7 +115,9 @@ typedef struct {
  * One complete IMU sample.
  *   gx/gy/gz — angular rate  [deg/s]   bias-corrected if calibrated
  *   ax/ay/az — linear accel  [g]
- *   valid    — false if any SPI error occurred
+ *   valid    — false once LSM6DSOX_FAULT_STREAK consecutive raw samples
+ *              looked dead (all-0xFF, all-0x00, or frozen) — see lsm6dsox.cpp.
+ *              A single bad sample does NOT clear valid; only a sustained fault does.
  */
 typedef struct {
     float gx, gy, gz;

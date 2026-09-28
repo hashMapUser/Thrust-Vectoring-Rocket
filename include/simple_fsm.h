@@ -27,11 +27,15 @@
 //      g-force spike to ever leave IDLE (a bump or knock moves the
 //      sensor by millimetres, not metres — it can spike accel, but it
 //      cannot fake a barometric altitude gain).
-//   2. pyro_fire_main()'s own PYRO_MAIN_MIN_ALT_M (50 m) floor, checked
-//      again independently inside pyro.cpp.
 // Do not power this up with a live e-match connected unless you are at
 // the pad, ready to fly. Use 'X' over serial to safe the pyro outputs
 // at any time.
+//
+// pyro.cpp also persists a "fired" flag per channel across resets, so a
+// brownout mid-flight can't re-fire a spent channel — but that means the
+// flag must be cleared for each *new* flight. finned_control_loop.cpp
+// does this on the arming switch's off->on edge on the pad; see its
+// setup()/loop() for the full arming-switch handling.
 
 // --------------------------------------------------------
 // TUNING — check these against your own motor/airframe before flying

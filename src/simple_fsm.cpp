@@ -55,7 +55,7 @@ void simple_fsm_update(SimpleFSM *fsm, PyroState *pyro,
                 Serial.print("[SIMPLE_FSM] Apogee detected. Peak=");
                 Serial.print(fsm->peak_altitude_m, 1);
                 Serial.println(" m. Firing recovery chute.");
-                pyro_fire_main(pyro, altitude_m);   // PYRO_MAIN_MIN_ALT_M floor enforced inside
+                pyro_fire_main(pyro, altitude_m);   // single-deploy: PYRO_MAIN_MIN_ALT_M is 0, no floor to enforce
                 fsm->chute_fired = true;
                 enter_state(fsm, SIMPLE_STATE_RECOVERY);
             }

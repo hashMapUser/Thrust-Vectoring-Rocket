@@ -32,21 +32,43 @@ kd = 0.05
 alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter)
 
 # --- Rocket physical parameters ---
-mass = 0.900                        # kg
-MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia)
-distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM)
-distanceCPToCOM = 0.2467            # m       (|distance| between CP and CoM)
+# mass/MOI/lever-arms below are the LOADED (liftoff) values. Propellant
+# burn-off during the flight is modeled separately below (propellantMass /
+# propellantCgOffsetAftOfCOM) rather than by editing these directly.
+mass = 0.900                        # kg      (liftoff mass, incl. propellant)
+MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia, liftoff)
+distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM, liftoff)
+distanceCPToCOM = 0.2467            # m       (|distance| between CP and CoM, liftoff)
                                     # 9.71 in fwd of CoM, static margin = -3.24 cal (unstable by design)
 isAerodynamicallyUnstable = True    # True = CP fwd of CoM (destabilizing), False = CP aft (stabilizing)
 C_N_alpha = 2.0                     # 1/rad   (normal force slope; ~2 for slender rockets)
 rocketCrossSectionalArea = 0.006207 # m^2     (pi * (3 in / 2)^2 ~ 3" airframe)
 dragCoefficient = 0.45              # C_d
 
+# Propellant burn-off: ~60 g of the F15's mass leaves during the burn, and
+# it sits aft of the vehicle CG (down near the nozzle), so the combined CG
+# moves forward as it depletes — this shrinks distanceCPToCOM (less
+# destabilizing moment arm) and grows distanceTVCToCOM (more TVC leverage)
+# over the burn. propellantCgOffsetAftOfCOM is an ESTIMATE (typical motor
+# placement for this airframe) — replace with a measured value from the
+# mass model if/when one exists; it only scales the size of this effect,
+# the direction is correct either way.
+propellantMass = 0.060              # kg (Estes F15 propellant weight, certified)
+propellantCgOffsetAftOfCOM = 0.10   # m  ESTIMATE — verify against the mass model
+
 # --- TVC / servo parameters ---
-PIDDT = 0.005                       # s       (controller update period)
+SERVO_PWM_HZ = 200                  # Hz — matches SERVO_PWM_HZ in servo_driver.h
+PIDDT = 0.008                       # s       (controller update period — matches the
+                                    #          firmware's 125 Hz flight loop, not the sim's
+                                    #          old 200 Hz PIDDT)
 servoDelay = 0.005                  # s       (command -> motion delay)
 maxTVCSpeed = 250                   # deg/s   (slew rate limit)
-absMaxTVCAngle = 7                  # deg     (mechanical limit)
+# Matches PID_OUT_MAX in pid.h (the firmware's authority clamp), NOT the
+# gimbal's mechanical limit — those are two different numbers until the
+# servo-horn-degrees -> gimbal-degrees linkage ratio is bench-measured
+# (see firmware review item 12 / SERVO_PER_GIMBAL_RATIO). If that ratio
+# turns out not to be 1:1, both this and PID_OUT_MAX need to move together.
+absMaxTVCAngle = 5                  # deg
 TVCBias = 0.0                       # deg     (constant TVC misalignment)
 TVCNoiseAmplitude = 1.5             # deg     (peak TVC jitter)
 
@@ -55,7 +77,11 @@ angleSensorBias = 0.0               # deg
 angleSensorNoiseAmplitude = 0.5     # deg
 
 # --- Simulation parameters ---
-dt = 0.005                          # s       (physics step)
+# Physics step is tied to SERVO_PWM_HZ: the servo's commanded position
+# can only actually change once per PWM period, so stepping physics at
+# that same rate is what gives the sim its 200 Hz actuator quantization
+# for free, without a separate zero-order-hold block.
+dt = 1.0 / SERVO_PWM_HZ              # s       (physics step)
 simLength = 7.0                     # s
 initAngle = 5.0                     # deg     (initial pitch disturbance)
 initSetpoint = 0.0                  # deg
@@ -77,7 +103,12 @@ randomSeed = 42                     # set to None for different noise each run
 focusOnPoweredPhase = True          # True = zoom plots to burn time + 0.5s coast (best for PID tuning)
 
 # ============================================================================
-# Estes F-15 thrust curve (from thrustcurve.org)
+# Estes F-15 thrust curve — full certified RASP data from thrustcurve.org
+# (motor id 5f4294d200023100000003f2, cert source). Burn time 3.45 s, total
+# impulse 49.61 N*s. The old table here stopped at t=1.736s / 0 N, which was
+# only the first third of the real curve (real thrust at 1.736s is ~14.6 N,
+# not 0) — that truncation was why PID gains tuned against this sim didn't
+# carry over to the firmware, which sees the motor's full ~3.45 s burn.
 # ============================================================================
 F15_CURVE = np.array([
     [0.000,  0.000],
@@ -93,12 +124,22 @@ F15_CURVE = np.array([
     [0.688, 17.500],
     [0.855, 16.225],
     [1.037, 15.427],
-    [1.205, 15.268],
-    [1.423, 15.140],
-    [1.452, 14.500],
-    [1.503,  6.663],
-    [1.736,  0.000],
+    [1.205, 14.948],
+    [1.423, 14.627],
+    [1.452, 15.741],
+    [1.503, 14.785],
+    [1.736, 14.623],
+    [1.955, 14.303],
+    [2.210, 14.141],
+    [2.494, 13.819],
+    [2.763, 13.338],
+    [3.120, 13.334],
+    [3.382, 13.013],
+    [3.404,  9.352],
+    [3.418,  4.895],
+    [3.450,  0.000],
 ])
+F15_TOTAL_IMPULSE = float(np.trapz(F15_CURVE[:, 1], F15_CURVE[:, 0]))   # N*s, ~49.6
 
 def getThrust(t):
     """Thrust (N) at time t (s)."""
@@ -109,6 +150,30 @@ def getThrust(t):
     return float(np.interp(t, F15_CURVE[:, 0], F15_CURVE[:, 1]))
 
 
+# Cumulative impulse at each curve breakpoint, for propellantRemainingFrac()
+# below — precomputed once rather than re-integrating from t=0 every call.
+_F15_CUM_IMPULSE = np.concatenate((
+    [0.0],
+    np.cumsum(0.5 * (F15_CURVE[1:, 1] + F15_CURVE[:-1, 1]) * np.diff(F15_CURVE[:, 0]))
+))
+
+
+def propellantRemainingFrac(t):
+    """Fraction (1.0 -> 0.0) of propellant mass remaining at time t (s).
+
+    Assumes propellant burns proportional to delivered impulse — the
+    standard approximation absent real grain-geometry data. Only used
+    when useThrustCurve is True; a constant-thrust motor has no impulse
+    curve to derive this from, so mass is held constant in that mode.
+    """
+    if not useThrustCurve or t <= 0.0:
+        return 1.0
+    if t >= F15_CURVE[-1, 0]:
+        return 0.0
+    cum_impulse = float(np.interp(t, F15_CURVE[:, 0], _F15_CUM_IMPULSE))
+    return max(0.0, 1.0 - cum_impulse / F15_TOTAL_IMPULSE)
+
+
 # ============================================================================
 # Simulation
 # ============================================================================
@@ -117,6 +182,17 @@ def run():
     if randomSeed is not None:
         random.seed(randomSeed)
         np.random.seed(randomSeed)
+
+    # --- Solve the fixed dry-airframe CG and propellant CG positions
+    # (both measured as a distance from the nozzle, "forward" = larger)
+    # that combine to the configured liftoff distanceTVCToCOM, given
+    # propellant sits propellantCgOffsetAftOfCOM behind the liftoff CG.
+    # Both positions are then fixed for the whole flight; only how much
+    # propellant mass remains at the propellant position changes.
+    dryMass = mass - propellantMass
+    x_combined_liftoff = distanceTVCToCOM
+    x_propellant = x_combined_liftoff - propellantCgOffsetAftOfCOM
+    x_dry = (x_combined_liftoff * mass - propellantMass * x_propellant) / dryMass
 
     steps = int(simLength / dt)
     delaySteps = max(int(servoDelay / dt), 1)
@@ -206,6 +282,18 @@ def run():
         T = getThrust(now)
         thrust_hist[i] = T
 
+        # Propellant burn-off: recombine dry + remaining-propellant point
+        # masses into the instantaneous mass and CG lever arms. MOI is
+        # scaled by the mass ratio as a first-order approximation (no
+        # parallel-axis correction) — the review calls this a small
+        # effect, and this is intentionally not more precise than that.
+        remaining_frac = propellantRemainingFrac(now)
+        mass_t         = dryMass + propellantMass * remaining_frac
+        x_combined_t   = (dryMass * x_dry + propellantMass * remaining_frac * x_propellant) / mass_t
+        leverTVC_t     = x_combined_t
+        leverCP_t      = distanceCPToCOM - (x_combined_t - x_combined_liftoff)
+        MOI_t          = MOI * (mass_t / mass)
+
         # Thrust component along rocket axis -> vertical accel (simplified, rocket ~ vertical)
         theta_rad = math.radians(theta[i])
         tvc_rad   = math.radians(tvcActual[i])
@@ -232,13 +320,13 @@ def run():
                     + windFx + gust - drag_x)
         Fz_world = (T_axial * math.cos(theta_rad)
                     - T_lateral * math.sin(theta_rad)
-                    - mass * gravity - drag_z)
+                    - mass_t * gravity - drag_z)
 
         fx_hist[i] = Fx_world
 
         # Translational integration
-        vx[i + 1] = vx[i] + (Fx_world / mass) * dt
-        vz[i + 1] = vz[i] + (Fz_world / mass) * dt
+        vx[i + 1] = vx[i] + (Fx_world / mass_t) * dt
+        vz[i + 1] = vz[i] + (Fz_world / mass_t) * dt
         x_pos[i + 1]    = x_pos[i]    + vx[i + 1] * dt
         altitude[i + 1] = altitude[i] + vz[i + 1] * dt
 
@@ -262,7 +350,7 @@ def run():
         # Moment from TVC: positive tvc angle -> positive torque -> positive theta rate.
         # Classical PID with err = sp - theta then commands negative TVC when theta > sp,
         # producing a restoring torque. Sign convention matches a conventional controller.
-        M_tvc = T * math.sin(tvc_rad) * distanceTVCToCOM
+        M_tvc = T * math.sin(tvc_rad) * leverTVC_t
 
         # Aerodynamic moment from normal force at CP.
         # Side force ~ q * A * C_N_alpha * sin(theta) acting at CP.
@@ -271,11 +359,11 @@ def run():
         q_dyn = 0.5 * airDensity * (vz[i] * vz[i] + vx[i] * vx[i])
         aero_sign = +1.0 if isAerodynamicallyUnstable else -1.0
         M_aero = aero_sign * q_dyn * rocketCrossSectionalArea * C_N_alpha \
-                 * math.sin(theta_rad) * distanceCPToCOM
+                 * math.sin(theta_rad) * leverCP_t
 
         M_total = M_tvc + M_aero
 
-        alpha_a[i + 1] = math.degrees(M_total / MOI)
+        alpha_a[i + 1] = math.degrees(M_total / MOI_t)
         omega[i + 1]   = omega[i] + alpha_a[i + 1] * dt
         theta[i + 1]   = theta[i] + omega[i + 1] * dt
 

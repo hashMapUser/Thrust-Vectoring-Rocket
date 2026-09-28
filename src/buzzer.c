@@ -53,6 +53,18 @@ static const Step PAT_ARMED[] = {
     { false, 820 },
 };
 
+/* CONT_OPEN: rapid triple-chirp every 1 s — armed but e-match reads open.
+ * Deliberately distinct from ARMED's double-chirp so a pad crew hears the
+ * difference without a laptop open. */
+static const Step PAT_CONT_OPEN[] = {
+    { true,  60  },
+    { false, 60  },
+    { true,  60  },
+    { false, 60  },
+    { true,  60  },
+    { false, 700 },
+};
+
 /* LOCATOR: 1 Hz continuous — find-me after landing */
 static const Step PAT_LOCATOR[] = {
     { true,  500 },
@@ -78,6 +90,7 @@ static const Pattern PATTERNS[BUZZ_PATTERN_COUNT] = {
     PAT(PAT_SELFTEST_FAIL), /* BUZZ_SELFTEST_FAIL */
     PAT(PAT_IDLE),          /* BUZZ_IDLE          */
     PAT(PAT_ARMED),         /* BUZZ_ARMED         */
+    PAT(PAT_CONT_OPEN),     /* BUZZ_CONT_OPEN     */
     PAT(PAT_LOCATOR),       /* BUZZ_LOCATOR       */
 };
 

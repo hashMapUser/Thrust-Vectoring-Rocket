@@ -44,9 +44,13 @@ const uint32_t LOOP_INTERVAL_US = 8000;  // 125 Hz
 uint32_t last_loop_time = 0;
 
 // --- ARMING ---
-// There is no arming mechanism on this board — pyro_arm() is called
-// unconditionally in setup(). The FSM just watches for a launch signature
-// (see flight_sm.cpp's STATE_IDLE case) and goes straight to POWERED.
+// pyro_arm() is still called unconditionally in setup() — SW401 is a
+// hardware interlock that physically cuts PYRO PWR, so software arming
+// state can never be the thing that blocks a deployment. What SW401
+// DOES drive in software: clearing the EEPROM "fired" flags for a new
+// flight, the STATE_IDLE<->STATE_ARMED display state, and the ARMED /
+// continuity-open buzzer feedback. See the arming-switch block in loop().
+//
 // This flag only tracks the pad-rest rising edge, to lock in the accel
 // bias calibration at the same moment the old auto-arm step used to.
 static bool pad_rest_prev = false;
@@ -55,10 +59,28 @@ static bool pad_rest_prev = false;
 // sensed directly on this board, but the ARM_SENSE pin gives it indirectly.
 #define ARM_SENSE_DIVIDER_RATIO 0.3197f
 
-static inline float read_pack_voltage() {
-    float arm_sense_v = analogRead(PIN_ARM_SENSE) * 3.30f / 4095.0f;
-    return arm_sense_v / ARM_SENSE_DIVIDER_RATIO;
+static inline float read_arm_sense_v() {
+    return analogRead(PIN_ARM_SENSE) * 3.30f / 4095.0f;
 }
+
+static inline float read_pack_voltage() {
+    return read_arm_sense_v() / ARM_SENSE_DIVIDER_RATIO;
+}
+
+// SW401 debounce + edge tracking. ~2.69 V at ARM_SENSE when armed (2S
+// pack), 0 V when safe — 1.2 V sits comfortably between the two.
+#define ARM_SENSE_ARMED_V   1.2f
+#define ARM_DEBOUNCE_MS     100
+
+static bool     arm_raw_prev  = false;
+static uint32_t arm_edge_ms   = 0;
+static bool     arm_now       = false;
+static bool     arm_prev      = false;
+static bool     seen_disarmed = false;   // latches once SW401 has read OFF since boot
+static uint32_t boot_ms       = 0;
+
+// Rising-edge tracker for fsm.tvc_enabled — see section 5 in loop().
+static bool tvc_enabled_prev = false;
 
 void setup() {
     Serial.begin(115200);
@@ -86,19 +108,20 @@ void setup() {
     buzzer_set(&buzz, BUZZ_BOOT);
     pyro_init(&pyros);
 
-    // No arming mechanism on this board — armed unconditionally. See
-    // simple_fsm.h (finned_control_loop.cpp) for the same trade-off and
-    // its full safety note. Continuity is checked here as a diagnostic
-    // only — it does not gate anything.
+    // pyro_arm() sets the software armed flags unconditionally — SW401 is
+    // the real interlock (it cuts PYRO PWR), not this. Continuity is only
+    // meaningful once PYRO PWR is actually present, so it's checked at the
+    // SW401 arming edge in loop(), not here — checking it at boot with the
+    // switch open would always read OPEN and tell you nothing.
     pyro_arm(&pyros);
     {
-        float pack_v  = read_pack_voltage();
-        bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
-        Serial.print("[PYRO] Armed at boot. Pyro1 (main) continuity: ");
-        Serial.print(cont_ok ? "OK" : "OPEN");
-        Serial.print("  pack=");
-        Serial.print(pack_v, 2);
-        Serial.println(" V");
+        bool arm_raw_boot = read_arm_sense_v() > ARM_SENSE_ARMED_V;
+        Serial.print("[PYRO] Armed (software). SW401 reads: ");
+        Serial.println(arm_raw_boot ? "CLOSED (armed)" : "OPEN (safe)");
+        if (arm_raw_boot) {
+            Serial.println("[ARM] SW401 already closed at boot — likely a mid-flight reset. "
+                            "Fired flags kept; no continuity check yet.");
+        }
     }
 
     // Green LED — bench aid, flashed by flight_sm.cpp on pad-rest latch.
@@ -154,6 +177,7 @@ void setup() {
     }
 
     buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
+    boot_ms = millis();
     Serial.println("FLIGHT COMPUTER READY. PYRO ARMED. WAITING FOR LAUNCH.");
 }
 
@@ -170,17 +194,63 @@ void loop() {
     uint32_t now_ms = millis();
 
     // ── 1. ACCEL BIAS LOCK ─────────────────────────────────────
-    // No arm step — pyro is already armed from setup(). This just locks
-    // in the accel calibration bias the moment pad-rest first latches,
-    // same timing the old auto-arm step used.
+    // Locks in the accel calibration bias the moment pad-rest first
+    // latches, independent of the arming switch — this just needs the
+    // vehicle to have sat still long enough, whether or not it's armed.
     {
-        bool pad_rest_now = (fsm.state == STATE_IDLE) && fsm.pad_rest_satisfied;
+        bool pad_rest_now = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                             fsm.pad_rest_satisfied;
         if (pad_rest_now && !pad_rest_prev) {
             alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
-            buzzer_set(&buzz, BUZZ_ARMED);
             Serial.println("[INIT] Pad-rest latched — accel bias locked in.");
         }
         pad_rest_prev = pad_rest_now;
+    }
+
+    // ── 1b. ARMING SWITCH (SW401) ──────────────────────────────
+    // The switch is the real safety interlock (it cuts PYRO PWR); this
+    // block only ever REPORTS its state and drives EEPROM/display/buzzer
+    // side effects — it must never gate whether a pyro can fire. Debounced
+    // ~100 ms; threshold sits between 0 V (safe) and ~2.69 V (armed, 2S pack).
+    {
+        bool arm_raw = read_arm_sense_v() > ARM_SENSE_ARMED_V;
+        if (arm_raw != arm_raw_prev) { arm_edge_ms = now_ms; arm_raw_prev = arm_raw; }
+        if ((now_ms - arm_edge_ms) >= ARM_DEBOUNCE_MS) arm_now = arm_raw;
+
+        if (!arm_now) seen_disarmed = true;
+
+        // "On the pad" = launch hasn't even started latching. Once
+        // launch_detect_ms is running (or later), SW401 transitions are
+        // logged implicitly (ignored) by simply not matching this gate.
+        bool on_pad = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                      fsm.launch_detect_ms == 0;
+
+        if (on_pad && arm_now && !arm_prev && seen_disarmed) {
+            // Genuine new-flight arming edge (not "switch already on at
+            // boot", which is the mid-flight-reset case — that must NOT
+            // clear the fired flags; see the seen_disarmed gate).
+            pyro_clear_fired(&pyros);
+            float pack_v  = read_pack_voltage();
+            bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
+            fsm_set_armed(&fsm, true);
+            buzzer_set(&buzz, cont_ok ? BUZZ_ARMED : BUZZ_CONT_OPEN);
+            Serial.print("[ARM] SW401 CLOSED — new flight armed. Continuity: ");
+            Serial.print(cont_ok ? "OK" : "OPEN");
+            Serial.print("  pack=");
+            Serial.print(pack_v, 2);
+            Serial.println(" V");
+        } else if (on_pad && !arm_now && arm_prev) {
+            fsm_set_armed(&fsm, false);
+            buzzer_set(&buzz, BUZZ_IDLE);
+            Serial.println("[ARM] SW401 OPEN — disarmed.");
+        } else if (fsm.state == STATE_IDLE && now_ms - boot_ms > 600 &&
+                   buzz.pattern != BUZZ_IDLE && buzz.pattern != BUZZ_ARMED &&
+                   buzz.pattern != BUZZ_CONT_OPEN) {
+            // First settle after the boot self-test chirps finish: default
+            // to the disarmed/alive pattern rather than staying silent.
+            buzzer_set(&buzz, BUZZ_IDLE);
+        }
+        arm_prev = arm_now;
     }
 
     // Serial commands
@@ -235,8 +305,8 @@ void loop() {
                                  imu_data.gy*imu_data.gy +
                                  imu_data.gz*imu_data.gz);
 
-    // T8: accumulate accel calibration samples during IDLE
-    if (fsm.state == STATE_IDLE) {
+    // T8: accumulate accel calibration samples while on the pad (armed or not)
+    if (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) {
         alt_calibrate_sample(&alt_est, accel_up_g);
     }
 
@@ -261,12 +331,14 @@ void loop() {
         logger_checkpoint(fsm.state, alt_est.altitude_m);
 
         switch (fsm.state) {
-            case STATE_POWERED:
-                pid_reset(&pid_pitch);
-                pid_reset(&pid_yaw);
-                break;
+            // No PID reset here — that now happens on fsm.tvc_enabled's
+            // rising edge in section 5 below, which fires at the initial
+            // launch-accel trigger (i.e. before STATE_POWERED is even
+            // entered — see item 3 in the firmware review).
             case STATE_MAIN:
-                // G5: pass real altitude from estimator (T8)
+                // First attempt on entry; section 6 retries every loop
+                // until it actually fires (pyro_fire_main() can decline —
+                // e.g. not armed — and this is a one-shot switch block).
                 pyro_fire_main(&pyros, alt_est.altitude_m);
                 break;
             case STATE_LANDED:
@@ -286,19 +358,39 @@ void loop() {
     }
 
     // ── 5. CONTROL & ACTUATION ────────────────────────────────
+    // Gated on fsm.tvc_enabled, not on fsm.state == STATE_POWERED — the
+    // FSM now sets tvc_enabled true at the initial launch-accel trigger,
+    // before liftoff is even confirmed, so the airframe is steered through
+    // the slowest / least aerodynamically damped part of the flight too
+    // (see item 3 in the firmware review). A rising edge on tvc_enabled
+    // resets both PID controllers so a stale integral from a prior false
+    // trigger never carries into a real one.
     float pitch_cmd = 0.0f;
     float yaw_cmd   = 0.0f;
 
-    if (fsm.state == STATE_POWERED && fsm.tvc_enabled) {
+    if (fsm.tvc_enabled && !tvc_enabled_prev) {
+        pid_reset(&pid_pitch);
+        pid_reset(&pid_yaw);
+    }
+    tvc_enabled_prev = fsm.tvc_enabled;
+
+    if (fsm.tvc_enabled) {
         pitch_cmd = pid_update(&pid_pitch, 0.0f, attitude.tip_a, dt);
         yaw_cmd   = pid_update(&pid_yaw,   0.0f, attitude.tip_b, dt);
         servo_set_pitch(pitch_cmd);
         servo_set_yaw(yaw_cmd);
-    } else if (fsm.state >= STATE_COAST) {
+    } else {
         servo_center();
     }
 
     // ── 6. HOUSEKEEPING ───────────────────────────────────────
+    // Retry the main charge every loop until it actually fires — it's
+    // only called once on state entry above, and pyro_fire_main() can
+    // legitimately decline once (e.g. transient not-armed) with nothing
+    // else that would ever ask again.
+    if (fsm.state == STATE_MAIN && !pyros.main_fired) {
+        pyro_fire_main(&pyros, alt_est.altitude_m);
+    }
     pyro_update(&pyros);
     indicator_update(&indicator, fsm.state);
     buzzer_update(&buzz);

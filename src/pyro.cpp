@@ -62,6 +62,13 @@ bool pyro_arm(PyroState *pyro) {
     return true;
 }
 
+void pyro_clear_fired(PyroState *pyro) {
+    pyro->drogue_fired = false;
+    pyro->main_fired   = false;
+    eeprom_save_fired(pyro);
+    Serial.println("[PYRO] Fired flags cleared: new flight armed");
+}
+
 bool pyro_check_continuity(uint8_t sense_pin, float pack_v) {
     uint32_t acc = 0;
     for (int i = 0; i < 16; i++) {

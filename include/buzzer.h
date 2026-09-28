@@ -11,6 +11,7 @@ typedef enum {
     BUZZ_SELFTEST_FAIL,  /* three long tones — a sensor failed init      */
     BUZZ_IDLE,           /* one chirp every 3 s — alive, disarmed        */
     BUZZ_ARMED,          /* rapid double chirp every 1 s — ORDNANCE LIVE */
+    BUZZ_CONT_OPEN,      /* rapid triple chirp every 1 s — armed, e-match OPEN */
     BUZZ_LOCATOR,        /* 1 Hz continuous — post-landing recovery      */
     BUZZ_PATTERN_COUNT
 } buzzer_pattern_t;
