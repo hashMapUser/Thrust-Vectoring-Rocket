@@ -11,13 +11,14 @@
 //  detailed diagnostics so you can chase down any issues.
 //
 //  Menu commands (send single char over serial):
-//    1 — Test BMP390 barometer     (I2C)
+//    1 — Test LPS22HBTR barometer  (I2C)
 //    2 — Test LSM6DSOX IMU         (SPI)
 //    3 — Test MMC5603NJ magnetometer (I2C Wire1)
 //    4 — Test GD25Q128 NOR flash   (SPI)
 //    5 — Test SD card              (card detect → sensor data → flash/RAM → SD CSV)
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
+//    H — Barometer lift-height test (baseline, lift prompt, 2.5 s delay, delta)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
@@ -1030,6 +1031,78 @@ static void test_pyro_continuity() {
 }
 
 // ============================================================
+//  TEST H — Barometer Lift-Height Test
+//  Captures a baseline pressure, prompts you to physically lift the
+//  barometer, then reports the height change 2.5 s later. Sanity check
+//  that the sensor tracks real altitude changes, not just noise.
+// ============================================================
+#define BARO_LIFT_BASELINE_SAMPLES   10
+#define BARO_LIFT_BASELINE_PERIOD_MS 100
+#define BARO_LIFT_WAIT_MS            2500
+
+static bool baro_lift_avg_pressure(int samples, int period_ms, float *out_hpa) {
+    float sum = 0.0f;
+    int valid = 0;
+    for (int i = 0; i < samples; i++) {
+        LPS22HB_Data d;
+        lps22hb_read(&d);
+        if (d.valid) { sum += d.pressure_pa; valid++; }
+        delay(period_ms);
+    }
+    if (valid < (samples + 1) / 2) return false;
+    *out_hpa = (sum / valid) / 100.0f;
+    return true;
+}
+
+static void test_baro_lift_height() {
+    print_banner("TEST H: Barometer Lift-Height (LPS22HBTR)");
+
+    if (!lps22hb_init()) {
+        fail("lps22hb_init() returned false — sensor not responding");
+        return;
+    }
+
+    info("Capturing baseline height — keep the barometer still...");
+    float baseline_hpa;
+    if (!baro_lift_avg_pressure(BARO_LIFT_BASELINE_SAMPLES, BARO_LIFT_BASELINE_PERIOD_MS, &baseline_hpa)) {
+        fail("Too many invalid reads while capturing baseline");
+        return;
+    }
+    Serial.print(F("  Baseline pressure: ")); Serial.print(baseline_hpa, 2); Serial.println(F(" hPa"));
+    Serial.println(F("  Baseline height set to 0.0 m."));
+
+    Serial.println();
+    Serial.println(F("  >>> Lift the barometer now. <<<"));
+    Serial.print(F("  Reading again in "));
+    Serial.print(BARO_LIFT_WAIT_MS / 1000.0f, 1);
+    Serial.println(F(" s..."));
+
+    delay(BARO_LIFT_WAIT_MS);
+
+    LPS22HB_Data d;
+    lps22hb_read(&d);
+    if (!d.valid) {
+        fail("Post-lift read invalid — try again");
+        return;
+    }
+    float new_hpa = d.pressure_pa / 100.0f;
+    float delta_alt_m = 44330.0f * (1.0f - powf(new_hpa / baseline_hpa, 0.1902949f));
+
+    Serial.print(F("  New pressure: ")); Serial.print(new_hpa, 2); Serial.println(F(" hPa"));
+    Serial.print(F("  Height change: "));
+    Serial.print(delta_alt_m, 2);
+    Serial.println(F(" m"));
+
+    if (delta_alt_m > 0.05f) {
+        pass("Barometer detected a lift — height increased");
+    } else if (delta_alt_m < -0.05f) {
+        info("Height decreased — barometer was lowered, not lifted");
+    } else {
+        info("No significant height change detected (< 5 cm) — try lifting higher/faster");
+    }
+}
+
+// ============================================================
 //  TEST B — Buzzer HAL (PIN_BUZZER = 3, hardware PWM via FlexPWM)
 // ============================================================
 static void run_pattern(buzzer_t *b, buzzer_pattern_t p,
@@ -1098,6 +1171,7 @@ static void print_menu() {
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
+    Serial.println(F("║  H - Barometer lift-height test          ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
     Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
@@ -1150,6 +1224,7 @@ void loop() {
         case 'S': case 's': test_servos(); break;
         case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
+        case 'H': case 'h': test_baro_lift_height(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
         case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;
