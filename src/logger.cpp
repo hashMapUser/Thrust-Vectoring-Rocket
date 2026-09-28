@@ -218,3 +218,9 @@ void logger_usb_dump() {
 }
 
 uint16_t logger_record_count() { return _count; }
+
+void logger_print_csv_header(Print &out) { out.print(CSV_HEADER); }
+
+void logger_print_csv_row(Print &out, const LogRecord *rec) {
+    if (rec) write_csv_row(out, *rec);
+}
