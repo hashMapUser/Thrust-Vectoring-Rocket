@@ -106,3 +106,12 @@ void logger_usb_dump();
  * How many records are currently in the RAM ring buffer.
  */
 uint16_t logger_record_count();
+
+/**
+ * Write the CSV header / one record as a CSV row to any Print (an SD
+ * FsFile or Serial). Same format as FLIGHT_XXX.CSV — used by the bench
+ * test so its SD file can be read with the same tools as flight data.
+ */
+class Print;
+void logger_print_csv_header(Print &out);
+void logger_print_csv_row(Print &out, const LogRecord *rec);
