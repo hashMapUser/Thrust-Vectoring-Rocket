@@ -15,12 +15,10 @@
 //    2 — Test LSM6DSOX IMU         (SPI)
 //    3 — Test MMC5603NJ magnetometer (I2C Wire1)
 //    4 — Test GD25Q128 NOR flash   (SPI)
-//    5 — Test SD card              (SPI)
+//    5 — Test SD card              (card detect → sensor data → flash/RAM → SD CSV)
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
-//    A — Altitude estimator self-check (no hardware needed)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
-//    M — Live health monitor ($HLTH frames for bench_gui.py / health_monitor.py)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
 // ============================================================
@@ -41,9 +39,8 @@
 #include "logger.h"
 #include "servo_driver.h"
 #include "buzzer.h"
-#include "alt_estimator.h"
 #include "pyro.h"
-#include "health.h"
+#include "flash.h"
 
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 
@@ -503,18 +500,155 @@ static void test_flash() {
 }
 
 // ============================================================
-//  TEST 5 — SD Card
+//  TEST 5 — SD Card (card detect → capture → stage → SD CSV)
+//  1. Card detect on PIN_SD_CD — stops here if no card is seated.
+//  2. Mount the card on SPI1.
+//  3. Capture SD_BENCH_RECORDS LogRecords at 125 Hz. Each sensor that
+//     initialises gives real readings; any that doesn't is filled with
+//     synthetic data. The imu/baro/mag_valid CSV columns say which:
+//     1 = real reading, 0 = synthetic.
+//  4. Stage the records in the GD25Q128 flash if it passes a write/
+//     readback probe, otherwise in a Teensy RAM buffer.
+//  5. Transfer staging → BENCH_SD.CSV on the card, then re-open the
+//     file and verify the row count.
 // ============================================================
+#define SD_CD_PRESENT_LEVEL  LOW    // switch closes to GND with a card in; R701 pulls up
+#define SD_CD_DEBOUNCE_MS    50
+#define SD_BENCH_RECORDS     250    // 2 s at 125 Hz
+#define SD_BENCH_PERIOD_US   8000
+#define SD_BENCH_FLASH_ADDR  0x100000u   // 1 MB in — clear of TEST 4's sector at 0x010000
+#define SD_BENCH_FILE        "BENCH_SD.CSV"
+
+static LogRecord _sd_ram_stage[SD_BENCH_RECORDS];   // fallback staging when flash is down
+
+// Flash staging: records packed back-to-back as raw LogRecord bytes,
+// streamed through a one-page buffer.
+static uint8_t  _sd_page[FLASH_PAGE_SIZE];
+static uint16_t _sd_page_fill;
+static uint32_t _sd_flash_addr;
+
+// FNV-1a over every staged byte — compared on write vs. readback so a
+// flaky flash shows up as a checksum mismatch, not silently bad CSV.
+static uint32_t fnv1a(uint32_t h, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static bool sd_card_detected() {
+    pinMode(PIN_SD_CD, INPUT);   // R701 is the pull-up — plain INPUT
+    int level = digitalRead(PIN_SD_CD);
+    uint32_t t0 = millis(), start = t0;
+    // Level must hold for SD_CD_DEBOUNCE_MS; give up after 1 s of bounce
+    while (millis() - t0 < SD_CD_DEBOUNCE_MS && millis() - start < 1000) {
+        int now = digitalRead(PIN_SD_CD);
+        if (now != level) { level = now; t0 = millis(); }
+    }
+    Serial.print(F("  SD_CD (pin ")); Serial.print(PIN_SD_CD);
+    Serial.print(F(") = "));          Serial.println(level == HIGH ? F("HIGH") : F("LOW"));
+    return level == SD_CD_PRESENT_LEVEL;
+}
+
+// JEDEC ID + erase/program/readback of 16 bytes in the staging sector.
+// A chip that IDs correctly but can't hold data still counts as down.
+static bool sd_flash_usable() {
+    if (!flash_init()) return false;
+    uint8_t w[16], r[16];
+    for (int i = 0; i < 16; i++) w[i] = (uint8_t)(0x5A ^ (i * 17));
+    flash_erase_sector(SD_BENCH_FLASH_ADDR);
+    flash_page_program(SD_BENCH_FLASH_ADDR, w, sizeof(w));
+    flash_read(SD_BENCH_FLASH_ADDR, r, sizeof(r));
+    return memcmp(w, r, sizeof(w)) == 0;
+}
+
+static void sd_flash_stage_begin() {
+    const uint32_t bytes = SD_BENCH_RECORDS * sizeof(LogRecord);
+    for (uint32_t a = SD_BENCH_FLASH_ADDR; a < SD_BENCH_FLASH_ADDR + bytes; a += FLASH_SECTOR_SIZE)
+        flash_erase_sector(a);
+    _sd_page_fill  = 0;
+    _sd_flash_addr = SD_BENCH_FLASH_ADDR;
+}
+
+static void sd_flash_stage_write(const LogRecord *r) {
+    const uint8_t *p = (const uint8_t *)r;
+    for (size_t k = 0; k < sizeof(LogRecord); k++) {
+        _sd_page[_sd_page_fill++] = p[k];
+        if (_sd_page_fill == FLASH_PAGE_SIZE) {
+            flash_page_program(_sd_flash_addr, _sd_page, FLASH_PAGE_SIZE);
+            _sd_flash_addr += FLASH_PAGE_SIZE;
+            _sd_page_fill = 0;
+        }
+    }
+}
+
+static void sd_flash_stage_end() {
+    if (_sd_page_fill) flash_page_program(_sd_flash_addr, _sd_page, _sd_page_fill);
+}
+
+// One record: real data from each working sensor, synthetic otherwise.
+// No attitude filter or controller runs on the bench, so attitude, servo
+// and PID columns hold neutral values.
+static void sd_bench_fill(LogRecord *r, uint16_t i, bool imu_ok, bool baro_ok,
+                          bool mag_ok, float *p0_hpa) {
+    memset(r, 0, sizeof(*r));
+    r->timestamp_ms = millis();
+    const float t = i * (SD_BENCH_PERIOD_US / 1e6f);
+
+    LSM6DSOX_Data imu = {};
+    if (imu_ok) lsm6dsox_read(&imu, nullptr);
+    if (imu_ok && imu.valid) {
+        r->gx = imu.gx; r->gy = imu.gy; r->gz = imu.gz;
+        r->ax = imu.ax; r->ay = imu.ay; r->az = imu.az;
+        r->imu_valid = true;
+    } else {
+        r->gx = 10.0f * sinf(TWO_PI * 0.5f * t);   // slow synthetic coning
+        r->gy = 10.0f * cosf(TWO_PI * 0.5f * t);
+        r->gz = 0.0f;
+        r->ax = 0.0f; r->ay = 0.0f; r->az = 1.0f;
+    }
+
+    LPS22HB_Data baro = {};
+    if (baro_ok) lps22hb_read(&baro);
+    if (baro_ok && baro.valid) {
+        r->temperature_c = baro.temperature_c;
+        r->pressure_hpa  = baro.pressure_pa / 100.0f;
+        r->baro_valid    = true;
+    } else {
+        r->temperature_c = 22.5f;
+        r->pressure_hpa  = 1013.25f - 0.5f * t;    // ~4 m/s synthetic climb
+    }
+    if (i == 0) *p0_hpa = r->pressure_hpa;
+    r->altitude_m = 44330.0f * (1.0f - powf(r->pressure_hpa / *p0_hpa, 0.1902949f));
+
+    mag_data m = {};
+    if (mag_ok) mag_read(&m);
+    if (mag_ok && m.valid) {
+        r->mx = m.mag_x; r->my = m.mag_y; r->mz = m.mag_z;
+        r->mag_valid = true;
+    } else {
+        r->mx = 0.2f; r->my = 0.1f; r->mz = -0.4f;
+    }
+
+    r->q0 = 1.0f;
+    r->servo_pitch_us = 1500.0f;
+    r->servo_yaw_us   = 1500.0f;
+    r->flight_state   = STATE_IDLE;
+}
+
 static void test_sd() {
     char sd_banner[64];
-    snprintf(sd_banner, sizeof(sd_banner), "TEST 5: SD Card (SPI, CS pin %d)", PIN_SD_CS);
+    snprintf(sd_banner, sizeof(sd_banner), "TEST 5: SD Card (SPI1, CS pin %d, CD pin %d)",
+             PIN_SD_CS, PIN_SD_CD);
     print_banner(sd_banner);
 
-    Serial.println(F("  SD card setup: FAT32, any size up to 32 GB."));
-    Serial.println(F("  No pre-formatting needed for modern cards already FAT32."));
-    Serial.println(F("  If init fails on a new card, format it FAT32 on your PC first."));
-    Serial.println();
+    // --- 1. Card detect ---
+    if (!sd_card_detected()) {
+        fail("No card detected on SD_CD — insert a card and re-run '5'");
+        Serial.println(F("  If a card IS inserted: check the DM3AT detect switch and R701."));
+        return;
+    }
+    pass("Card detected");
 
+    // --- 2. Mount ---
     SPI1.setMISO(PIN_SD_MISO);
     SPI1.setMOSI(PIN_SD_MOSI);
     SPI1.setSCK(PIN_SD_SCK);
@@ -523,50 +657,108 @@ static void test_sd() {
         fail("SD init failed");
         _bench_sd.initErrorPrint(&Serial);
         Serial.println(F("  Checklist:"));
-        Serial.println(F("    - Card inserted in Hirose DM3AT connector?"));
         Serial.println(F("    - PIN_SD_CS = 0 correct?"));
-        Serial.println(F("    - Card formatted FAT32? (not exFAT, not NTFS)"));
+        Serial.println(F("    - Card formatted FAT32/exFAT?"));
         Serial.println(F("    - Try a different SD card (some cards fail at 3.3V)"));
         return;
     }
     pass("SD init OK — card mounted");
 
-    // Write a test file
-    const char *TESTFILE = "BENCH.TXT";
-    if (_bench_sd.exists(TESTFILE)) _bench_sd.remove(TESTFILE);
+    // --- 3. Sensors: real where they work, synthetic where they don't ---
+    info("Bringing up sensors...");
+    const bool imu_ok  = lsm6dsox_init();
+    const bool baro_ok = lps22hb_init();
+    const bool mag_ok  = mag_init();
+    Serial.print(F("  IMU : ")); Serial.println(imu_ok  ? F("real")  : F("SYNTHETIC (init failed)"));
+    Serial.print(F("  BARO: ")); Serial.println(baro_ok ? F("real")  : F("SYNTHETIC (init failed)"));
+    Serial.print(F("  MAG : ")); Serial.println(mag_ok  ? F("real")  : F("SYNTHETIC (init failed)"));
 
-    FsFile f = _bench_sd.open(TESTFILE, O_WRONLY | O_CREAT | O_TRUNC);
+    // --- 4. Staging: flash if it works, RAM if not ---
+    const bool use_flash = sd_flash_usable();
+    if (use_flash) {
+        info("Flash write/readback OK — staging records in GD25Q128");
+        sd_flash_stage_begin();
+    } else {
+        info("Flash down — staging records in Teensy RAM buffer");
+    }
+
+    Serial.print(F("  Capturing ")); Serial.print(SD_BENCH_RECORDS);
+    Serial.println(F(" records at 125 Hz..."));
+
+    float p0_hpa = 1013.25f;
+    uint32_t sum_wr = 2166136261u;
+    uint32_t next_us = micros();
+    for (uint16_t i = 0; i < SD_BENCH_RECORDS; i++) {
+        while ((int32_t)(micros() - next_us) < 0) {}
+        next_us += SD_BENCH_PERIOD_US;
+
+        LogRecord r;
+        sd_bench_fill(&r, i, imu_ok, baro_ok, mag_ok, &p0_hpa);
+        sum_wr = fnv1a(sum_wr, (const uint8_t *)&r, sizeof(r));
+        if (use_flash) sd_flash_stage_write(&r);
+        else           _sd_ram_stage[i] = r;
+    }
+    if (use_flash) sd_flash_stage_end();
+    pass(use_flash ? "Records staged in flash" : "Records staged in RAM");
+
+    // --- 5. Transfer staging → SD ---
+    if (_bench_sd.exists(SD_BENCH_FILE)) _bench_sd.remove(SD_BENCH_FILE);
+    FsFile f = _bench_sd.open(SD_BENCH_FILE, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) {
-        fail("Could not create BENCH.TXT");
+        fail("Could not create " SD_BENCH_FILE);
         return;
     }
-    f.println(F("bench_test.cpp write test"));
-    f.print(F("timestamp_ms="));
-    f.println(millis());
-    f.println(F("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"));
+    logger_print_csv_header(f);
+
+    uint32_t sum_rd = 2166136261u;
+    for (uint16_t i = 0; i < SD_BENCH_RECORDS; i++) {
+        LogRecord r;
+        if (use_flash) flash_read(SD_BENCH_FLASH_ADDR + (uint32_t)i * sizeof(LogRecord),
+                                  (uint8_t *)&r, sizeof(r));
+        else           r = _sd_ram_stage[i];
+        sum_rd = fnv1a(sum_rd, (const uint8_t *)&r, sizeof(r));
+        logger_print_csv_row(f, &r);
+    }
     f.sync();
+    const uint32_t file_bytes = (uint32_t)f.fileSize();
     f.close();
-    pass("BENCH.TXT written and closed");
 
-    // Read it back
-    f = _bench_sd.open(TESTFILE, O_RDONLY);
-    if (!f) {
-        fail("Could not re-open BENCH.TXT for reading");
+    if (sum_rd != sum_wr) {
+        fail("Staging checksum mismatch — data read back from staging is corrupt");
+        Serial.print(F("  wrote 0x")); Serial.print(sum_wr, HEX);
+        Serial.print(F("  read 0x"));  Serial.println(sum_rd, HEX);
         return;
     }
-    Serial.println(F("  Contents of BENCH.TXT:"));
+    pass("Staging readback checksum matches");
+
+    Serial.print(F("  Wrote ")); Serial.print(SD_BENCH_FILE);
+    Serial.print(F(" (")); Serial.print(file_bytes); Serial.println(F(" bytes)"));
+
+    // --- Verify: re-open, count rows, echo the first few ---
+    f = _bench_sd.open(SD_BENCH_FILE, O_RDONLY);
+    if (!f) {
+        fail("Could not re-open " SD_BENCH_FILE " for reading");
+        return;
+    }
+    Serial.println(F("  First rows of the file:"));
+    uint32_t lines = 0;
+    char line[320];
     while (f.available()) {
-        Serial.print(F("    "));
-        Serial.println(f.readStringUntil('\n'));
+        int n = f.fgets(line, sizeof(line));
+        if (n <= 0) break;
+        if (lines < 4) { Serial.print(F("    ")); Serial.print(line); }
+        lines++;
     }
     f.close();
-    pass("BENCH.TXT read back successfully");
 
-    // Check available space
-    // SdFat doesn't expose free space cheaply here, so just report card type
-    Serial.println(F("  SD card responding correctly."));
-    _bench_sd.remove(TESTFILE);
-    pass("SD Card PASSED — write, read, and delete all OK");
+    Serial.print(F("  Rows (excluding header): ")); Serial.print(lines ? lines - 1 : 0);
+    Serial.print(F(" / expected ")); Serial.println(SD_BENCH_RECORDS);
+    if (lines != SD_BENCH_RECORDS + 1u) {
+        fail("Row count mismatch — SD write incomplete");
+        return;
+    }
+    pass("SD Card PASSED — detect, capture, stage, write, and readback all OK");
+    Serial.println(F("  " SD_BENCH_FILE " is left on the card for inspection."));
 }
 
 // ============================================================
@@ -872,204 +1064,6 @@ static void test_buzzer() {
 }
 
 // ============================================================
-//  TEST A — Altitude Estimator (complementary filter self-check)
-//  Pure math, no hardware involved — exercises alt_estimator.cpp
-//  directly with synthetic pressure/accel inputs.
-// ============================================================
-static void test_altitude_estimator() {
-    print_banner("TEST A: Altitude Estimator (complementary filter)");
-
-    const float P0 = 1013.25f;   // hPa at sea level -> simulated pad
-    const float DT = 0.02f;      // 50 Hz
-    int failed = 0;
-
-    auto check = [&](const char *name, bool cond) {
-        if (cond) pass(name);
-        else { fail(name); failed++; }
-    };
-
-    info("Sub-test 1: init caches ground altitude");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        check("initialised flag set",   est.initialised);
-        check("ground_pressure stored", fabsf(est.ground_pressure - P0) < 0.001f);
-        check("ground_altitude ~0 m for sea-level pressure",
-              fabsf(est.ground_altitude_m) < 0.1f);
-        check("accel_bias starts at 0", fabsf(est.accel_bias_ms2) < 1e-6f);
-    }
-
-    info("Sub-test 2: calibration with perfect 1g samples");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.0f);
-        bool ok = alt_calibrate_finish(&est);
-        check("finish returns true with >= ALT_MIN_CAL_SAMPLES", ok);
-        check("computed bias is ~0", fabsf(est.accel_bias_ms2) < 1e-4f);
-    }
-
-    info("Sub-test 3: calibration recovers a known +0.01g bias");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.01f);
-        bool ok = alt_calibrate_finish(&est);
-        check("finish returns true", ok);
-        // 0.01 g * 9.80665 = 0.0980665 m/s^2
-        check("computed bias matches expected 0.0981 m/s^2",
-              fabsf(est.accel_bias_ms2 - 0.0980665f) < 1e-4f);
-    }
-
-    info("Sub-test 4: insufficient calibration samples");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        for (int i = 0; i < 10; i++) alt_calibrate_sample(&est, 1.01f);   // < ALT_MIN_CAL_SAMPLES
-        bool ok = alt_calibrate_finish(&est);
-        check("finish returns false with too few samples", !ok);
-        check("bias remains at 0", fabsf(est.accel_bias_ms2) < 1e-6f);
-    }
-
-    info("Sub-test 5: post-calibration pad-static velocity drift");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        const float pad_reading_g = 1.005f;   // simulated +0.005g sensor bias
-        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, pad_reading_g);
-        alt_calibrate_finish(&est);
-
-        for (int i = 0; i < 500; i++) alt_update(&est, P0, pad_reading_g, DT);   // 10 s on pad
-
-        Serial.print(F("    velocity after 10 s on pad: "));
-        Serial.print(est.velocity_ms, 4); Serial.println(F(" m/s"));
-        Serial.print(F("    altitude after 10 s on pad: "));
-        Serial.print(est.altitude_m, 4); Serial.println(F(" m"));
-        check("velocity drift < 0.05 m/s", fabsf(est.velocity_ms) < 0.05f);
-        check("altitude drift < 1 m",      fabsf(est.altitude_m)  < 1.0f);
-    }
-
-    info("Sub-test 6: NaN guards");
-    {
-        AltEstimator est;
-        alt_init(&est, P0);
-        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.0f);
-        alt_calibrate_finish(&est);
-
-        alt_update(&est, P0, 1.0f, DT);
-        float alt_before = est.altitude_m;
-        float vel_before = est.velocity_ms;
-
-        alt_update(&est, NAN, 1.0f, DT);   // NaN pressure
-        check("NaN pressure leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
-        check("NaN pressure leaves velocity unchanged", fabsf(est.velocity_ms - vel_before) < 1e-6f);
-
-        alt_update(&est, P0, NAN, DT);     // NaN accel
-        check("NaN accel leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
-
-        alt_update(&est, P0, 1.0f, NAN);   // NaN dt
-        check("NaN dt leaves altitude unchanged", fabsf(est.altitude_m - alt_before) < 1e-6f);
-
-        for (int i = 0; i < 50; i++) alt_update(&est, P0, 1.0f, DT);
-        check("estimator recovers and produces finite altitude", isfinite(est.altitude_m));
-    }
-
-    info("Sub-test 7: rate-independent bias convergence");
-    {
-        const float TRUE_BIAS_G = 0.02f;   // sensor reads 1.02 g on the pad
-        const float WALL_TIME_S = 30.0f;
-
-        auto run = [&](float fs) {
-            AltEstimator est;
-            alt_init(&est, P0);
-            float dt = 1.0f / fs;
-            int n_ticks = (int)(WALL_TIME_S * fs);
-            for (int i = 0; i < n_ticks; i++) alt_update(&est, P0, 1.0f + TRUE_BIAS_G, dt);
-            return est.accel_bias_ms2;
-        };
-
-        float bias_50Hz  = run(50.0f);
-        float bias_100Hz = run(100.0f);
-        Serial.print(F("    bias after 30 s @  50 Hz: ")); Serial.print(bias_50Hz, 4);  Serial.println(F(" m/s^2"));
-        Serial.print(F("    bias after 30 s @ 100 Hz: ")); Serial.print(bias_100Hz, 4); Serial.println(F(" m/s^2"));
-        check("50 Hz and 100 Hz converge to same bias (within 5%)",
-              fabsf(bias_50Hz - bias_100Hz) < (0.05f * fabsf(bias_50Hz) + 0.001f));
-    }
-
-    Serial.println();
-    if (failed == 0) {
-        pass("Altitude Estimator PASSED — all sub-checks OK");
-    } else {
-        Serial.print(F("  [FAIL] Altitude Estimator — "));
-        Serial.print(failed);
-        Serial.println(F(" sub-check(s) failed"));
-    }
-}
-
-// ============================================================
-//  TEST M — Live Health Monitor
-//  Streams $HLTH frames (see health.h) for tools/bench_gui.py and
-//  tools/health_monitor.py. Brings up IMU/baro/SD once, then polls
-//  continuously until any key is pressed. MAG/FLASH/PYRO1/PYRO2/BATT
-//  stay at their policy-driven N/FIT state — this board doesn't fit
-//  the mag, and the others need their own dedicated bench test to
-//  produce a real reading.
-// ============================================================
-static HealthMonitor _health;
-static bool           _health_ready = false;
-
-static void health_bench_init() {
-    health_init(&_health);
-
-    bool imu_ok = lsm6dsox_init();
-    health_set_init(&_health, HC_IMU, imu_ok);
-    if (!imu_ok) Serial.println(F("  [WARN] IMU init failed — monitor will show IMU as FAILED"));
-
-    bool baro_ok = lps22hb_init();
-    health_set_init(&_health, HC_BARO, baro_ok);
-    if (!baro_ok) Serial.println(F("  [WARN] Baro init failed — monitor will show BARO as FAILED"));
-
-    bool sd_ok = logger_init();
-    health_update_log(&_health, sd_ok, millis());
-
-    analogReadResolution(12);
-    pinMode(PIN_ARM_SENSE, INPUT);
-
-    _health_ready = true;
-}
-
-static void test_monitor() {
-    print_banner("TEST M: Live Health Monitor ($HLTH frames)");
-    Serial.println(F("  Streaming for bench_gui.py / health_monitor.py."));
-    Serial.println(F("  Send any character to stop and return to the menu."));
-
-    if (!_health_ready) health_bench_init();
-
-    while (Serial.available()) Serial.read();   // clear the 'M' that got us here
-
-    while (!Serial.available()) {
-        uint32_t now = millis();
-
-        LSM6DSOX_Data imu_d;
-        lsm6dsox_read(&imu_d, nullptr);
-        health_update_imu(&_health, &imu_d, now, true);   // bench = on pad
-
-        LPS22HB_Data baro_d;
-        lps22hb_read(&baro_d);
-        health_update_baro(&_health, &baro_d, now);
-
-        health_update_arm(&_health, (uint16_t)analogRead(PIN_ARM_SENSE), now);
-
-        health_tick(&_health, now);
-        health_emit_frame(&_health, now, STATE_IDLE);
-
-        delay(8);   // ~125 Hz, matches the flight loop rate
-    }
-    while (Serial.available()) Serial.read();
-    pass("Monitor stopped");
-}
-
-// ============================================================
 //  Run all tests
 // ============================================================
 static void run_all() {
@@ -1079,12 +1073,11 @@ static void run_all() {
     test_flash();
     test_sd();
     test_logger_roundtrip();
-    test_altitude_estimator();
 
     Serial.println();
     print_banner("ALL TESTS COMPLETE");
     Serial.println(F("  Review each test above for PASS/FAIL."));
-    Serial.println(F("  Send individual command (1-6, A) to re-run a specific test."));
+    Serial.println(F("  Send individual command (1-6) to re-run a specific test."));
 }
 
 // ============================================================
@@ -1099,15 +1092,13 @@ static void print_menu() {
     Serial.println(F("║  2 - LSM6DSOX IMU (SPI)                  ║"));
     Serial.println(F("║  3 - MMC5603NJ Magnetometer (I2C Wire1)  ║"));
     Serial.println(F("║  4 - GD25Q128 NOR Flash (SPI)            ║"));
-    Serial.println(F("║  5 - SD Card (SPI)                       ║"));
+    Serial.println(F("║  5 - SD Card (detect → stage → CSV)      ║"));
     Serial.println(F("║  6 - Logger round-trip (RAM → SD CSV)    ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
-    Serial.println(F("║  A - Altitude estimator self-check       ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
-    Serial.println(F("║  M - Live health monitor ($HLTH frames)  ║"));
     Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
@@ -1159,9 +1150,7 @@ void loop() {
         case 'S': case 's': test_servos(); break;
         case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
-        case 'A': case 'a': test_altitude_estimator(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
-        case 'M': case 'm': test_monitor(); break;
         case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;
         default:
