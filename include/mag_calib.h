@@ -12,9 +12,13 @@
 // At ~10 Hz reads, 500 samples = 50 seconds — enough for a thorough rotation.
 #define MAG_CALIB_SAMPLES        500
 
-// EEPROM address for mag calibration (after gyro bias at addr 10, size 14)
-// Gyro bias ends at addr 10 + 2 + 4 + 4 + 4 = 24. Start mag at 30.
-#define MAG_CALIB_EEPROM_ADDR    30
+// EEPROM address for mag calibration. Map:
+//   10-23  gyro bias      (lsm6dsox.h — magic + 3 floats)
+//   30-33  pyro fired flags (pyro.h — rewritten on every SW401 arming)
+//   40-65  mag calibration  (magic + 6 floats)
+// Must not overlap pyro: it used to sit at 30 too, so every arming
+// wiped the saved calibration.
+#define MAG_CALIB_EEPROM_ADDR    40
 #define MAG_CALIB_MAGIC          0xCA1Bu
 
 // --------------------------------------------------------

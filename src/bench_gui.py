@@ -420,7 +420,7 @@ class BenchPanel:
         ("1  Baro", "1"), ("2  IMU", "2"), ("3  Mag", "3"), ("4  Flash", "4"),
         ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"),
         ("S  Servos", "S"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
-        ("C  Continuity", "C"), ("U  USB dump", "U"),
+        ("C  Continuity", "C"), ("M  Mag calibrate", "M"), ("U  USB dump", "U"),
         ("R  Menu", "R"),
     ]
 

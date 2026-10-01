@@ -25,7 +25,7 @@
 #define PYRO_MAIN_MIN_ALT_M   0.0f
 
 // EEPROM — persist fired flags across brownouts so a reset cannot re-arm a spent channel.
-#define PYRO_EEPROM_ADDR      30   // bytes 30-33 (after gyro bias at 10-23)
+#define PYRO_EEPROM_ADDR      30   // bytes 30-33 (after gyro bias at 10-23, before mag calib at 40 — see mag_calib.h)
 #define PYRO_EEPROM_MAGIC     0xF1A5u
 
 // --------------------------------------------------------

@@ -19,6 +19,7 @@
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
 //    H — Barometer lift-height test (averaged baseline, lift prompt, 2.5 s delay, averaged delta)
+//    M — Magnetometer calibration (rotate ~50 s, then 'Y' to save to EEPROM)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
@@ -323,7 +324,7 @@ static void test_mmc5603() {
         Serial.print(cal.scale_y, 4); Serial.print(F(" z="));
         Serial.println(cal.scale_z, 4);
     } else {
-        info("No mag calibration in EEPROM — send 'M' to calibrate in main firmware");
+        info("No mag calibration in EEPROM — send 'M' to calibrate");
         cal.offset_x = cal.offset_y = cal.offset_z = 0.0f;
         cal.scale_x  = cal.scale_y  = cal.scale_z  = 1.0f;
     }
@@ -383,6 +384,57 @@ static void test_mmc5603() {
     }
 
     pass("MMC5603NJ PASSED — reads valid, field magnitude in range");
+}
+
+// ============================================================
+//  TEST M — Magnetometer hard/soft-iron calibration
+//  Runs mag_calibrate() (~50 s of rotation), shows the result, and
+//  saves it to EEPROM only on a 'Y' — a bad run never overwrites a
+//  good calibration.
+// ============================================================
+#define MAG_CAL_CONFIRM_TIMEOUT_MS 30000
+
+static void test_mag_calibrate() {
+    print_banner("TEST M: Magnetometer Calibration (MMC5603NJ)");
+
+    if (!mag_init()) {
+        fail("mag_init() returned false — sensor not responding");
+        return;
+    }
+
+    Serial.println(F("  Fit the board in the airframe as it will fly (battery, motor"));
+    Serial.println(F("  case, servos) — their iron is what this corrects for. Stand"));
+    Serial.println(F("  clear of desks, laptops and steel, then rotate it slowly through"));
+    Serial.println(F("  every orientation: a full roll about each axis, nose up and down."));
+
+    MagCalib cal;
+    if (!mag_calibrate(&cal)) {
+        fail("Calibration failed — nothing saved. Cover more orientations and retry.");
+        return;
+    }
+
+    Serial.println(F("  Send Y to save to EEPROM, anything else to discard."));
+    while (Serial.available()) Serial.read();   // drop anything typed during the rotation
+    int c = -1;
+    uint32_t t0 = millis();
+    while (millis() - t0 < MAG_CAL_CONFIRM_TIMEOUT_MS) {
+        if (!Serial.available()) continue;
+        c = Serial.read();
+        if (c != '\r' && c != '\n') break;
+        c = -1;
+    }
+    if (c != 'Y' && c != 'y') {
+        info("Not saved — EEPROM calibration unchanged");
+        return;
+    }
+
+    mag_save_calib(&cal);
+    MagCalib readback;
+    if (mag_load_calib(&readback) && memcmp(&readback, &cal, sizeof cal) == 0) {
+        pass("Mag calibration saved and read back — run Test 3 to check it");
+    } else {
+        fail("EEPROM read-back mismatch — calibration not stored correctly");
+    }
 }
 
 // ============================================================
@@ -1209,6 +1261,7 @@ static void print_menu() {
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
     Serial.println(F("║  H - Barometer lift-height test          ║"));
+    Serial.println(F("║  M - Magnetometer calibration (~50 s)    ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
     Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
@@ -1262,6 +1315,7 @@ void loop() {
         case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
         case 'H': case 'h': test_baro_lift_height(); break;
+        case 'M': case 'm': test_mag_calibrate(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
         case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;
