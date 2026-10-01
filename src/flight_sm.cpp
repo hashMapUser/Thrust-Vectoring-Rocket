@@ -43,11 +43,12 @@ static void update_pad_rest(FlightSM *fsm, float accel_mag_g, float gyro_rate_dp
             Serial.println("[FSM] Pad rest timer started...");
         }
         if (!fsm->pad_rest_satisfied && (now - fsm->pad_rest_start_ms) >= PAD_REST_MS) {
-            fsm->pad_rest_satisfied      = true;
-            fsm->pad_rest_baseline_alt_m = altitude_m;
+            fsm->pad_rest_satisfied = true;
+            if (!fsm->baseline_from_arm) fsm->pad_rest_baseline_alt_m = altitude_m;
             Serial.print("[FSM] PAD REST SATISFIED. Baseline Alt: ");
-            Serial.print(altitude_m);
-            Serial.println(" m. Ready for launch.");
+            Serial.print(fsm->pad_rest_baseline_alt_m);
+            Serial.print(fsm->baseline_from_arm ? " m (armed ground ref)" : " m");
+            Serial.println(". Ready for launch.");
 
             digitalWriteFast(PIN_LED_GREEN, HIGH);
             pad_rest_led_off_ms = now + PAD_REST_LED_FLASH_MS;
@@ -80,6 +81,7 @@ void fsm_init(FlightSM *fsm) {
     fsm->pad_rest_satisfied      = false;
     fsm->pad_rest_start_ms       = 0;
     fsm->pad_rest_baseline_alt_m = 0.0f;
+    fsm->baseline_from_arm       = false;
     fsm->imu_fault               = false;
     
     Serial.println("[FSM] Initialized. Awaiting pad rest.");
@@ -90,9 +92,16 @@ void fsm_set_armed(FlightSM *fsm, bool armed) {
         enter_state(fsm, STATE_ARMED);
     } else if (!armed && fsm->state == STATE_ARMED) {
         enter_state(fsm, STATE_IDLE);
+        // Back to pad-rest snapshots — the next arming edge re-captures.
+        fsm->baseline_from_arm = false;
     }
     // Any other state: launch already latched or flight is underway —
     // the switch's ARM_SENSE reading is logged upstream but ignored here.
+}
+
+void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m) {
+    fsm->pad_rest_baseline_alt_m = altitude_m;
+    fsm->baseline_from_arm       = true;
 }
 
 void fsm_abort(FlightSM *fsm) {

@@ -72,7 +72,7 @@ typedef struct {
     SimpleState prev_state;
     uint32_t    state_entry_ms;
 
-    float       ground_altitude_m;   // baseline captured at init
+    float       ground_altitude_m;   // launch baseline: set at init, re-set by the SW401 arming capture
     float       peak_altitude_m;     // highest altitude seen this flight
 
     bool        chute_fired;
@@ -89,6 +89,15 @@ typedef struct {
  *                            baseline SIMPLE_LAUNCH_ALT_M is measured from.
  */
 void simple_fsm_init(SimpleFSM *fsm, float ground_altitude_m);
+
+/**
+ * Re-set the launch baseline after the altitude estimator is re-referenced
+ * (the SW401 arming capture). Also resets the peak — one left over from the
+ * old reference would read as an instant "drop" once ASCENT starts. No-op
+ * outside IDLE.
+ * @param ground_altitude_m  Estimated altitude at the new reference.
+ */
+void simple_fsm_set_ground(SimpleFSM *fsm, float ground_altitude_m);
 
 /**
  * Update the state machine and fire the recovery chute when appropriate.

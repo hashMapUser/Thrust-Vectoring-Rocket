@@ -31,6 +31,22 @@
 // Minimum samples required for pre-arm calibration to be considered valid
 #define ALT_MIN_CAL_SAMPLES     50
 
+// Fresh baro samples averaged into a ground reference — the boot reference
+// and the launch baseline captured on the SW401 arming edge. ~1.33 s at the
+// LPS22HB's 75 Hz ODR.
+#define ALT_GROUND_SAMPLES      100
+
+// Ground-reference outlier rejection (alt_ground_mean()): a sample further
+// than this from the set's median is dropped from the average. ~4 m — a
+// still board spreads ~0.02 hPa; the bad reading seen on the bench was
+// 28 hPa off.
+#define ALT_GROUND_OUTLIER_HPA  0.5f
+
+// If fewer than this percentage of samples survive, the whole set is
+// rejected: that many outliers means the sensor is glitching or the vehicle
+// is moving, and the median itself can't be trusted.
+#define ALT_GROUND_MIN_USED_PCT 80
+
 // --------------------------------------------------------
 // STRUCTS
 // --------------------------------------------------------
@@ -66,6 +82,12 @@ typedef struct {
     float    cal_accel_sum_g; // running sum of accel_z_g samples
     uint32_t cal_count;       // number of calibration samples accumulated
 
+    // ---- ground-reference capture (alt_ground_capture_*) ----
+    float    ground_cap_samples[ALT_GROUND_SAMPLES];
+    uint16_t ground_cap_count;
+    uint16_t ground_cap_used;     // samples kept by the last completed set (outliers dropped)
+    bool     ground_capturing;
+
     // ---- flags ----
     bool initialised;
 } AltEstimator;
@@ -83,6 +105,62 @@ typedef struct {
  * @param ground_hpa    Current pressure at ground level [hPa].
  */
 void alt_init(AltEstimator *est, float ground_hpa);
+
+/**
+ * Re-reference to a new ground pressure. Altitude and velocity are zeroed —
+ * the vehicle must be stationary on the pad at this pressure. The accel
+ * bias and its calibration are kept.
+ *
+ * @param est         Estimator state.
+ * @param ground_hpa  Pressure at the launch site [hPa].
+ */
+void alt_set_ground(AltEstimator *est, float ground_hpa);
+
+/**
+ * Outlier-rejecting mean of a set of pressure samples: samples further
+ * than ALT_GROUND_OUTLIER_HPA from the median are dropped, the rest are
+ * averaged. Used for every ground reference (boot, arming, bench Test H).
+ *
+ * @param samples_hpa  Samples [hPa]; not modified.
+ * @param n            Number of samples, 1..ALT_GROUND_SAMPLES.
+ * @param mean_hpa     Mean of the kept samples. Untouched on failure.
+ * @param median_hpa   Optional (nullptr to skip): the set's median.
+ * @param n_used       Optional (nullptr to skip): samples kept.
+ * @return false if fewer than ALT_GROUND_MIN_USED_PCT % were kept, or n is
+ *         out of range.
+ */
+bool alt_ground_mean(const float *samples_hpa, uint16_t n,
+                     float *mean_hpa, float *median_hpa, uint16_t *n_used);
+
+/** alt_ground_capture_sample() result. */
+typedef enum {
+    ALT_CAPTURE_PENDING = 0,   // still collecting, or no capture running
+    ALT_CAPTURE_DONE,          // new ground reference applied
+    ALT_CAPTURE_RESTARTED,     // too many outliers — set discarded, collecting again
+} AltCaptureResult;
+
+/**
+ * Start a non-blocking ground-reference capture: feed it the loop's baro
+ * reading every tick with alt_ground_capture_sample(). Restarts any
+ * capture already in progress.
+ */
+void alt_ground_capture_start(AltEstimator *est);
+
+/**
+ * Feed one pressure sample to an in-progress capture. NaN (no fresh baro
+ * data this tick) is skipped. On the ALT_GROUND_SAMPLES-th valid sample the
+ * set goes through alt_ground_mean(): if it passes, the mean is applied via
+ * alt_set_ground() (ALT_CAPTURE_DONE, once per capture); if too many
+ * samples were outliers, the set is thrown away and collection starts over
+ * (ALT_CAPTURE_RESTARTED). ground_cap_used holds the kept count either way.
+ *
+ * @param est           Estimator state.
+ * @param pressure_hpa  This tick's pressure [hPa], or NaN.
+ */
+AltCaptureResult alt_ground_capture_sample(AltEstimator *est, float pressure_hpa);
+
+/** Abandon an in-progress capture; the current ground reference stays. */
+void alt_ground_capture_cancel(AltEstimator *est);
 
 /**
  * Accumulate one accelerometer sample for pre-arm bias calibration.

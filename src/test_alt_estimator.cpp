@@ -181,6 +181,100 @@ int main(void) {
               approx(bias_50Hz, bias_100Hz, 0.05f * std::fabs(bias_50Hz) + 0.001f));
     }
 
+    // ============================================================
+    // 8. Ground-reference capture: averages ALT_GROUND_SAMPLES valid
+    //    samples, skips NaN, re-references and zeroes altitude/velocity
+    // ============================================================
+    std::printf("Test 8: ground-reference capture\n");
+    {
+        const float PAD_HPA = 985.0f;   // pad ~240 m above the boot reference
+        AltEstimator est;
+        alt_init(&est, P0);
+        // Let the filter settle against the wrong (boot) reference
+        for (int i = 0; i < 500; i++) alt_update(&est, PAD_HPA, 1.0f, DT);
+        check("altitude off by ~240 m before capture", est.altitude_m > 200.0f);
+
+        alt_ground_capture_start(&est);
+        int completions = 0;
+        for (int i = 0; i < ALT_GROUND_SAMPLES - 1; i++) {
+            // Alternate ±0.1 hPa around the pad pressure, with NaN gaps
+            if (alt_ground_capture_sample(&est, NAN) != ALT_CAPTURE_PENDING) completions++;
+            if (alt_ground_capture_sample(&est, PAD_HPA + ((i & 1) ? 0.1f : -0.1f)) != ALT_CAPTURE_PENDING) completions++;
+        }
+        check("not complete before ALT_GROUND_SAMPLES valid samples",
+              completions == 0 && est.ground_capturing);
+        AltCaptureResult r = alt_ground_capture_sample(&est, PAD_HPA + 0.1f);
+        check("completes on the last sample", r == ALT_CAPTURE_DONE && !est.ground_capturing);
+        check("ground pressure is the mean",
+              approx(est.ground_pressure, PAD_HPA, 0.01f));
+        check("all samples kept", est.ground_cap_used == ALT_GROUND_SAMPLES);
+        check("altitude zeroed", approx(est.altitude_m, 0.0f, 1e-6f));
+        check("velocity zeroed", approx(est.velocity_ms, 0.0f, 1e-6f));
+        check("further samples ignored once complete",
+              alt_ground_capture_sample(&est, PAD_HPA) == ALT_CAPTURE_PENDING);
+
+        for (int i = 0; i < 500; i++) alt_update(&est, PAD_HPA, 1.0f, DT);
+        check("altitude stays near 0 on the pad after capture",
+              std::fabs(est.altitude_m) < 0.5f);
+
+        // Cancel keeps the current reference
+        alt_ground_capture_start(&est);
+        for (int i = 0; i < 50; i++) alt_ground_capture_sample(&est, 900.0f);
+        alt_ground_capture_cancel(&est);
+        check("cancel keeps previous reference",
+              approx(est.ground_pressure, PAD_HPA, 0.01f) && !est.ground_capturing);
+    }
+
+    // ============================================================
+    // 9. Outlier rejection: a wild reading is dropped from the mean;
+    //    too many outliers rejects the whole set
+    // ============================================================
+    std::printf("Test 9: ground-reference outlier rejection\n");
+    {
+        const float TRUE_HPA = 1013.5f;
+        float s[ALT_GROUND_SAMPLES];
+        float mean = -1.0f, median = -1.0f;
+        uint16_t used = 0;
+
+        // Two glitches like the one seen on the bench (28 hPa low / high)
+        for (int i = 0; i < ALT_GROUND_SAMPLES; i++) s[i] = TRUE_HPA + ((i & 1) ? 0.02f : -0.02f);
+        s[0]  = 985.5f;
+        s[57] = 1041.5f;
+        bool ok = alt_ground_mean(s, ALT_GROUND_SAMPLES, &mean, &median, &used);
+        check("set with 2 glitches accepted", ok);
+        check("glitches dropped", used == ALT_GROUND_SAMPLES - 2);
+        check("mean unaffected by glitches", approx(mean, TRUE_HPA, 0.005f));
+        check("median is the true pressure", approx(median, TRUE_HPA, 0.03f));
+
+        // 30 % outliers — the median still lands on the good cluster, but
+        // a set this bad isn't trusted
+        for (int i = 0; i < ALT_GROUND_SAMPLES; i++) s[i] = (i < 30) ? 985.5f : TRUE_HPA;
+        mean = -1.0f;
+        ok = alt_ground_mean(s, ALT_GROUND_SAMPLES, &mean, nullptr, &used);
+        check("set with 30% outliers rejected", !ok && used == 70);
+        check("mean untouched on rejection", mean == -1.0f);
+
+        check("n = 0 rejected", !alt_ground_mean(s, 0, &mean, nullptr, nullptr));
+
+        // Capture path: a bad set restarts collection instead of applying
+        AltEstimator est;
+        alt_init(&est, P0);
+        alt_ground_capture_start(&est);
+        AltCaptureResult r = ALT_CAPTURE_PENDING;
+        for (int i = 0; i < ALT_GROUND_SAMPLES; i++)
+            r = alt_ground_capture_sample(&est, (i < 30) ? 985.5f : TRUE_HPA);
+        check("bad set restarts capture",
+              r == ALT_CAPTURE_RESTARTED && est.ground_capturing &&
+              est.ground_cap_count == 0 && approx(est.ground_pressure, P0, 0.001f));
+
+        for (int i = 0; i < ALT_GROUND_SAMPLES; i++)
+            r = alt_ground_capture_sample(&est, (i == 10) ? 985.5f : TRUE_HPA);
+        check("good set after restart applies, glitch dropped",
+              r == ALT_CAPTURE_DONE && !est.ground_capturing &&
+              est.ground_cap_used == ALT_GROUND_SAMPLES - 1 &&
+              approx(est.ground_pressure, TRUE_HPA, 0.001f));
+    }
+
     std::printf("\n");
     if (failures == 0) {
         std::printf("ALL TESTS PASSED.\n");

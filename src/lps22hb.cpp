@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
 #include "lps22hb.h"
@@ -85,4 +86,25 @@ void lps22hb_read(LPS22HB_Data *out) {
     out->pressure_pa   = (raw_press / 4096.0f) * 100.0f;   // hPa → Pa
     out->temperature_c = raw_temp / 100.0f;
     out->valid         = true;
+}
+
+bool lps22hb_read_samples(uint16_t samples, float *samples_hpa) {
+    if (samples == 0) return false;
+
+    uint16_t count   = 0;
+    uint32_t last_ms = millis();
+
+    while (count < samples) {
+        LPS22HB_Data d;
+        lps22hb_read(&d);
+        if (d.valid) {
+            samples_hpa[count++] = d.pressure_pa / 100.0f;
+            last_ms = millis();
+        } else if (millis() - last_ms > LPS22HB_SAMPLE_TIMEOUT_MS) {
+            return false;
+        } else {
+            delay(1);   // next conversion is up to ~13 ms away
+        }
+    }
+    return true;
 }

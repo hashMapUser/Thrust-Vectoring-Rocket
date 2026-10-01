@@ -18,7 +18,7 @@
 //    5 — Test SD card              (card detect → sensor data → flash/RAM → SD CSV)
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
-//    H — Barometer lift-height test (baseline, lift prompt, 2.5 s delay, delta)
+//    H — Barometer lift-height test (averaged baseline, lift prompt, 2.5 s delay, averaged delta)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
@@ -34,6 +34,7 @@
 // Pull in your actual driver headers
 #include "board_pins.h"
 #include "lps22hb.h"
+#include "alt_estimator.h"   // ALT_GROUND_SAMPLES — Test H matches the flight baseline
 #include "lsm6dsox.h"
 #include "mag.h"
 #include "mag_calib.h"
@@ -1033,24 +1034,67 @@ static void test_pyro_continuity() {
 // ============================================================
 //  TEST H — Barometer Lift-Height Test
 //  Captures a baseline pressure, prompts you to physically lift the
-//  barometer, then reports the height change 2.5 s later. Sanity check
-//  that the sensor tracks real altitude changes, not just noise.
+//  barometer, then 2.5 s later averages a second reading while you hold
+//  it up and reports the height change. Both readings average
+//  ALT_GROUND_SAMPLES fresh samples with outliers dropped — exactly the
+//  flight launch baseline's alt_ground_mean() — so a single wild sample
+//  can't decide the result.
 // ============================================================
-#define BARO_LIFT_BASELINE_SAMPLES   10
-#define BARO_LIFT_BASELINE_PERIOD_MS 100
 #define BARO_LIFT_WAIT_MS            2500
+#define BARO_SAMPLES_PER_LINE        5
 
-static bool baro_lift_avg_pressure(int samples, int period_ms, float *out_hpa) {
-    float sum = 0.0f;
-    int valid = 0;
-    for (int i = 0; i < samples; i++) {
-        LPS22HB_Data d;
-        lps22hb_read(&d);
-        if (d.valid) { sum += d.pressure_pa; valid++; }
-        delay(period_ms);
+// Every reading in the set, '*' marking the outliers alt_ground_mean()
+// dropped, plus min/max/spread. Printed after the capture so Serial
+// output can't delay the sampling.
+static void print_baro_samples(const float *samples_hpa, uint16_t n, float median_hpa) {
+    float lo = samples_hpa[0], hi = samples_hpa[0];
+    for (uint16_t i = 0; i < n; i++) {
+        if (i % BARO_SAMPLES_PER_LINE == 0) Serial.print(F("    "));
+        Serial.print('[');
+        if (i + 1 < 100) Serial.print(' ');
+        if (i + 1 < 10)  Serial.print(' ');
+        Serial.print(i + 1);
+        Serial.print(F("] "));
+        Serial.print(samples_hpa[i], 3);
+        bool outlier = fabsf(samples_hpa[i] - median_hpa) > ALT_GROUND_OUTLIER_HPA;
+        Serial.print(outlier ? F("* ") : F("  "));
+        if (i % BARO_SAMPLES_PER_LINE == BARO_SAMPLES_PER_LINE - 1 || i == n - 1) Serial.println();
+
+        if (samples_hpa[i] < lo) lo = samples_hpa[i];
+        if (samples_hpa[i] > hi) hi = samples_hpa[i];
     }
-    if (valid < (samples + 1) / 2) return false;
-    *out_hpa = (sum / valid) / 100.0f;
+    Serial.print(F("    min ")); Serial.print(lo, 3);
+    Serial.print(F("  max "));   Serial.print(hi, 3);
+    Serial.print(F("  spread ")); Serial.print(hi - lo, 3);
+    Serial.print(F("  median ")); Serial.print(median_hpa, 3);
+    Serial.println(F(" hPa"));
+}
+
+// Read one set of ALT_GROUND_SAMPLES, print it, and average it the same way
+// the flight ground reference does. Prints its own FAIL on error.
+static bool baro_lift_capture(const __FlashStringHelper *label, float *mean_hpa) {
+    float samples_hpa[ALT_GROUND_SAMPLES];
+    if (!lps22hb_read_samples(ALT_GROUND_SAMPLES, samples_hpa)) {
+        fail("Sensor stopped producing data — check I2C / try again");
+        return false;
+    }
+
+    float    median_hpa;
+    uint16_t used = 0;
+    bool ok = alt_ground_mean(samples_hpa, ALT_GROUND_SAMPLES, mean_hpa, &median_hpa, &used);
+
+    Serial.print(F("  ")); Serial.print(label);
+    Serial.println(F(" readings (hPa, * = outlier, dropped):"));
+    print_baro_samples(samples_hpa, ALT_GROUND_SAMPLES, median_hpa);
+    Serial.print(F("    used ")); Serial.print(used);
+    Serial.print(F(" of "));      Serial.print(ALT_GROUND_SAMPLES);
+    Serial.print(F(" ("));        Serial.print(ALT_GROUND_SAMPLES - used);
+    Serial.println(F(" outliers dropped)"));
+
+    if (!ok) {
+        fail("Too many outliers — sensor glitching or board moving; try again");
+        return false;
+    }
     return true;
 }
 
@@ -1064,11 +1108,8 @@ static void test_baro_lift_height() {
 
     info("Capturing baseline height — keep the barometer still...");
     float baseline_hpa;
-    if (!baro_lift_avg_pressure(BARO_LIFT_BASELINE_SAMPLES, BARO_LIFT_BASELINE_PERIOD_MS, &baseline_hpa)) {
-        fail("Too many invalid reads while capturing baseline");
-        return;
-    }
-    Serial.print(F("  Baseline pressure: ")); Serial.print(baseline_hpa, 2); Serial.println(F(" hPa"));
+    if (!baro_lift_capture(F("Baseline"), &baseline_hpa)) return;
+    Serial.print(F("  Baseline pressure: ")); Serial.print(baseline_hpa, 3); Serial.println(F(" hPa"));
     Serial.println(F("  Baseline height set to 0.0 m."));
 
     Serial.println();
@@ -1079,16 +1120,12 @@ static void test_baro_lift_height() {
 
     delay(BARO_LIFT_WAIT_MS);
 
-    LPS22HB_Data d;
-    lps22hb_read(&d);
-    if (!d.valid) {
-        fail("Post-lift read invalid — try again");
-        return;
-    }
-    float new_hpa = d.pressure_pa / 100.0f;
+    Serial.println(F("  Hold it there — averaging..."));
+    float new_hpa;
+    if (!baro_lift_capture(F("Post-lift"), &new_hpa)) return;
     float delta_alt_m = 44330.0f * (1.0f - powf(new_hpa / baseline_hpa, 0.1902949f));
 
-    Serial.print(F("  New pressure: ")); Serial.print(new_hpa, 2); Serial.println(F(" hPa"));
+    Serial.print(F("  New pressure: ")); Serial.print(new_hpa, 3); Serial.println(F(" hPa"));
     Serial.print(F("  Height change: "));
     Serial.print(delta_alt_m, 2);
     Serial.println(F(" m"));

@@ -40,6 +40,11 @@
 // I2C fast-mode clock
 #define LPS22HB_I2C_CLOCK       400000UL
 
+// lps22hb_read_samples(): give up if no fresh sample arrives within this
+// long. ~4 sample periods at 75 Hz — long enough to ride out one missed
+// conversion, short enough that a dead sensor fails fast.
+#define LPS22HB_SAMPLE_TIMEOUT_MS  50
+
 // PIN ASSIGNMENTS — Wire (I2C0): SDA=PIN_BARO_SDA (18), SCL=PIN_BARO_SCL (19) from board_pins.h
 #include "board_pins.h"
 
@@ -76,3 +81,17 @@ bool lps22hb_init(void);
  * @param out  Output measurement.  out->valid is false on any I2C error.
  */
 void lps22hb_read(LPS22HB_Data *out);
+
+/**
+ * Blocking read of `samples` fresh pressure readings. Each one is a new
+ * conversion (gated on P_DA like lps22hb_read()), so 100 samples take
+ * ~1.33 s at 75 Hz. Average them with alt_ground_mean(), which drops
+ * outliers. Blocks — do not call from the watchdog-fed flight loop; use
+ * alt_ground_capture_*() there instead.
+ *
+ * @param samples      Number of fresh samples to read (> 0).
+ * @param samples_hpa  Receives each reading [hPa]; must hold `samples` floats.
+ * @return false if the sensor stops producing data (no fresh sample within
+ *         LPS22HB_SAMPLE_TIMEOUT_MS).
+ */
+bool lps22hb_read_samples(uint16_t samples, float *samples_hpa);

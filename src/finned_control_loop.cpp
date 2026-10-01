@@ -5,8 +5,9 @@
 //  Uses simple_fsm.h instead of flight_sm.h — no ARMED flight-state, no
 //  pad-rest latch, no PID/servo control. The arming switch (SW401) is
 //  still read here (see the "ARMING SWITCH" block below) to clear the
-//  EEPROM fired-flags and check continuity for each new flight, but it
-//  does not gate launch detection the way flight_sm.h's does.
+//  EEPROM fired-flags, check continuity and re-capture the launch ground
+//  reference for each new flight, but it does not gate launch detection
+//  the way flight_sm.h's does.
 //
 //  SAFETY: the pyro channel is armed once at boot, unconditionally.
 //  See include/simple_fsm.h for the full safety note before powering
@@ -105,13 +106,20 @@ void setup() {
 
     logger_init();
 
-    float ground_hpa = 1013.25f;
+    // Boot ground reference, averaged over ALT_GROUND_SAMPLES fresh baro
+    // readings with outliers dropped (~1.33 s). Covers the time before
+    // arming — the launch baseline is re-captured on the SW401 arming edge
+    // in loop().
     {
-        LPS22HB_Data baro_ground;
-        lps22hb_read(&baro_ground);
-        if (baro_ground.valid) ground_hpa = baro_ground.pressure_pa / 100.0f;
+        float samples_hpa[ALT_GROUND_SAMPLES];
+        float ground_hpa;
+        if (!lps22hb_read_samples(ALT_GROUND_SAMPLES, samples_hpa) ||
+            !alt_ground_mean(samples_hpa, ALT_GROUND_SAMPLES, &ground_hpa, nullptr, nullptr)) {
+            Serial.println("[WARN] Baro ground reference failed — using sea-level, altitude unreliable");
+            ground_hpa = ALT_SEA_LEVEL_HPA;
+        }
+        alt_init(&alt_est, ground_hpa);
     }
-    alt_init(&alt_est, ground_hpa);
 
     // Pre-flight accel bias lock — hold still on the pad while this runs.
     Serial.println("[INIT] Hold still — calibrating accel bias (2 s)...");
@@ -162,8 +170,9 @@ void loop() {
 
     // ── ARMING SWITCH (SW401) ─────────────────────────────────
     // Lighter version of main_control_loop.cpp's block: this build has
-    // no ARMED state, so all it does is clear the fired flags and give
-    // an audible continuity check on a genuine new-flight arming edge.
+    // no ARMED state, so all it does on a genuine new-flight arming edge
+    // is clear the fired flags, give an audible continuity check and
+    // start the launch ground-reference capture.
     {
         bool arm_raw = read_arm_sense_v() > ARM_SENSE_ARMED_V;
         if (arm_raw != arm_raw_prev) { arm_edge_ms = now_ms; arm_raw_prev = arm_raw; }
@@ -180,7 +189,13 @@ void loop() {
             buzzer_set(&buzz, cont_ok ? BUZZ_ARMED : BUZZ_CONT_OPEN);
             Serial.print("[ARM] SW401 CLOSED — new flight armed. Continuity: ");
             Serial.println(cont_ok ? "OK" : "OPEN");
+
+            // Launch baseline: averaged over the next ALT_GROUND_SAMPLES
+            // baro readings, fed below — never blocking, the watchdog is live.
+            alt_ground_capture_start(&alt_est);
+            Serial.println("[ALT] Capturing launch ground reference — hold still...");
         } else if (on_pad && !arm_now && arm_prev) {
+            alt_ground_capture_cancel(&alt_est);
             buzzer_set(&buzz, BUZZ_IDLE);
             Serial.println("[ARM] SW401 OPEN — disarmed.");
         }
@@ -216,6 +231,39 @@ void loop() {
                                  imu_data.gz*imu_data.gz);
 
     float pressure_for_est = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
+
+    // Launch ground reference capture, started on the SW401 arming edge.
+    // Before alt_update() so the completing tick uses the new reference;
+    // abandoned if launch is detected first.
+    if (alt_est.ground_capturing) {
+        if (fsm.state != SIMPLE_STATE_IDLE) {
+            alt_ground_capture_cancel(&alt_est);
+            Serial.println("[ALT] Launch began before ground reference finished — keeping previous baseline.");
+        } else {
+            switch (alt_ground_capture_sample(&alt_est, pressure_for_est)) {
+                case ALT_CAPTURE_DONE:
+                    simple_fsm_set_ground(&fsm, alt_est.altitude_m);
+                    Serial.print("[ALT] Launch ground reference set: ");
+                    Serial.print(alt_est.ground_pressure, 3);
+                    Serial.print(" hPa (");
+                    Serial.print(alt_est.ground_cap_used);
+                    Serial.print(" of ");
+                    Serial.print(ALT_GROUND_SAMPLES);
+                    Serial.println(" samples, outliers dropped). Altitude zeroed.");
+                    break;
+                case ALT_CAPTURE_RESTARTED:
+                    Serial.print("[ALT] Ground reference rejected — only ");
+                    Serial.print(alt_est.ground_cap_used);
+                    Serial.print(" of ");
+                    Serial.print(ALT_GROUND_SAMPLES);
+                    Serial.println(" samples near the median. Recapturing — hold still...");
+                    break;
+                case ALT_CAPTURE_PENDING:
+                    break;
+            }
+        }
+    }
+
     alt_update(&alt_est, pressure_for_est, accel_up_g, dt);
 
     // ── STATE MACHINE ─────────────────────────────────────────

@@ -150,14 +150,20 @@ void setup() {
     logger_init();
 
     // 5. ALTITUDE ESTIMATOR INIT
-    // Take a ground pressure snapshot (baro must be initialised first).
-    // If baro is absent, init with sea-level; in-flight bias refinement will
-    // still work but altitude will be inaccurate.
+    // Boot ground reference, averaged over ALT_GROUND_SAMPLES fresh baro
+    // readings with outliers dropped (~1.33 s; runs before the watchdog
+    // starts). This only covers the time before arming — the launch
+    // baseline is re-captured on the SW401 arming edge in loop(). If baro
+    // is absent, init with sea-level; in-flight bias refinement will still
+    // work but altitude will be inaccurate.
     {
-        LPS22HB_Data baro_ground;
-        lps22hb_read(&baro_ground);
-        float ground_hpa = baro_ground.valid ? (baro_ground.pressure_pa / 100.0f)
-                                              : 1013.25f;
+        float samples_hpa[ALT_GROUND_SAMPLES];
+        float ground_hpa;
+        if (!lps22hb_read_samples(ALT_GROUND_SAMPLES, samples_hpa) ||
+            !alt_ground_mean(samples_hpa, ALT_GROUND_SAMPLES, &ground_hpa, nullptr, nullptr)) {
+            Serial.println("[WARN] Baro ground reference failed — using sea-level, altitude unreliable");
+            ground_hpa = ALT_SEA_LEVEL_HPA;
+        }
         alt_init(&alt_est, ground_hpa);
     }
 
@@ -239,8 +245,15 @@ void loop() {
             Serial.print("  pack=");
             Serial.print(pack_v, 2);
             Serial.println(" V");
+
+            // Launch baseline: averaged over the next ALT_GROUND_SAMPLES
+            // baro readings, fed in section 3 — never blocking, the
+            // watchdog is live.
+            alt_ground_capture_start(&alt_est);
+            Serial.println("[ALT] Capturing launch ground reference — hold still...");
         } else if (on_pad && !arm_now && arm_prev) {
             fsm_set_armed(&fsm, false);
+            alt_ground_capture_cancel(&alt_est);
             buzzer_set(&buzz, BUZZ_IDLE);
             Serial.println("[ARM] SW401 OPEN — disarmed.");
         } else if (fsm.state == STATE_IDLE && now_ms - boot_ms > 600 &&
@@ -310,8 +323,44 @@ void loop() {
         alt_calibrate_sample(&alt_est, accel_up_g);
     }
 
-    // T8: update altitude estimator every tick (NaN pressure = accel-only update)
     float pressure_for_est = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
+
+    // Launch ground reference capture, started on the SW401 arming edge.
+    // Runs before alt_update() so the tick that completes it already
+    // measures against the new reference. If launch detection starts
+    // first, abandon it — an average spanning liftoff would be wrong.
+    if (alt_est.ground_capturing) {
+        bool on_pad = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                      fsm.launch_detect_ms == 0;
+        if (!on_pad) {
+            alt_ground_capture_cancel(&alt_est);
+            Serial.println("[ALT] Launch began before ground reference finished — keeping previous baseline.");
+        } else {
+            switch (alt_ground_capture_sample(&alt_est, pressure_for_est)) {
+                case ALT_CAPTURE_DONE:
+                    fsm_set_launch_baseline(&fsm, alt_est.altitude_m);
+                    Serial.print("[ALT] Launch ground reference set: ");
+                    Serial.print(alt_est.ground_pressure, 3);
+                    Serial.print(" hPa (");
+                    Serial.print(alt_est.ground_cap_used);
+                    Serial.print(" of ");
+                    Serial.print(ALT_GROUND_SAMPLES);
+                    Serial.println(" samples, outliers dropped). Altitude zeroed.");
+                    break;
+                case ALT_CAPTURE_RESTARTED:
+                    Serial.print("[ALT] Ground reference rejected — only ");
+                    Serial.print(alt_est.ground_cap_used);
+                    Serial.print(" of ");
+                    Serial.print(ALT_GROUND_SAMPLES);
+                    Serial.println(" samples near the median. Recapturing — hold still...");
+                    break;
+                case ALT_CAPTURE_PENDING:
+                    break;
+            }
+        }
+    }
+
+    // T8: update altitude estimator every tick (NaN pressure = accel-only update)
     alt_update(&alt_est, pressure_for_est, accel_up_g, dt);
 
     mahrs_tick(&imu_data, &no_mag);

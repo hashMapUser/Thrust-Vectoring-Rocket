@@ -1,0 +1,43 @@
+TEENSY 4.0 PIN MAPPING DOCUMENT
+Pin Function        Pin Number    Mapping Type        Components          Interface
+GND                 GND           GND                 IMU                 SPI
+SD CS 1             0             SPI 1               Baro (LPS22HBTR)    I2C
+SD MISO1            1             SPI 1               Mag                 I2C
+                    2                                 Flash               SPI
+BUZZER              3             DIGITAL             SD Slot             SPI
+                    4                                 Servo X             PWM
+SERVO X             5             PWM                 Servo Y             PWM
+SERVO Y             6             PWM                 PYRO 1              DIG/ANA
+                    7                                 PYRO 2              DIG/ANA
+                    8                                 LED                 SPI
+                    9                                 BUZZER              DIG
+IMU CS              10            SPI 0
+IMU MOSI            11            SPI 0
+IMU MISO            12            SPI 0
+IMU SCK             13            SPI 0
+                    14            DIGITAL/ANALOG
+                    15            DIGITAL/ANALOG
+MAG SCL             16            I2C
+MAG SDA             17            I2C
+BARO SDA            18            I2C
+BARO SCL            19            I2C
+PYRO 1 SENSE        20
+PYRO 1 FIRE         21            DIGITAL/ANALOG
+PYRO 2 SENSE        22            DIGITAL/ANALOG
+PYRO 2 FIRE         23            DIGITAL/ANALOG
+                    24            DIGITAL/ANALOG
+                    25
+SD + LED MOSI1      26            SPI 1
+SD + LED SCK1       27            SPI 1
+                    28
+                    29
+                    30
+                    31
+                    32
+                    33
+FLASH MISO2         34            SPI 2
+FLASH MOSI2         35            SPI 2
+FLASH CS2           36            SPI 2
+FLASH SCK2          37            SPI 2
+                    38
+                    39

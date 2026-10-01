@@ -23,6 +23,12 @@ void simple_fsm_init(SimpleFSM *fsm, float ground_altitude_m) {
     fsm->chute_fired       = false;
 }
 
+void simple_fsm_set_ground(SimpleFSM *fsm, float ground_altitude_m) {
+    if (fsm->state != SIMPLE_STATE_IDLE) return;
+    fsm->ground_altitude_m = ground_altitude_m;
+    fsm->peak_altitude_m   = ground_altitude_m;
+}
+
 bool simple_fsm_state_changed(SimpleFSM *fsm) {
     if (fsm->state != fsm->prev_state) {
         fsm->prev_state = fsm->state;

@@ -28,7 +28,7 @@
 
 // G2b — Altitude confirmation: a real launch must also show altitude gain,
 // not just an accel spike (rules out a bump/knock while sitting on the pad).
-#define LAUNCH_ALT_DELTA_M         2.0f    // m AGL gain required, measured from pad-rest baseline
+#define LAUNCH_ALT_DELTA_M         2.0f    // m AGL gain required, measured from the launch baseline (pad_rest_baseline_alt_m)
 #define LAUNCH_CONFIRM_MS          1000    // total window (from accel latch start) to see that gain
 
 // POWERED → COAST: motor burnout
@@ -117,7 +117,8 @@ typedef struct {
     // detection directly — no arm step in between)
     bool     pad_rest_satisfied;
     uint32_t pad_rest_start_ms;
-    float    pad_rest_baseline_alt_m;  // altitude snapshot when latch is satisfied
+    float    pad_rest_baseline_alt_m;  // launch baseline: the armed ground reference once captured, else the altitude snapshot at pad-rest latch
+    bool     baseline_from_arm;        // set by fsm_set_launch_baseline(); pad-rest latches stop overwriting the baseline
 
     // Fault flags
     bool     imu_fault;
@@ -149,6 +150,15 @@ void fsm_update(FlightSM *fsm,
  * see main_control_loop.cpp's arming-switch handling for the full policy.
  */
 void fsm_set_armed(FlightSM *fsm, bool armed);
+
+/**
+ * Lock the launch baseline to the ground reference captured after the
+ * SW401 arming edge (ALT_GROUND_SAMPLES averaged readings). Later pad-rest
+ * latches keep it instead of taking a fresh single-tick snapshot, until
+ * the switch is opened again. Only call while still on the pad.
+ * @param altitude_m  Estimated altitude at the new reference (0 right after alt_set_ground()).
+ */
+void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m);
 
 /** Emergency abort — safes all outputs, sets STATE_ABORT. Pad-side faults only. */
 void fsm_abort(FlightSM *fsm);

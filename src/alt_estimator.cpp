@@ -23,7 +23,92 @@ void alt_init(AltEstimator *est, float ground_hpa) {
     est->cal_accel_sum_g    = 0.0f;
     est->cal_count          = 0;
 
+    est->ground_cap_count   = 0;
+    est->ground_cap_used    = 0;
+    est->ground_capturing   = false;
+
     est->initialised        = true;
+}
+
+
+void alt_set_ground(AltEstimator *est, float ground_hpa) {
+    est->ground_pressure   = ground_hpa;
+    est->ground_altitude_m = pressure_to_altitude(ground_hpa);
+
+    // On the pad at the new reference by definition. Leaving the old
+    // altitude in the filter would bleed the reference step out over
+    // ~50 baro ticks (ALT_ALPHA) and look like climb or sink.
+    est->altitude_m      = 0.0f;
+    est->velocity_ms     = 0.0f;
+    est->baro_altitude_m = 0.0f;
+}
+
+
+bool alt_ground_mean(const float *samples_hpa, uint16_t n,
+                     float *mean_hpa, float *median_hpa, uint16_t *n_used) {
+    if (n == 0 || n > ALT_GROUND_SAMPLES) return false;
+
+    // Median from a sorted copy (insertion sort — n is only ~100). Unlike
+    // the mean, it barely moves for a few wild readings, so it's a safe
+    // centre to measure "too far off" from.
+    float sorted[ALT_GROUND_SAMPLES] = {};   // zeroed only to quiet -Wmaybe-uninitialized
+    for (uint16_t i = 0; i < n; i++) {
+        float    v = samples_hpa[i];
+        uint16_t j = i;
+        while (j > 0 && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; j--; }
+        sorted[j] = v;
+    }
+    float median = (n & 1) ? sorted[n / 2]
+                           : 0.5f * (sorted[n / 2 - 1] + sorted[n / 2]);
+
+    // Double accumulator: 100 × ~1013 hPa in a float would round away
+    // centimetres of the mean.
+    double   sum  = 0.0;
+    uint16_t used = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        if (fabsf(samples_hpa[i] - median) <= ALT_GROUND_OUTLIER_HPA) {
+            sum += samples_hpa[i];
+            used++;
+        }
+    }
+
+    if (median_hpa) *median_hpa = median;
+    if (n_used)     *n_used     = used;
+
+    if ((uint32_t)used * 100 < (uint32_t)n * ALT_GROUND_MIN_USED_PCT) return false;
+    *mean_hpa = (float)(sum / used);
+    return true;
+}
+
+
+void alt_ground_capture_start(AltEstimator *est) {
+    est->ground_cap_count = 0;
+    est->ground_capturing = true;
+}
+
+
+AltCaptureResult alt_ground_capture_sample(AltEstimator *est, float pressure_hpa) {
+    if (!est->ground_capturing) return ALT_CAPTURE_PENDING;
+    if (isnan(pressure_hpa)) return ALT_CAPTURE_PENDING;
+
+    est->ground_cap_samples[est->ground_cap_count++] = pressure_hpa;
+    if (est->ground_cap_count < ALT_GROUND_SAMPLES) return ALT_CAPTURE_PENDING;
+
+    float mean_hpa;
+    if (!alt_ground_mean(est->ground_cap_samples, est->ground_cap_count,
+                         &mean_hpa, nullptr, &est->ground_cap_used)) {
+        est->ground_cap_count = 0;   // keep capturing with a fresh set
+        return ALT_CAPTURE_RESTARTED;
+    }
+
+    est->ground_capturing = false;
+    alt_set_ground(est, mean_hpa);
+    return ALT_CAPTURE_DONE;
+}
+
+
+void alt_ground_capture_cancel(AltEstimator *est) {
+    est->ground_capturing = false;
 }
 
 
