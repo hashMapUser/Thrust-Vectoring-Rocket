@@ -17,6 +17,7 @@
 
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 #include "logger.h"
+#include "telemetry.h"
 
 // Forward declarations for mahrs_integration.cpp
 struct RocketAttitude { float tip_a; float tip_b; float spin; };
@@ -80,10 +81,26 @@ static uint32_t arm_edge_ms   = 0;
 static bool     arm_now       = false;
 static bool     arm_prev      = false;
 static bool     seen_disarmed = false;   // latches once SW401 has read OFF since boot
-static uint32_t boot_ms       = 0;
+
+// White LED heartbeat — blinks for as long as the flight firmware is
+// running, so the build on the board is identifiable without a laptop.
+#define HEARTBEAT_HALF_PERIOD_MS 500
+
+static inline void heartbeat_update(uint32_t now_ms) {
+    digitalWriteFast(PIN_LED_WHITE, ((now_ms / HEARTBEAT_HALF_PERIOD_MS) & 1) ? HIGH : LOW);
+}
 
 // Rising-edge tracker for fsm.tvc_enabled — see section 5 in loop().
 static bool tvc_enabled_prev = false;
+
+// --- BENCH TELEMETRY ---
+// Tick counter for TLM_DIVIDER, and the last valid baro sample —
+// lps22hb_read() returns NaN on ticks with no new data, so without
+// holding the last value most telemetry frames would show no pressure.
+static uint8_t  tlm_tick      = 0;
+static uint32_t baro_last_ms  = 0;
+static float    baro_last_hpa = NAN;
+static float    baro_last_c   = NAN;
 
 void setup() {
     Serial.begin(115200);
@@ -103,12 +120,11 @@ void setup() {
     delay(100);
 
     // 2. HARDWARE OUTPUTS — indicator/buzzer/pyro only. Pyro pins go LOW
-    // here for safety (see pyro_init()'s own ordering requirement), and the
-    // buzzer needs to be ready before the sensor-init fail path below can
-    // use it. servo_init() is deferred past sensor init — see step 3.
+    // here for safety (see pyro_init()'s own ordering requirement). The
+    // buzzer stays silent until SW401 arms — boot status is shown on the
+    // LEDs instead. servo_init() is deferred past sensor init — see step 3.
     indicator_init(&indicator);
     buzzer_init(&buzz, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
-    buzzer_set(&buzz, BUZZ_BOOT);
     pyro_init(&pyros);
 
     // pyro_arm() sets the software armed flags unconditionally — SW401 is
@@ -128,8 +144,14 @@ void setup() {
     }
 
     // Green LED — bench aid, flashed by flight_sm.cpp on pad-rest latch.
+    // White LED — flight-firmware heartbeat, see heartbeat_update().
+    // Red LED — fast blink on a sensor-init fault.
     pinMode(PIN_LED_GREEN, OUTPUT);
     digitalWrite(PIN_LED_GREEN, LOW);
+    pinMode(PIN_LED_WHITE, OUTPUT);
+    digitalWrite(PIN_LED_WHITE, LOW);
+    pinMode(PIN_LED_RED, OUTPUT);
+    digitalWrite(PIN_LED_RED, LOW);
 
     // 3. SENSOR INIT — before servo_init() attaches and centers the servos.
     // That draws a current spike, and lsm6dsox_init() is a one-shot
@@ -142,8 +164,10 @@ void setup() {
 
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
-        buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
-        while (true) { buzzer_update(&buzz); delay(10); }
+        while (true) {
+            digitalWriteFast(PIN_LED_RED, ((millis() / 100) & 1) ? HIGH : LOW);
+            delay(10);
+        }
     }
     lsm6dsox_load_bias(&gyro_bias);
 
@@ -185,8 +209,6 @@ void setup() {
         wdt.begin(wdt_cfg);
     }
 
-    buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
-    boot_ms = millis();
     Serial.println("FLIGHT COMPUTER READY. PYRO ARMED. WAITING FOR LAUNCH.");
 }
 
@@ -243,14 +265,8 @@ void loop() {
         } else if (on_pad && !arm_now && arm_prev) {
             fsm_set_armed(&fsm, false);
             alt_ground_capture_cancel(&alt_est);
-            buzzer_set(&buzz, BUZZ_IDLE);
+            buzzer_off(&buzz);   // silent whenever disarmed
             Serial.println("[ARM] SW401 OPEN — disarmed.");
-        } else if (fsm.state == STATE_IDLE && now_ms - boot_ms > 600 &&
-                   buzz.pattern != BUZZ_IDLE && buzz.pattern != BUZZ_ARMED &&
-                   buzz.pattern != BUZZ_CONT_OPEN) {
-            // First settle after the boot self-test chirps finish: default
-            // to the disarmed/alive pattern rather than staying silent.
-            buzzer_set(&buzz, BUZZ_IDLE);
         }
         arm_prev = arm_now;
     }
@@ -266,7 +282,9 @@ void loop() {
             if (fsm.state != STATE_IDLE) {
                 Serial.println("[CAL] Gyro cal only allowed in IDLE.");
             } else {
-                if (lsm6dsox_calibrate_gyro(&gyro_bias)) {
+                // Calibration blocks for 4+ s; the keepalive feeds the
+                // 500 ms watchdog each sample so it doesn't reset mid-run.
+                if (lsm6dsox_calibrate_gyro(&gyro_bias, [] { wdt.feed(); })) {
                     lsm6dsox_save_bias(&gyro_bias);
                     Serial.println("[CAL] Gyro bias saved to EEPROM.");
                 }
@@ -276,6 +294,12 @@ void loop() {
             // automatically on STATE_LANDED; this covers bench testing
             // or forcing a dump before landing is detected.
             logger_finalize();
+        } else if (c == 'T') {
+            telemetry_set_enabled(true);
+            Serial.println("[TLM] Stream on.");
+        } else if (c == 't') {
+            telemetry_set_enabled(false);
+            Serial.println("[TLM] Stream off.");
         } else if (c == 'U') {
             // USB CSV dump, independent of logger_finalize()'s idempotence.
             // The auto-finalize at STATE_LANDED fires the moment it's
@@ -460,6 +484,63 @@ void loop() {
     pyro_update(&pyros);
     indicator_update(&indicator, fsm.state);
     buzzer_update(&buzz);
+    heartbeat_update(now_ms);
+
+    // ── 6b. BENCH TELEMETRY ───────────────────────────────────
+    // One $TLM frame every TLM_DIVIDER ticks while the stream is on.
+    // Sits before section 7's STATE_LANDED early return so the
+    // dashboard keeps updating after touchdown. telemetry_emit() drops
+    // a frame rather than block when the USB buffer is full.
+    if (baro_data.valid) {
+        baro_last_ms  = now_ms;
+        baro_last_hpa = baro_data.pressure_pa / 100.0f;
+        baro_last_c   = baro_data.temperature_c;
+    }
+
+    if (++tlm_tick >= TLM_DIVIDER) {
+        tlm_tick = 0;
+        if (telemetry_enabled()) {
+            TelemetryFrame t;
+            t.t_ms  = now_ms;
+            t.state = (uint8_t)fsm.state;
+
+            uint8_t flags = 0;
+            if (imu_data.valid)                     flags |= TLM_F_IMU_VALID;
+            if (baro_last_ms != 0 &&
+                now_ms - baro_last_ms < TLM_BARO_STALE_MS) flags |= TLM_F_BARO_OK;
+            if (fsm.tvc_enabled)                    flags |= TLM_F_TVC_LIVE;
+            if (arm_now)                            flags |= TLM_F_ARM_SWITCH;
+            if (fsm.pad_rest_satisfied)             flags |= TLM_F_PAD_REST;
+            if (fsm.launch_detect_ms != 0)          flags |= TLM_F_LAUNCH_DET;
+            if (alt_est.ground_capturing)           flags |= TLM_F_GROUND_CAP;
+            if (pyros.main_fired)                   flags |= TLM_F_MAIN_FIRED;
+            t.flags = flags;
+
+            t.q0 = q0; t.q1 = q1; t.q2 = q2; t.q3 = q3;
+            t.tip_a = attitude.tip_a;
+            t.tip_b = attitude.tip_b;
+            t.spin  = attitude.spin;
+
+            t.gx = imu_data.gx; t.gy = imu_data.gy; t.gz = imu_data.gz;
+            t.ax = imu_data.ax; t.ay = imu_data.ay; t.az = imu_data.az;
+
+            t.alt_m      = alt_est.altitude_m;
+            t.vel_ms     = alt_est.velocity_ms;
+            t.baro_alt_m = alt_est.baro_altitude_m;
+            t.press_hpa  = baro_last_hpa;
+            t.temp_c     = baro_last_c;
+
+            t.pid_p      = pitch_cmd;
+            t.pid_y      = yaw_cmd;
+            t.servo_p_us = servo_get_pitch_us();
+            t.servo_y_us = servo_get_yaw_us();
+
+            t.pack_v  = read_pack_voltage();
+            t.loop_us = micros() - now_us;
+
+            telemetry_emit(&t);
+        }
+    }
 
     // ── 7. LOGGING ────────────────────────────────────────────
     // Stop once landed. logger_write() runs unconditionally otherwise, so
