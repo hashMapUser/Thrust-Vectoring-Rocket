@@ -104,6 +104,10 @@ void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m) {
     fsm->baseline_from_arm       = true;
 }
 
+void fsm_set_pad_rest_baseline(FlightSM *fsm, float altitude_m) {
+    if (!fsm->baseline_from_arm) fsm->pad_rest_baseline_alt_m = altitude_m;
+}
+
 void fsm_abort(FlightSM *fsm) {
     fsm->tvc_enabled = false;
     enter_state(fsm, STATE_ABORT);

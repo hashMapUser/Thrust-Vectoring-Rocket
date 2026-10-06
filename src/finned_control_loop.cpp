@@ -130,7 +130,17 @@ void setup() {
         alt_calibrate_sample(&alt_est, -d.ax);
         delay(8);
     }
-    alt_calibrate_finish(&alt_est);
+    if (alt_calibrate_finish(&alt_est)) {
+        Serial.print("[INIT] Accel bias locked in: ");
+        Serial.print(alt_est.accel_bias_ms2, 3);
+        Serial.println(" m/s^2");
+    } else {
+        // Not upright/still at power-on (e.g. lying on the bench). Not fatal:
+        // the altitude filter learns the bias from the baro within seconds
+        // once the vehicle is upright on the pad.
+        Serial.println("[INIT] Accel calibration rejected (not upright/still) — "
+                       "bias will be learned from the baro.");
+    }
 
     simple_fsm_init(&fsm, alt_est.altitude_m);
 

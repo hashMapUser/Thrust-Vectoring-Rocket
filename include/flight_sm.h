@@ -160,6 +160,14 @@ void fsm_set_armed(FlightSM *fsm, bool armed);
  */
 void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m);
 
+/**
+ * Replace the pad-rest altitude snapshot — call after alt_calibrate_finish()
+ * re-syncs the altitude estimate on the pad-rest latch, so the baseline
+ * matches the re-synced altitude rather than the pre-calibration one.
+ * No-op once the armed ground reference is locked (fsm_set_launch_baseline()).
+ */
+void fsm_set_pad_rest_baseline(FlightSM *fsm, float altitude_m);
+
 /** Emergency abort — safes all outputs, sets STATE_ABORT. Pad-side faults only. */
 void fsm_abort(FlightSM *fsm);
 

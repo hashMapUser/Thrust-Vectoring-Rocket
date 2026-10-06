@@ -128,11 +128,11 @@ int main(void) {
         float alt_before = est.altitude_m;
         float vel_before = est.velocity_ms;
 
-        // NaN pressure
+        // NaN pressure = accel-only prediction; at rest that changes nothing
         alt_update(&est, NAN, 1.0f, DT);
-        check("NaN pressure leaves altitude unchanged",
+        check("NaN pressure (accel-only, at rest) leaves altitude unchanged",
               approx(est.altitude_m, alt_before, 1e-6f));
-        check("NaN pressure leaves velocity unchanged",
+        check("NaN pressure (accel-only, at rest) leaves velocity unchanged",
               approx(est.velocity_ms, vel_before, 1e-6f));
 
         // NaN accel
@@ -152,33 +152,42 @@ int main(void) {
     }
 
     // ============================================================
-    // 7. Bias gain is rate-independent
-    //    Run identical scenario at 50 Hz and 100 Hz, check that the
-    //    converged bias is the same after equal wall-clock time.
+    // 7. Uncalibrated bias is learned from the baro, at any loop rate
+    //    No pad calibration: the filter must find the true bias and keep
+    //    velocity at zero. (The old filter's gated refinement stalled at
+    //    ~13% of the bias once velocity drifted past 0.5 m/s — and this
+    //    test still passed, because it only compared the two rates.)
     // ============================================================
-    std::printf("Test 7: rate-independent bias convergence\n");
+    std::printf("Test 7: bias learned from the baro, rate-independent\n");
     {
-        const float TRUE_BIAS_G = 0.02f;   // sensor reads 1.02 g on the pad
-        const float WALL_TIME_S = 30.0f;
+        const float TRUE_BIAS_G   = 0.02f;   // sensor reads 1.02 g on the pad
+        const float TRUE_BIAS_MS2 = TRUE_BIAS_G * ALT_GRAVITY;
+        const float WALL_TIME_S   = 30.0f;
 
-        auto run = [&](float fs) {
-            AltEstimator est;
-            alt_init(&est, P0);
-            // Skip pre-arm cal → exercise the in-flight refinement
+        auto run = [&](float fs, AltEstimator *est) {
+            alt_init(est, P0);
             float dt = 1.0f / fs;
             int n_ticks = (int)(WALL_TIME_S * fs);
             for (int i = 0; i < n_ticks; i++) {
-                alt_update(&est, P0, 1.0f + TRUE_BIAS_G, dt);
+                alt_update(est, P0, 1.0f + TRUE_BIAS_G, dt);
             }
-            return est.accel_bias_ms2;
         };
 
-        float bias_50Hz  = run(50.0f);
-        float bias_100Hz = run(100.0f);
-        std::printf("    bias after 30 s @  50 Hz: %.4f m/s²\n", (double)bias_50Hz);
-        std::printf("    bias after 30 s @ 100 Hz: %.4f m/s²\n", (double)bias_100Hz);
-        check("50 Hz and 100 Hz converge to same bias (within 5%)",
-              approx(bias_50Hz, bias_100Hz, 0.05f * std::fabs(bias_50Hz) + 0.001f));
+        AltEstimator e50, e100;
+        run(50.0f, &e50);
+        run(100.0f, &e100);
+        std::printf("    @  50 Hz: bias %.4f m/s², velocity %+.4f m/s\n",
+                    (double)e50.accel_bias_ms2, (double)e50.velocity_ms);
+        std::printf("    @ 100 Hz: bias %.4f m/s², velocity %+.4f m/s\n",
+                    (double)e100.accel_bias_ms2, (double)e100.velocity_ms);
+        check("50 Hz learns the true bias (within 2%)",
+              approx(e50.accel_bias_ms2, TRUE_BIAS_MS2, 0.02f * TRUE_BIAS_MS2));
+        check("100 Hz learns the true bias (within 2%)",
+              approx(e100.accel_bias_ms2, TRUE_BIAS_MS2, 0.02f * TRUE_BIAS_MS2));
+        check("velocity held at ~0 (no drift)",
+              std::fabs(e50.velocity_ms) < 0.01f && std::fabs(e100.velocity_ms) < 0.01f);
+        check("altitude held at ~0",
+              std::fabs(e50.altitude_m) < 0.05f && std::fabs(e100.altitude_m) < 0.05f);
     }
 
     // ============================================================
@@ -273,6 +282,92 @@ int main(void) {
               r == ALT_CAPTURE_DONE && !est.ground_capturing &&
               est.ground_cap_used == ALT_GROUND_SAMPLES - 1 &&
               approx(est.ground_pressure, TRUE_HPA, 0.001f));
+    }
+
+    // ============================================================
+    // 10. Calibration window: rejects non-upright samples, reset discards
+    //     old ones, success zeroes velocity and re-syncs altitude to baro
+    // ============================================================
+    std::printf("Test 10: calibration window and sanity check\n");
+    {
+        AltEstimator est;
+        alt_init(&est, P0);
+
+        // Lying flat: mean ~0 g — must be rejected, bias untouched
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 0.0f);
+        check("flat-lying samples rejected", !alt_calibrate_finish(&est));
+        check("bias untouched on rejection", approx(est.accel_bias_ms2, 0.0f, 1e-6f));
+
+        // New still window: reset, then upright samples only
+        alt_calibrate_reset(&est);
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.01f);
+        est.velocity_ms     = 3.0f;    // error built up before the window
+        est.altitude_m      = 2.5f;
+        est.baro_altitude_m = 0.1f;    // latest baro AGL
+        check("upright window accepted after reset", alt_calibrate_finish(&est));
+        check("bias from the window only (0.01 g)",
+              approx(est.accel_bias_ms2, 0.01f * ALT_GRAVITY, 1e-4f));
+        check("velocity zeroed", approx(est.velocity_ms, 0.0f, 1e-6f));
+        check("altitude re-synced to baro", approx(est.altitude_m, 0.1f, 1e-6f));
+    }
+
+    // ============================================================
+    // 11. Pad scenario: power on lying flat for 10 s, then stood up on
+    //     the rail. Old filter: velocity +374 m/s, altitude +145 m by
+    //     launch. Now bounded before calibration, exact after.
+    // ============================================================
+    std::printf("Test 11: lying flat after power-on, then upright\n");
+    {
+        const float LOOP_DT = 1.0f / 125.0f;
+        AltEstimator est;
+        alt_init(&est, P0);
+        float max_v = 0.0f;
+        for (int i = 0; i < 10 * 125; i++) alt_update(&est, P0, 0.0f, LOOP_DT);
+        check("velocity bounded while lying flat", std::fabs(est.velocity_ms) < 1.0f);
+
+        alt_calibrate_reset(&est);     // pad-rest timer starts as it's stood up
+        for (int i = 0; i < 2 * 125; i++) {
+            alt_calibrate_sample(&est, 1.0f);
+            alt_update(&est, P0, 1.0f, LOOP_DT);
+            if (std::fabs(est.velocity_ms) > max_v) max_v = std::fabs(est.velocity_ms);
+        }
+        std::printf("    peak |velocity| while settling: %.2f m/s\n", (double)max_v);
+        check("pad-rest calibration accepted", alt_calibrate_finish(&est));
+        for (int i = 0; i < 60 * 125; i++) alt_update(&est, P0, 1.0f, LOOP_DT);
+        std::printf("    after 60 s upright: velocity %+.4f m/s, altitude %+.4f m\n",
+                    (double)est.velocity_ms, (double)est.altitude_m);
+        check("velocity ~0 at launch", std::fabs(est.velocity_ms) < 0.01f);
+        check("altitude ~0 at launch", std::fabs(est.altitude_m)  < 0.05f);
+    }
+
+    // ============================================================
+    // 12. Baro glitch gate and dt guard
+    // ============================================================
+    std::printf("Test 12: glitch gate, re-sync, dt guard\n");
+    {
+        const float GLITCH_HPA = 985.5f;   // ~238 m off, as seen on the bench
+        AltEstimator est;
+        alt_init(&est, P0);
+        for (int i = 0; i < 200; i++) alt_calibrate_sample(&est, 1.0f);
+        alt_calibrate_finish(&est);
+        for (int i = 0; i < 100; i++) alt_update(&est, P0, 1.0f, DT);
+
+        alt_update(&est, GLITCH_HPA, 1.0f, DT);
+        check("single glitch doesn't move velocity", std::fabs(est.velocity_ms) < 0.01f);
+        check("single glitch doesn't move altitude", std::fabs(est.altitude_m)  < 0.01f);
+
+        // A sustained offset is real: re-sync after ALT_INNOV_GATE_COUNT
+        for (int i = 0; i < ALT_INNOV_GATE_COUNT; i++) alt_update(&est, GLITCH_HPA, 1.0f, DT);
+        float glitch_agl = pressure_to_altitude(GLITCH_HPA) - est.ground_altitude_m;
+        check("sustained offset re-syncs altitude to baro",
+              approx(est.altitude_m, glitch_agl, 0.5f));
+        check("re-sync leaves velocity alone", std::fabs(est.velocity_ms) < 0.01f);
+
+        // First loop tick after setup() measures dt from boot — skipped
+        float alt_before = est.altitude_m, vel_before = est.velocity_ms;
+        alt_update(&est, P0, 1.5f, 4.0f);
+        check("multi-second dt skipped",
+              est.altitude_m == alt_before && est.velocity_ms == vel_before);
     }
 
     std::printf("\n");

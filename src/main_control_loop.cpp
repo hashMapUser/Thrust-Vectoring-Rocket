@@ -51,9 +51,12 @@ uint32_t last_loop_time = 0;
 // flight, the STATE_IDLE<->STATE_ARMED display state, and the ARMED /
 // continuity-open buzzer feedback. See the arming-switch block in loop().
 //
-// This flag only tracks the pad-rest rising edge, to lock in the accel
-// bias calibration at the same moment the old auto-arm step used to.
-static bool pad_rest_prev = false;
+// These only track pad-rest edges for the accel bias calibration:
+// pad_still_prev — the pad-rest timer running (upright and still), which
+// opens a fresh calibration window; pad_rest_prev — the latch itself, which
+// locks the calibration in, at the same moment the old auto-arm step used to.
+static bool pad_still_prev = false;
+static bool pad_rest_prev  = false;
 
 // ARM_SENSE divider: 10K/4.7K, ratio 0.3197. The pyro pack voltage isn't
 // sensed directly on this board, but the ARM_SENSE pin gives it indirectly.
@@ -199,21 +202,7 @@ void loop() {
 
     uint32_t now_ms = millis();
 
-    // ── 1. ACCEL BIAS LOCK ─────────────────────────────────────
-    // Locks in the accel calibration bias the moment pad-rest first
-    // latches, independent of the arming switch — this just needs the
-    // vehicle to have sat still long enough, whether or not it's armed.
-    {
-        bool pad_rest_now = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
-                             fsm.pad_rest_satisfied;
-        if (pad_rest_now && !pad_rest_prev) {
-            alt_calibrate_finish(&alt_est);   // T8: lock in accel bias before flight
-            Serial.println("[INIT] Pad-rest latched — accel bias locked in.");
-        }
-        pad_rest_prev = pad_rest_now;
-    }
-
-    // ── 1b. ARMING SWITCH (SW401) ──────────────────────────────
+    // ── 1. ARMING SWITCH (SW401) ───────────────────────────────
     // The switch is the real safety interlock (it cuts PYRO PWR); this
     // block only ever REPORTS its state and drives EEPROM/display/buzzer
     // side effects — it must never gate whether a pyro can fire. Debounced
@@ -318,9 +307,16 @@ void loop() {
                                  imu_data.gy*imu_data.gy +
                                  imu_data.gz*imu_data.gz);
 
-    // T8: accumulate accel calibration samples while on the pad (armed or not)
-    if (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) {
-        alt_calibrate_sample(&alt_est, accel_up_g);
+    // T8: accel calibration samples — only while the pad-rest timer is
+    // running (upright and still, armed or not). Each new still window
+    // starts from scratch, so time spent being carried or lying flat never
+    // reaches the average. Locked in at the latch, after fsm_update().
+    {
+        bool pad_still = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                         fsm.pad_rest_start_ms != 0;
+        if (pad_still && !pad_still_prev) alt_calibrate_reset(&alt_est);
+        if (pad_still) alt_calibrate_sample(&alt_est, accel_up_g);
+        pad_still_prev = pad_still;
     }
 
     float pressure_for_est = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
@@ -374,6 +370,27 @@ void loop() {
     // ── 4. FLIGHT STATE MACHINE ───────────────────────────────
     fsm_update(&fsm, accel_up_g, alt_est.velocity_ms,
                accel_mag_g, gyro_rate_dps, alt_est.altitude_m, imu_data.valid);
+
+    // Accel bias lock, on the pad-rest latch — independent of the arming
+    // switch; the vehicle just has to have sat still long enough. Runs
+    // right after fsm_update() so the FSM's baseline snapshot from this
+    // same tick can be moved onto the re-synced altitude.
+    {
+        bool pad_rest_now = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                             fsm.pad_rest_satisfied;
+        if (pad_rest_now && !pad_rest_prev) {
+            if (alt_calibrate_finish(&alt_est)) {   // T8: lock in accel bias before flight
+                fsm_set_pad_rest_baseline(&fsm, alt_est.altitude_m);
+                Serial.print("[INIT] Pad-rest latched — accel bias locked in: ");
+                Serial.print(alt_est.accel_bias_ms2, 3);
+                Serial.println(" m/s^2. Velocity zeroed, altitude re-synced to baro.");
+            } else {
+                Serial.println("[INIT] Pad-rest latched — accel calibration rejected "
+                               "(not upright/still); bias will be learned from the baro.");
+            }
+        }
+        pad_rest_prev = pad_rest_now;
+    }
 
     if (fsm_state_changed(&fsm)) {
         mahrs_set_phase(fsm.state);
