@@ -6,6 +6,10 @@ A desktop GUI for hardware bring-up. Reads the $HLTH frames emitted by
 health_emit_frame() and drives the serial command menus in bench_test.cpp
 and main_control_loop.cpp.
 
+The Telemetry tab (telemetry_panel.py) shows live attitude and flight
+data from the $TLM frames in include/telemetry.h. It starts the stream
+itself when the tab is open, so flash `pio run -e flight` and connect.
+
     python src/bench_gui.py                 # pick a port in the UI
     python src/bench_gui.py -p COM3
     python src/bench_gui.py --demo          # synthesised data, no hardware
@@ -29,6 +33,8 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog
+
+from telemetry_panel import TelemetryPanel, DemoFlight, parse_tlm
 
 # ----------------------------------------------------------------------
 # Frame format — must mirror include/health.h
@@ -80,6 +86,15 @@ LAMP_WHITE = "#d8dee6"   # advisory
 LAMP_GREY  = "#4a5563"   # inop
 
 STATE_LAMP = {0: LAMP_GREY, 1: LAMP_GREEN, 2: LAMP_AMBER, 3: LAMP_RED, 4: LAMP_WHITE}
+
+# Body-axis colours for telemetry traces (see telemetry_panel.py) — kept
+# clear of the lamp hues so a data trace never reads as a lamp state.
+AXIS_Y = "#6ba3d6"
+AXIS_Z = "#c48fd3"
+
+THEME = dict(BEZEL=BEZEL, PANEL=PANEL, WELL=WELL, RULE=RULE, TEXT=TEXT, TEXT_DIM=TEXT_DIM,
+             LAMP_GREEN=LAMP_GREEN, LAMP_AMBER=LAMP_AMBER, LAMP_RED=LAMP_RED,
+             LAMP_WHITE=LAMP_WHITE, LAMP_GREY=LAMP_GREY, AXIS_Y=AXIS_Y, AXIS_Z=AXIS_Z)
 
 
 def mix(a, b, t):
@@ -290,6 +305,7 @@ class DemoLink:
         self._stop = threading.Event()
         self.ser = True
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._run_tlm, daemon=True).start()
         self.q.put(("info", "Demo mode — data is synthesised, no hardware attached."))
 
     connected = True
@@ -332,6 +348,16 @@ class DemoLink:
                 ck ^= ord(c)
             self.q.put(("line", f"${body}*{ck:02X}"))
             time.sleep(0.5)
+
+    def _run_tlm(self):
+        sim = DemoFlight()
+        t0 = time.time()
+        while not self._stop.is_set():
+            self.q.put(("line", sim.line(time.time() - t0)))
+            change = sim.transition()
+            if change:
+                self.q.put(("line", f"[FSM] STATE TRANSITION: {change[0]} \u2192 {change[1]}"))
+            time.sleep(1 / 42)
 
 
 # ----------------------------------------------------------------------
@@ -427,6 +453,7 @@ class BenchPanel:
     FLIGHT_CMDS = [
         ("H  Status page", "H"), ("G  Calibrate gyro", "G"), ("X  Abort", "X"),
         ("R  Finalize log", "R"), ("U  USB dump", "U"),
+        ("T  Telemetry on", "T"), ("t  Telemetry off", "t"),
     ]
 
     def __init__(self, root, args):
@@ -440,10 +467,15 @@ class BenchPanel:
         self.rejected = 0
         self.lamp_test_until = 0.0
 
+        # Telemetry stream control — see _ensure_stream()
+        self.tlm_seen = False          # any $TLM this connection
+        self.stream_tries = 0
+        self.stream_last_try = 0.0
+
         root.title("TVC Flight Computer — Bench Panel")
         root.configure(bg=BEZEL)
-        root.geometry("1150x750")
-        root.minsize(940, 700)
+        root.geometry("1320x880")
+        root.minsize(1180, 800)
 
         mono_name = pick_font(
             ["JetBrains Mono", "Cascadia Mono", "SF Mono", "Menlo", "Consolas",
@@ -464,8 +496,8 @@ class BenchPanel:
         }
 
         self._build_header()
+        self._build_commands()     # packed to the bottom first, so it never gets clipped
         self._build_body()
-        self._build_commands()
 
         if not args.demo:
             want = args.port or SerialLink.guess_port()
@@ -508,12 +540,18 @@ class BenchPanel:
             self.conn_btn.state(["disabled"])
 
     def _build_body(self):
-        body = tk.Frame(self.root, bg=BEZEL)
-        body.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        self.tabs = ttk.Notebook(self.root, style="Bench.TNotebook")
+        self.tabs.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        body = tk.Frame(self.tabs, bg=BEZEL)
+        self.tabs.add(body, text="Health")
+        self.tlm = TelemetryPanel(self.tabs, self.fonts, THEME)
+        self.tabs.add(self.tlm, text="Telemetry")
+        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab)
 
         # ---------------- left: annunciator stack ----------------
         left = tk.Frame(body, bg=BEZEL)
-        left.pack(side="left", fill="y")
+        left.pack(side="left", fill="y", pady=(10, 0))
 
         # Master annunciator — the one lamp that matters before you commit.
         self._eyebrow(left, "flight-critical")
@@ -540,7 +578,7 @@ class BenchPanel:
 
         # ---------------- right: serial console ----------------
         right = tk.Frame(body, bg=BEZEL)
-        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=(10, 0))
 
         head = tk.Frame(right, bg=BEZEL)
         head.pack(fill="x")
@@ -580,7 +618,7 @@ class BenchPanel:
 
     def _build_commands(self):
         foot = tk.Frame(self.root, bg=BEZEL)
-        foot.pack(fill="x", padx=14, pady=(0, 12))
+        foot.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
 
         bench = tk.LabelFrame(foot, text=" pio run -e bench ", bg=BEZEL, fg=TEXT_DIM,
                               font=self.fonts["small"], bd=1,
@@ -629,6 +667,7 @@ class BenchPanel:
 
     def toggle_connection(self):
         if self.link.connected:
+            self._stop_stream()
             self.link.disconnect()
             self.conn_btn.configure(text="Connect")
         else:
@@ -639,6 +678,9 @@ class BenchPanel:
                 return
             if self.link.connect(port, 115200):
                 self.conn_btn.configure(text="Disconnect")
+                self.tlm_seen = False
+                self.stream_tries = 0
+                self.stream_last_try = time.time()   # let the board finish booting first
 
     def _lamp_test(self):
         """Illuminate every lamp so a dead indicator can't hide a live fault."""
@@ -676,6 +718,39 @@ class BenchPanel:
             self.console.see("end")
 
     # ------------------------------------------------------------------
+    # Telemetry stream
+    # ------------------------------------------------------------------
+
+    def _on_tab(self, _evt=None):
+        self.stream_tries = 0          # a fresh look at the tab earns fresh retries
+        self._ensure_stream()
+
+    def _telemetry_tab_open(self):
+        return self.tabs.select() == str(self.tlm)
+
+    def _ensure_stream(self):
+        """Send 'T' while the Telemetry tab is open and no frames are arriving.
+
+        Capped at a few tries per connection or tab visit: the bench
+        firmware doesn't know 'T' and answers by reprinting its menu, so
+        retrying forever would bury the console.
+        """
+        if self.demo or not self.link.connected or not self._telemetry_tab_open():
+            return
+        if self.tlm.receiving(1.5) or self.stream_tries >= 3:
+            return
+        if time.time() - self.stream_last_try < 2.0:
+            return
+        self.stream_tries += 1
+        self.stream_last_try = time.time()
+        self.link.send("T")
+
+    def _stop_stream(self):
+        # Only if this firmware actually streamed — 't' is just noise to the bench build.
+        if self.tlm_seen and self.link.connected and not self.demo:
+            self.link.send("t")
+
+    # ------------------------------------------------------------------
     # Event pump
     # ------------------------------------------------------------------
 
@@ -691,6 +766,7 @@ class BenchPanel:
                     self._log(payload, "meta")
                 elif kind == "error":
                     self._log(payload, "fail")
+                    self.tlm.event(payload, "fail")
                 elif kind == "dropped":
                     self.conn_btn.configure(text="Connect")
                     self.link.ser = None
@@ -702,10 +778,21 @@ class BenchPanel:
             for row in self.rows.values():
                 row.force(None)
 
+        self._ensure_stream()
         self._redraw()
         self.root.after(60, self._pump)
 
     def _on_line(self, line):
+        if line.startswith("$TLM"):
+            fr = parse_tlm(line)
+            if fr:
+                self.tlm_seen = True
+                self.stream_tries = 0
+                self.tlm.push(fr)
+            else:
+                self.tlm.note_rejected()
+            return
+
         if line.startswith("$"):
             fr = parse_frame(line)
             if fr:
@@ -725,6 +812,8 @@ class BenchPanel:
         elif "[WARN]" in line:
             tag = "warn"
         self._log(line, tag)
+        if line.strip():
+            self.tlm.event(line, tag)
 
     def _apply(self, fr):
         seen = set()
@@ -823,7 +912,9 @@ class BenchPanel:
                       font=self.fonts["small"])
 
     def _on_close(self):
+        self.tlm.shutdown()
         try:
+            self._stop_stream()
             self.link.disconnect()
         except Exception:
             pass
@@ -866,6 +957,15 @@ def main():
                   selectforeground=[("readonly", TEXT)])
         style.configure("TScrollbar", background=PANEL, troughcolor=WELL,
                         borderwidth=0, arrowcolor=TEXT_DIM)
+        style.configure("Bench.TNotebook", background=BEZEL, borderwidth=1,
+                        tabmargins=(0, 0, 0, 0), bordercolor=RULE,
+                        lightcolor=BEZEL, darkcolor=BEZEL)
+        style.configure("Bench.TNotebook.Tab", background=BEZEL, foreground=TEXT_DIM,
+                        borderwidth=0, padding=(14, 5), lightcolor=BEZEL, bordercolor=BEZEL)
+        style.map("Bench.TNotebook.Tab",
+                  background=[("selected", PANEL), ("active", mix(BEZEL, PANEL, 0.5))],
+                  foreground=[("selected", TEXT)],
+                  lightcolor=[("selected", PANEL)])
     except tk.TclError:
         pass
 

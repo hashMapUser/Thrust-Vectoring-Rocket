@@ -166,11 +166,13 @@ void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias) {
     out->valid = (_bad_streak < LSM6DSOX_FAULT_STREAK);
 }
 
-bool lsm6dsox_calibrate_gyro(GyroBias *bias) {
+bool lsm6dsox_calibrate_gyro(GyroBias *bias, void (*keepalive)()) {
     Serial.println("  Calibrating gyro — keep still...");
     float sx = 0, sy = 0, sz = 0;
 
     for (int i = 0; i < GYRO_CALIB_SAMPLES; i++) {
+        if (keepalive) keepalive();
+
         LSM6DSOX_Data d;
         lsm6dsox_read(&d, nullptr);
         if (!d.valid) return false;

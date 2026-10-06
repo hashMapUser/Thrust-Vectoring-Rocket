@@ -150,10 +150,13 @@ bool lsm6dsox_init();
  * (any sample exceeds GYRO_MOTION_THRESHOLD deg/s).
  * Prints progress to Serial so you can watch it run.
  *
- * @param bias   Output — populated with x/y/z offsets [deg/s].
+ * @param bias       Output — populated with x/y/z offsets [deg/s].
+ * @param keepalive  Optional; called once per sample. The flight firmware
+ *                   passes a watchdog feed here, since calibration blocks
+ *                   for 4+ s and the watchdog times out at 500 ms.
  * @return true on success; false if motion detected or read failure.
  */
-bool lsm6dsox_calibrate_gyro(GyroBias *bias);
+bool lsm6dsox_calibrate_gyro(GyroBias *bias, void (*keepalive)() = nullptr);
 
 /**
  * Save gyro bias to EEPROM so it survives reboot.
