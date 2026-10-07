@@ -122,6 +122,11 @@ typedef struct {
 
     // Fault flags
     bool     imu_fault;
+
+    // Set by fsm_resume() after a mid-flight watchdog reset. The velocity
+    // estimate restarts from zero, so velocity-based apogee is disabled —
+    // the baro-drop and launch-timeout backstops still run.
+    bool     resumed;
 } FlightSM;
 
 // --------------------------------------------------------
@@ -167,6 +172,22 @@ void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m);
  * No-op once the armed ground reference is locked (fsm_set_launch_baseline()).
  */
 void fsm_set_pad_rest_baseline(FlightSM *fsm, float altitude_m);
+
+/**
+ * Pick a flight back up after a mid-flight watchdog reset (see
+ * flight_resume.h). Call right after fsm_init(). POWERED/COAST resume as
+ * COAST with TVC off — the attitude filter just restarted and can't be
+ * trusted to steer. APOGEE/DESCENT/MAIN resume as MAIN, which retries the
+ * main charge until it has fired (the fired flag survives in EEPROM).
+ * The state change is reported by fsm_state_changed() like any other.
+ *
+ * @param saved            State at the last save before the reset.
+ * @param ms_since_launch  Time since liftoff confirmation at that save.
+ * @param peak_altitude_m  Peak altitude seen before the reset.
+ * @param flight_proven    Peak velocity had passed MIN_FLIGHT_VELOCITY_MS.
+ */
+void fsm_resume(FlightSM *fsm, FlightState saved, uint32_t ms_since_launch,
+                float peak_altitude_m, bool flight_proven);
 
 /** Emergency abort — safes all outputs, sets STATE_ABORT. Pad-side faults only. */
 void fsm_abort(FlightSM *fsm);

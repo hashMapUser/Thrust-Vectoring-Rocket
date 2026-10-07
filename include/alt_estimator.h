@@ -136,6 +136,18 @@ typedef struct {
 void alt_init(AltEstimator *est, float ground_hpa);
 
 /**
+ * Re-initialise mid-flight after a watchdog reset: same ground reference
+ * as before the reset, but altitude starts at the current baro altitude
+ * instead of zero. Velocity restarts at zero and the accel bias is
+ * re-learned from the baro.
+ *
+ * @param est           Estimator state.
+ * @param ground_hpa    Ground pressure saved before the reset [hPa].
+ * @param pressure_hpa  Current pressure [hPa]; NaN to start at zero.
+ */
+void alt_resume(AltEstimator *est, float ground_hpa, float pressure_hpa);
+
+/**
  * Re-reference to a new ground pressure. Altitude and velocity are zeroed —
  * the vehicle must be stationary on the pad at this pressure. The accel
  * bias and its calibration are kept.

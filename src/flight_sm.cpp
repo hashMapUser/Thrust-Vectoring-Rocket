@@ -83,7 +83,8 @@ void fsm_init(FlightSM *fsm) {
     fsm->pad_rest_baseline_alt_m = 0.0f;
     fsm->baseline_from_arm       = false;
     fsm->imu_fault               = false;
-    
+    fsm->resumed                 = false;
+
     Serial.println("[FSM] Initialized. Awaiting pad rest.");
 }
 
@@ -106,6 +107,28 @@ void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m) {
 
 void fsm_set_pad_rest_baseline(FlightSM *fsm, float altitude_m) {
     if (!fsm->baseline_from_arm) fsm->pad_rest_baseline_alt_m = altitude_m;
+}
+
+void fsm_resume(FlightSM *fsm, FlightState saved, uint32_t ms_since_launch,
+                float peak_altitude_m, bool flight_proven) {
+    uint32_t now = millis();
+
+    fsm->resumed          = true;
+    fsm->tvc_enabled      = false;
+    fsm->powered_entry_ms = now - ms_since_launch;   // keeps the G7 timeout on the original clock
+    fsm->peak_altitude_m  = peak_altitude_m;
+    // Only the G3 gate reads this — carry over whether it had been passed.
+    fsm->peak_velocity_ms = flight_proven ? MIN_FLIGHT_VELOCITY_MS + 1.0f : 0.0f;
+
+    Serial.print("[FSM] WATCHDOG RESET IN FLIGHT — resuming from ");
+    Serial.print(STATE_NAMES[saved]);
+    Serial.print(", ");
+    Serial.print(ms_since_launch);
+    Serial.println(" ms after launch.");
+
+    FlightState target = (saved == STATE_POWERED || saved == STATE_COAST) ? STATE_COAST : STATE_MAIN;
+    enter_state(fsm, target);
+    fsm->prev_state = STATE_IDLE;   // let fsm_state_changed() report the entry
 }
 
 void fsm_abort(FlightSM *fsm) {
@@ -237,7 +260,7 @@ void fsm_update(FlightSM *fsm,
                 bool gate = (fsm->peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS) &&
                             (fsm_time_in_state(fsm) >= COAST_APOGEE_MIN_MS);
 
-                bool vel_apogee  = gate && (velocity_ms <= 0.0f);   // level, not edge-triggered
+                bool vel_apogee  = gate && !fsm->resumed && (velocity_ms <= 0.0f);   // level, not edge-triggered
                 bool baro_apogee = gate && ((fsm->peak_altitude_m - altitude_m) >= APOGEE_BARO_DROP_M);
                 bool timeout     = (since_launch >= APOGEE_TIMEOUT_FROM_LAUNCH_MS);   // no extra gates
 

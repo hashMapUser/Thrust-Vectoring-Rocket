@@ -160,7 +160,7 @@ void setup() {
 
     {
         WDT_timings_t wdt_cfg;
-        wdt_cfg.timeout = 0.5f;   // 500 ms
+        wdt_cfg.timeout = 500;   // ms — WDT3 (RTWDOG) takes milliseconds, not seconds
         wdt.begin(wdt_cfg);
     }
 

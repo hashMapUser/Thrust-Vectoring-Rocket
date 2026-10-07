@@ -18,6 +18,7 @@
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 #include "logger.h"
 #include "telemetry.h"
+#include "flight_resume.h"
 
 // Forward declarations for mahrs_integration.cpp
 struct RocketAttitude { float tip_a; float tip_b; float spin; };
@@ -102,9 +103,26 @@ static uint32_t baro_last_ms  = 0;
 static float    baro_last_hpa = NAN;
 static float    baro_last_c   = NAN;
 
+// --- WATCHDOG RECOVERY ---
+// Last time the flight record was refreshed — see flight_resume.h.
+static uint32_t resume_saved_ms = 0;
+
 void setup() {
+    // A watchdog reset in the air must get back to the control loop fast,
+    // so the slow boot steps (USB wait, SD init, 1.3 s baro average) are
+    // skipped when there's a flight to resume.
+    bool         wdt_boot = resume_boot_was_watchdog();
+    ResumeRecord resume;
+    bool         resuming = wdt_boot && resume_load(&resume);
+
     Serial.begin(115200);
-    while (!Serial && millis() < 3000) {}
+    if (!wdt_boot) {
+        while (!Serial && millis() < 3000) {}
+    }
+    if (wdt_boot) {
+        Serial.println(resuming ? "[WDT] Watchdog reset mid-flight — fast boot, resuming flight."
+                                : "[WDT] Watchdog reset on the ground — normal boot.");
+    }
 
     // 1. ANALOG + PIN SETUP
     analogReadResolution(12);   // 12-bit ADC for ARM_SENSE, PYRO1_SENSE
@@ -164,7 +182,9 @@ void setup() {
 
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
-        while (true) {
+        // In the air, carry on without it: the FSM flags the IMU fault,
+        // drops TVC and still runs the baro/timeout recovery path.
+        if (!resuming) while (true) {
             digitalWriteFast(PIN_LED_RED, ((millis() / 100) & 1) ? HIGH : LOW);
             delay(10);
         }
@@ -173,8 +193,10 @@ void setup() {
 
     servo_init();
 
-    // 4. LOGGER
-    logger_init();
+    // 4. LOGGER — skipped on a resume: SD init can block for seconds on a
+    // bad card. Logging still goes to RAM, and logger_finalize() falls
+    // back to a USB dump.
+    if (!resuming) logger_init();
 
     // 5. ALTITUDE ESTIMATOR INIT
     // Boot ground reference, averaged over ALT_GROUND_SAMPLES fresh baro
@@ -183,7 +205,19 @@ void setup() {
     // baseline is re-captured on the SW401 arming edge in loop(). If baro
     // is absent, init with sea-level; in-flight bias refinement will still
     // work but altitude will be inaccurate.
-    {
+    if (resuming) {
+        // Same ground reference as before the reset; altitude starts at
+        // the current baro reading so the apogee baro-drop check compares
+        // against a real altitude, not zero.
+        float samples_hpa[8];
+        float now_hpa = NAN;
+        if (!lps22hb_read_samples(8, samples_hpa) ||
+            !alt_ground_mean(samples_hpa, 8, &now_hpa, nullptr, nullptr)) {
+            now_hpa = NAN;
+            Serial.println("[WARN] Baro read failed on resume — altitude starts at 0");
+        }
+        alt_resume(&alt_est, resume.ground_hpa, now_hpa);
+    } else {
         float samples_hpa[ALT_GROUND_SAMPLES];
         float ground_hpa;
         if (!lps22hb_read_samples(ALT_GROUND_SAMPLES, samples_hpa) ||
@@ -197,17 +231,26 @@ void setup() {
     // 6. FILTER & FSM INIT
     mahrs_init();
     fsm_init(&fsm);
+    if (resuming) {
+        // If the baro seed failed, altitude starts at 0 — don't compare it
+        // against the old peak, or the baro-drop check fires immediately.
+        float peak = isnan(alt_est.baro_altitude_m) || alt_est.altitude_m == 0.0f
+                         ? 0.0f : fmaxf(resume.peak_altitude_m, alt_est.altitude_m);
+        fsm_resume(&fsm, resume.state, resume.ms_since_launch, peak, resume.flight_proven);
+    }
     pid_init(&pid_pitch);
     pid_init(&pid_yaw);
 
     // 7. WATCHDOG — 500 ms timeout; fed every loop iteration.
     // On watchdog reset, setup() runs again: pyro pins go LOW first via
-    // pyro_init(), servos centre via servo_init(), FSM starts in IDLE.
+    // pyro_init(), servos centre via servo_init(), and the FSM resumes the
+    // flight if one was in progress (see flight_resume.h).
     {
         WDT_timings_t wdt_cfg;
-        wdt_cfg.timeout = 0.5f;   // 500 ms
+        wdt_cfg.timeout = 500;   // ms — WDT3 (RTWDOG) takes milliseconds, not seconds
         wdt.begin(wdt_cfg);
     }
+    logger_set_keepalive([] { wdt.feed(); });
 
     Serial.println("FLIGHT COMPUTER READY. PYRO ARMED. WAITING FOR LAUNCH.");
 }
@@ -416,7 +459,21 @@ void loop() {
         pad_rest_prev = pad_rest_now;
     }
 
-    if (fsm_state_changed(&fsm)) {
+    bool state_changed = fsm_state_changed(&fsm);
+
+    // Refresh the flight record so a watchdog reset can pick up from here.
+    if (state_changed || now_ms - resume_saved_ms >= RESUME_SAVE_INTERVAL_MS) {
+        resume_saved_ms = now_ms;
+        ResumeRecord r;
+        r.state           = fsm.state;
+        r.flight_proven   = fsm.peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS;
+        r.ms_since_launch = fsm.powered_entry_ms ? now_ms - fsm.powered_entry_ms : 0;
+        r.ground_hpa      = alt_est.ground_pressure;
+        r.peak_altitude_m = fsm.peak_altitude_m;
+        resume_save(&r);
+    }
+
+    if (state_changed) {
         mahrs_set_phase(fsm.state);
         logger_checkpoint(fsm.state, alt_est.altitude_m);
 

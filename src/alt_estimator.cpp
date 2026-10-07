@@ -38,6 +38,14 @@ void alt_init(AltEstimator *est, float ground_hpa) {
 }
 
 
+void alt_resume(AltEstimator *est, float ground_hpa, float pressure_hpa) {
+    alt_init(est, ground_hpa);
+    if (isnan(pressure_hpa)) return;
+    est->baro_altitude_m = pressure_to_altitude(pressure_hpa) - est->ground_altitude_m;
+    est->altitude_m      = est->baro_altitude_m;
+}
+
+
 void alt_set_ground(AltEstimator *est, float ground_hpa) {
     est->ground_pressure   = ground_hpa;
     est->ground_altitude_m = pressure_to_altitude(ground_hpa);

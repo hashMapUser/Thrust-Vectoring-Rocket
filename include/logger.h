@@ -73,6 +73,13 @@ typedef struct __attribute__((packed)) {
 bool logger_init();
 
 /**
+ * Register a function called once per CSV row during logger_finalize()
+ * and logger_usb_dump(). Writing the whole buffer takes far longer than
+ * the watchdog timeout, so the flight loop passes its wdt.feed() here.
+ */
+void logger_set_keepalive(void (*keepalive)());
+
+/**
  * Store one record in the RAM ring buffer. Never touches the SD card,
  * never blocks. Call every loop iteration.
  */

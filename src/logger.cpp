@@ -52,6 +52,7 @@ static bool _sd_ready  = false;
 static bool _finalized = false;
 static char _csv_name[20];
 static char _log_name[20];
+static void (*_keepalive)() = nullptr;
 
 // ============================================================
 //  Pick the next free FLIGHT_XXX.CSV / .LOG slot
@@ -105,6 +106,7 @@ static void dump_csv_over_serial() {
     for (uint16_t i = 0; i < _count; i++) {
         uint16_t idx = (start + i) % LOG_RAM_CAPACITY;
         write_csv_row(Serial, _buf[idx]);
+        if (_keepalive) _keepalive();
     }
     Serial.println("-----END FLIGHT CSV-----");
 }
@@ -112,6 +114,10 @@ static void dump_csv_over_serial() {
 // ============================================================
 //  Public API
 // ============================================================
+
+void logger_set_keepalive(void (*keepalive)()) {
+    _keepalive = keepalive;
+}
 
 bool logger_init() {
     _head            = 0;
@@ -202,6 +208,7 @@ void logger_finalize() {
     for (uint16_t i = 0; i < _count; i++) {
         uint16_t idx = (start + i) % LOG_RAM_CAPACITY;
         write_csv_row(f, _buf[idx]);
+        if (_keepalive) _keepalive();
     }
 
     f.sync();
