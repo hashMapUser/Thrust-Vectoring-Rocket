@@ -30,6 +30,7 @@ void mahrs_set_phase(FlightState phase);
 void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag);
 void mahrs_get_attitude(RocketAttitude *out);
 void mahrs_get_quaternion(float *q0, float *q1, float *q2, float *q3);
+float mahrs_vertical_accel_g(const LSM6DSOX_Data *imu);
 
 // --- WATCHDOG ---
 static WDT_T4<WDT3> wdt;
@@ -489,6 +490,8 @@ void loop() {
     mag_to_body(&mag_body);
 
     // ── 3. STATE ESTIMATION ───────────────────────────────────
+    // Along the airframe — what the FSM's launch / burnout / upright checks
+    // want, since thrust acts along it.
     float accel_up_g = -imu_data.ax;   // body +X toward tail; negate for "up"
 
     float accel_mag_g   = sqrtf(imu_data.ax*imu_data.ax +
@@ -498,6 +501,15 @@ void loop() {
                                  imu_data.gy*imu_data.gy +
                                  imu_data.gz*imu_data.gz);
 
+    mahrs_tick(&imu_data, &mag_body);
+
+    // True vertical, from the attitude — what the altitude estimator wants.
+    // Unlike accel_up_g it reads 1 g at rest whichever way the vehicle is
+    // lying, so booting, laying it down or standing it up on the bench
+    // doesn't kick the altitude (lying flat at boot used to dip it ~2.6 m
+    // for ~10 s), and it takes only the vertical share of thrust in a tilt.
+    float accel_vert_g = mahrs_vertical_accel_g(&imu_data);
+
     // T8: accel calibration samples — only while the pad-rest timer is
     // running (upright and still, armed or not). Each new still window
     // starts from scratch, so time spent being carried or lying flat never
@@ -506,7 +518,7 @@ void loop() {
         bool pad_still = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
                          fsm.pad_rest_start_ms != 0;
         if (pad_still && !pad_still_prev) alt_calibrate_reset(&alt_est);
-        if (pad_still) alt_calibrate_sample(&alt_est, accel_up_g);
+        if (pad_still) alt_calibrate_sample(&alt_est, accel_vert_g);   // same signal alt_update() integrates
         pad_still_prev = pad_still;
     }
 
@@ -548,9 +560,7 @@ void loop() {
     }
 
     // T8: update altitude estimator every tick (NaN pressure = accel-only update)
-    alt_update(&alt_est, pressure_for_est, accel_up_g, dt);
-
-    mahrs_tick(&imu_data, &mag_body);
+    alt_update(&alt_est, pressure_for_est, accel_vert_g, dt);
 
     RocketAttitude attitude;
     mahrs_get_attitude(&attitude);

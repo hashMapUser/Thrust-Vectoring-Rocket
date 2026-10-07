@@ -190,6 +190,23 @@ void mahrs_get_attitude(RocketAttitude *out) {
     out->spin  = e.yaw;
 }
 
+// Upward specific force [g] in the earth frame: the body-frame accel turned
+// by the current attitude — 1 g at rest whichever way the vehicle is lying.
+// Call after mahrs_tick() so the attitude is this tick's.
+float mahrs_vertical_accel_g(const LSM6DSOX_Data *imu) {
+    // Same remap as the gyro; no negation — this stays specific force.
+    float fx =  imu->az;
+    float fy = -imu->ay;
+    float fz =  imu->ax;
+
+    // "Down" row of R(q) (filter sensor frame -> NED), negated for up.
+    float q0 = mahrs.q0, q1 = mahrs.q1, q2 = mahrs.q2, q3 = mahrs.q3;
+    float down = 2.0f*(q1*q3 - q0*q2) * fx
+               + 2.0f*(q2*q3 + q0*q1) * fy
+               + (1.0f - 2.0f*(q1*q1 + q2*q2)) * fz;
+    return -down;
+}
+
 // Convenience: get the raw filter quaternion for TVC math.
 // Note this is in the FILTER frame, not the body frame.
 // For TVC you'll want to apply the inverse remap when interpreting it.
