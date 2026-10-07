@@ -7,6 +7,7 @@
 #include "lsm6dsox.h"
 #include "lps22hb.h"
 #include "mag.h"
+#include "mag_calib.h"
 #include "alt_estimator.h"
 #include "flight_sm.h"
 #include "pid.h"
@@ -23,6 +24,8 @@ extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 // Forward declarations for mahrs_integration.cpp
 struct RocketAttitude { float tip_a; float tip_b; float spin; };
 void mahrs_init();
+void mahrs_seed_from_accel(float ax, float ay, float az);
+bool mahrs_align_heading(float mx, float my, float mz);
 void mahrs_set_phase(FlightState phase);
 void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag);
 void mahrs_get_attitude(RocketAttitude *out);
@@ -93,6 +96,12 @@ static inline void heartbeat_update(uint32_t now_ms) {
     digitalWriteFast(PIN_LED_WHITE, ((now_ms / HEARTBEAT_HALF_PERIOD_MS) & 1) ? HIGH : LOW);
 }
 
+// Accel samples averaged to seed the attitude filter at boot (~50 ms).
+#define ATTITUDE_SEED_SAMPLES 25
+
+// Magnetometer samples averaged to set the boot heading (~8 ms each).
+#define HEADING_SEED_SAMPLES  8
+
 // Rising-edge tracker for fsm.tvc_enabled — see section 5 in loop().
 static bool tvc_enabled_prev = false;
 
@@ -104,6 +113,52 @@ static uint8_t  tlm_tick      = 0;
 static uint32_t baro_last_ms  = 0;
 static float    baro_last_hpa = NAN;
 static float    baro_last_c   = NAN;
+
+// --- MAGNETOMETER ---
+// Feeds the attitude filter's heading, telemetry and the log — see
+// section 2 in loop().
+// mag_last holds the last calibrated sample; older than MAG_STALE_MS
+// and it's reported as NaN / mag_valid false.
+#define MAG_STALE_MS 100
+static bool     mag_ok      = false;
+static MagCalib mag_cal;
+static mag_data mag_last;
+static uint32_t mag_last_ms = 0;
+
+// --- GYRO BIAS TRACKING ---
+// The bias saved by 'G' drifts with temperature, and with no magnetometer
+// in the filter, whatever is left on the long axis integrates straight into
+// spin (~0.4 deg/s measured). While the vehicle sits still on the pad, ease
+// the bias toward the leftover gyro reading so it stays zeroed. Only on the
+// pad (IDLE/ARMED, launch detection not started) and only after
+// GYRO_TRACK_STILL_MS of stillness, so handling and flight never leak in.
+// RAM only — the EEPROM calibration from 'G' is left alone.
+#define GYRO_TRACK_RATE_DPS   1.0f    // leftover rate magnitude below this = still
+#define GYRO_TRACK_ACCEL_TOL  0.05f   // | |accel| - 1 g | below this = not being handled
+#define GYRO_TRACK_STILL_MS   2000
+#define GYRO_TRACK_TAU_S      5.0f    // averaging time constant
+
+static uint32_t gyro_still_since = 0;
+
+// `d` is a bias-corrected sample in IMU axes — the frame gyro_bias is in —
+// so call this before lsm6dsox_to_body().
+static void track_gyro_bias(const LSM6DSOX_Data *d, uint32_t now_ms, float dt) {
+    bool on_pad = (fsm.state == STATE_IDLE || fsm.state == STATE_ARMED) &&
+                  fsm.launch_detect_ms == 0;
+    float rate  = sqrtf(d->gx*d->gx + d->gy*d->gy + d->gz*d->gz);
+    float accel = sqrtf(d->ax*d->ax + d->ay*d->ay + d->az*d->az);
+    bool  still = on_pad && d->valid && rate < GYRO_TRACK_RATE_DPS &&
+                  fabsf(accel - 1.0f) < GYRO_TRACK_ACCEL_TOL;
+
+    if (!still)                { gyro_still_since = 0;      return; }
+    if (gyro_still_since == 0) { gyro_still_since = now_ms; return; }
+    if (now_ms - gyro_still_since < GYRO_TRACK_STILL_MS)    return;
+
+    float k = dt / GYRO_TRACK_TAU_S;   // EMA: bias += k * (raw - bias), and d is raw - bias
+    gyro_bias.x += k * d->gx;
+    gyro_bias.y += k * d->gy;
+    gyro_bias.z += k * d->gz;
+}
 
 // --- WATCHDOG RECOVERY ---
 // Last time the flight record was refreshed — see flight_resume.h.
@@ -128,7 +183,11 @@ void setup() {
 
     // 1. ANALOG + PIN SETUP
     analogReadResolution(12);   // 12-bit ADC for ARM_SENSE, PYRO1_SENSE
-    pinMode(PIN_ARM_SENSE, INPUT);
+    // Pull-down so an unconnected ARM_SENSE reads 0 V (safe). Left as plain
+    // INPUT it floats up past ARM_SENSE_ARMED_V and reads as SW401 closed —
+    // bench test 'A' shows it. With the divider fitted, the ~100k sits in
+    // parallel with the 4.7K and pack voltage reads ~3% low.
+    pinMode(PIN_ARM_SENSE, INPUT_PULLDOWN);
     pinMode(PIN_PYRO1_SENSE, INPUT);   // main-chute continuity sense; channel 2 unused this flight
 
     // IMU CS must be HIGH before SPI.begin() (keeps CS deasserted during bus init)
@@ -182,6 +241,15 @@ void setup() {
         Serial.println("[WARN] LPS22HB not found — baro disabled");
     }
 
+    // Uses the hard/soft-iron calibration saved by bench test 'M'; without
+    // one, mag_load_calib() leaves it as a pass-through.
+    mag_ok = mag_init();
+    if (mag_ok) {
+        mag_load_calib(&mag_cal);
+    } else {
+        Serial.println("[WARN] MMC5603NJ not found — magnetometer disabled");
+    }
+
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
         // In the air, carry on without it: the FSM flags the IMU fault,
@@ -231,7 +299,45 @@ void setup() {
     }
 
     // 6. FILTER & FSM INIT
+    // Seed the attitude from the averaged accelerometer so the filter
+    // starts at the real tilt, not at vertical. Skipped on a resume —
+    // mid-flight the accelerometer reads thrust and drag, not gravity —
+    // and if no valid sample arrives, which leaves it at vertical.
     mahrs_init();
+    if (!resuming) {
+        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+        int   n  = 0;
+        for (int i = 0; i < ATTITUDE_SEED_SAMPLES; i++) {
+            LSM6DSOX_Data s;
+            lsm6dsox_read(&s, &gyro_bias);
+            lsm6dsox_to_body(&s);
+            if (s.valid) { sx += s.ax; sy += s.ay; sz += s.az; n++; }
+            delay(2);   // > one 833 Hz ODR period, so each read is fresh
+        }
+        if (n > 0) mahrs_seed_from_accel(sx / n, sy / n, sz / n);
+
+        // Then turn it to face magnetic north. mag_read() blocks ~8 ms a
+        // sample — fine here, the watchdog isn't running yet.
+        if (mag_ok) {
+            float mx = 0.0f, my = 0.0f, mz = 0.0f;
+            int   mn = 0;
+            for (int i = 0; i < HEADING_SEED_SAMPLES; i++) {
+                mag_data m;
+                mag_read(&m);
+                if (m.valid) { mx += m.mag_x; my += m.mag_y; mz += m.mag_z; mn++; }
+            }
+            mag_data m = {};
+            if (mn > 0) {
+                mag_apply_calib(&mag_cal, mx / mn, my / mn, mz / mn, &m.mag_x, &m.mag_y, &m.mag_z);
+                mag_to_body(&m);
+            }
+            if (mn > 0 && mahrs_align_heading(m.mag_x, m.mag_y, m.mag_z)) {
+                Serial.println("[MAG] Heading set from the magnetometer (magnetic north).");
+            } else {
+                Serial.println("[WARN] No usable magnetometer heading at boot — heading starts at the power-up direction.");
+            }
+        }
+    }
     fsm_init(&fsm);
     if (resuming) {
         // If the baro seed failed, altitude starts at 0 — don't compare it
@@ -358,12 +464,29 @@ void loop() {
     // ── 2. SENSOR INGESTION ───────────────────────────────────
     LSM6DSOX_Data imu_data;
     lsm6dsox_read(&imu_data, &gyro_bias);
+    track_gyro_bias(&imu_data, now_ms, dt);   // IMU axes, like the bias itself
+    lsm6dsox_to_body(&imu_data);   // IMU axes -> body frame; everything below is body frame
 
     // Baro: gated by P_DA in lps22hb_read(); returns NaN when no new sample
     LPS22HB_Data baro_data;
     lps22hb_read(&baro_data);
 
-    mag_data no_mag = {};   // mag not fitted this flight
+    // Magnetometer: non-blocking, ~40 Hz. Holds the attitude filter's
+    // heading (see mahrs_tick()), and goes to telemetry and the log.
+    {
+        mag_data m;
+        if (mag_ok && mag_poll(&m)) {
+            mag_apply_calib(&mag_cal, m.mag_x, m.mag_y, m.mag_z,
+                            &mag_last.mag_x, &mag_last.mag_y, &mag_last.mag_z);
+            mag_last_ms = now_ms;
+        }
+    }
+    bool mag_fresh = mag_last_ms != 0 && now_ms - mag_last_ms < MAG_STALE_MS;
+
+    // Body-frame copy for the filter; telemetry and the log keep chip axes.
+    mag_data mag_body = mag_last;
+    mag_body.valid = mag_fresh;
+    mag_to_body(&mag_body);
 
     // ── 3. STATE ESTIMATION ───────────────────────────────────
     float accel_up_g = -imu_data.ax;   // body +X toward tail; negate for "up"
@@ -427,7 +550,7 @@ void loop() {
     // T8: update altitude estimator every tick (NaN pressure = accel-only update)
     alt_update(&alt_est, pressure_for_est, accel_up_g, dt);
 
-    mahrs_tick(&imu_data, &no_mag);
+    mahrs_tick(&imu_data, &mag_body);
 
     RocketAttitude attitude;
     mahrs_get_attitude(&attitude);
@@ -593,6 +716,9 @@ void loop() {
 
             t.gx = imu_data.gx; t.gy = imu_data.gy; t.gz = imu_data.gz;
             t.ax = imu_data.ax; t.ay = imu_data.ay; t.az = imu_data.az;
+            t.mx = mag_fresh ? mag_last.mag_x : NAN;
+            t.my = mag_fresh ? mag_last.mag_y : NAN;
+            t.mz = mag_fresh ? mag_last.mag_z : NAN;
 
             t.alt_m      = alt_est.altitude_m;
             t.vel_ms     = alt_est.velocity_ms;
@@ -633,7 +759,9 @@ void loop() {
     rec.gx = imu_data.gx; rec.gy = imu_data.gy; rec.gz = imu_data.gz;
     rec.ax = imu_data.ax; rec.ay = imu_data.ay; rec.az = imu_data.az;
 
-    rec.mx = 0.0f; rec.my = 0.0f; rec.mz = 0.0f;  // mag not fitted
+    rec.mx = mag_fresh ? mag_last.mag_x : NAN;   // magnetometer's own axes, calibrated
+    rec.my = mag_fresh ? mag_last.mag_y : NAN;
+    rec.mz = mag_fresh ? mag_last.mag_z : NAN;
 
     rec.temperature_c = baro_data.valid ? baro_data.temperature_c : NAN;
     rec.pressure_hpa  = baro_data.valid ? (baro_data.pressure_pa / 100.0f) : NAN;
@@ -648,7 +776,7 @@ void loop() {
     rec.flight_state = (uint8_t)fsm.state;
     rec.imu_valid    = imu_data.valid;
     rec.baro_valid   = baro_data.valid;   // T9: set correctly now that T7 is landed
-    rec.mag_valid    = false;
+    rec.mag_valid    = mag_fresh;
 
     logger_write(&rec);
 }

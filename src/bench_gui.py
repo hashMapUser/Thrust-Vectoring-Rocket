@@ -2,13 +2,15 @@
 """
 TVC flight computer — bench annunciator panel.
 
-A desktop GUI for hardware bring-up. Reads the $HLTH frames emitted by
-health_emit_frame() and drives the serial command menus in bench_test.cpp
-and main_control_loop.cpp.
+A desktop GUI for hardware bring-up. Drives the serial command menus in
+bench_test.cpp and main_control_loop.cpp.
 
-The Telemetry tab (telemetry_panel.py) shows live attitude and flight
-data from the $TLM frames in include/telemetry.h. It starts the stream
-itself when the tab is open, so flash `pio run -e flight` and connect.
+Both tabs run off the $TLM frames in include/telemetry.h, which only the
+flight firmware sends — flash `pio run -e flight` and connect; the panel
+starts the stream itself. The Health tab turns each frame's IMU / baro /
+magnetometer / arm-switch data into lamps; the Telemetry tab (telemetry_panel.py) shows
+live attitude and flight data. The bench firmware has no live stream —
+its tests print PASS/FAIL to the console via the buttons.
 
     python src/bench_gui.py                 # pick a port in the UI
     python src/bench_gui.py -p COM3
@@ -26,7 +28,6 @@ so a lit amber lamp means the same thing here as it would in a cockpit.
 
 import argparse
 import queue
-import random
 import sys
 import threading
 import time
@@ -34,37 +35,42 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog
 
-from telemetry_panel import TelemetryPanel, DemoFlight, parse_tlm
+from telemetry_panel import (TelemetryPanel, DemoFlight, parse_tlm, finite,
+                             F_IMU_VALID, F_BARO_OK)
 
 # ----------------------------------------------------------------------
-# Frame format — must mirror include/health.h
-#   $HLTH,<t_ms>,<fsm>,<arm_counts>,NAME=st:flags:consec:fails:age:dHz,...*XX
+# Health from telemetry — each $TLM frame carries the firmware's own
+# IMU-valid and baro-fresh bits plus the pack voltage read through
+# ARM_SENSE. The other channels aren't in the stream.
 # ----------------------------------------------------------------------
 
 STATE_NAMES = {0: "INOP", 1: "OK", 2: "CAUTION", 3: "FAIL", 4: "NO DATA"}
 
+FLAG_STALE      = 0x01   # was good, isn't now
+FLAG_NEVER_GOOD = 0x08   # no good sample since connecting
+
 # Short enough to sit in the annunciator's right-hand column without
 # colliding with the age readout. Ordered most-severe first.
 FLAG_BITS = [
-    (0x10, "INIT FAIL"),
-    (0x08, "NO SAMPLES"),
-    (0x02, "RANGE"),
-    (0x04, "UNSTABLE"),
-    (0x01, "STALE"),
-    (0x20, "RECOV"),
+    (FLAG_NEVER_GOOD, "NO SAMPLES"),
+    (FLAG_STALE,      "STALE"),
 ]
 MAX_FLAGS_SHOWN = 2
 
-# Why a channel is dark, when the firmware reports it as not fitted.
+# Channels shown dark, and why.
 INOP_REASON = {
-    "MAG":   "not fitted",
-    "FLASH": "GD25Q128 miswired",
-    "PYRO1": "no continuity telemetry",
-    "PYRO2": "no continuity telemetry",
+    "FLASH": "not in telemetry",
+    "SD":    "not in telemetry",
+    "PYRO1": "not in telemetry",
+    "PYRO2": "unused this flight",
     "BATT":  "no firmware use yet",
 }
 
-ARM_THRESHOLD_COUNTS = 1614   # reference marker only — no arm switch in firmware; ~1.3 V on ARM_SENSE indicates pyro pack present
+# ARM_SENSE_ARMED_V and ARM_SENSE_DIVIDER_RATIO in main_control_loop.cpp.
+ARM_THRESHOLD_COUNTS    = round(1.2 / 3.3 * 4095)
+ARM_SENSE_DIVIDER_RATIO = 0.3197
+
+HEALTH_STALE_S = 3.0     # no $TLM for this long = health unknown
 
 # ----------------------------------------------------------------------
 # Panel palette — cool instrument slate, not near-black, so the lit lamps
@@ -149,45 +155,57 @@ class Frame:
         self.channels = []
 
 
-def parse_frame(line):
-    """Return a Frame, or None if the line is not a valid health frame."""
-    line = line.strip()
-    if not line.startswith("$") or "*" not in line:
-        return None
+class TlmHealth:
+    """Turns each $TLM frame into a health Frame.
 
-    body, _, cks_txt = line[1:].rpartition("*")
-    ck = 0
-    for ch in body:
-        ck ^= ord(ch)
-    try:
-        if ck != int(cks_txt[:2], 16):
-            return None
-    except ValueError:
-        return None
+    A frame only says whether the IMU, baro and magnetometer are good right
+    now, so the age since each was last good and its count of bad frames
+    are kept here, across frames.
+    """
 
-    f = body.split(",")
-    if len(f) < 4 or f[0] != "HLTH":
-        return None
+    CHECKS = (
+        ("IMU",  lambda f: f.flags & F_IMU_VALID),
+        ("BARO", lambda f: f.flags & F_BARO_OK),
+        ("MAG",  lambda f: finite(f.mx)),        # NaN = no fresh sample
+    )
 
-    fr = Frame()
-    try:
-        fr.t_ms = int(f[1])
-        fr.fsm = f[2]
-        fr.arm_counts = int(f[3])
-    except ValueError:
-        return None
+    def __init__(self):
+        self.reset()
 
-    for tok in f[4:]:
-        name, _, rest = tok.partition("=")
-        parts = rest.split(":")
-        if len(parts) != 6:
-            continue
-        try:
-            fr.channels.append(Channel(name, *(int(p) for p in parts)))
-        except ValueError:
-            continue
+    def reset(self):
+        self.last_good = {}    # name -> t_ms of the last frame with its bit set
+        self.fails = {}
+        self.last_t = None
 
-    return fr if fr.channels else None
+    def frame(self, tlm):
+        if self.last_t is not None and tlm.t_ms < self.last_t:
+            self.reset()                        # device rebooted — time went backwards
+        self.last_t = tlm.t_ms
+
+        fr = Frame()
+        fr.t_ms = tlm.t_ms
+        fr.fsm = tlm.state
+        fr.arm_counts = round(tlm.pack_v * ARM_SENSE_DIVIDER_RATIO / 3.3 * 4095)
+
+        for name, good in self.CHECKS:
+            if good(tlm):
+                self.last_good[name] = tlm.t_ms
+                state, flags = 1, 0
+            else:
+                self.fails[name] = self.fails.get(name, 0) + 1
+                was_good = name in self.last_good
+                flags = FLAG_STALE if was_good else FLAG_NEVER_GOOD
+                # A baro or mag that has worked and briefly goes stale is a
+                # caution; a bad IMU, or one that has never worked, is a failure.
+                state = 2 if name != "IMU" and was_good else 3
+            age = tlm.t_ms - self.last_good.get(name, tlm.t_ms)
+            fr.channels.append(Channel(name, state, flags, 0,
+                                       self.fails.get(name, 0), age, 0))
+
+        fr.channels.append(Channel("ARM", 1, 0, 0, 0, 0, 0))
+        for name in INOP_REASON:
+            fr.channels.append(Channel(name, 0, 0, 0, 0, 0, 0))
+        return fr
 
 
 # ----------------------------------------------------------------------
@@ -297,14 +315,10 @@ class SerialLink:
 class DemoLink:
     """Synthesises frames so the panel can be driven without hardware."""
 
-    NAMES = ["IMU", "BARO", "MAG", "FLASH", "SD", "ARM", "PYRO1", "PYRO2", "BATT"]
-    FITTED = {"IMU", "BARO", "SD", "ARM"}
-
     def __init__(self, out_queue):
         self.q = out_queue
         self._stop = threading.Event()
         self.ser = True
-        threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._run_tlm, daemon=True).start()
         self.q.put(("info", "Demo mode — data is synthesised, no hardware attached."))
 
@@ -323,31 +337,6 @@ class DemoLink:
     def send(self, text):
         self.q.put(("sent", text))
         self.q.put(("line", f"  [demo] received command '{text}'"))
-
-    def _run(self):
-        t0 = time.time()
-        while not self._stop.is_set():
-            t = int((time.time() - t0) * 1000)
-            parts = [f"HLTH,{t},IDLE,3340"]
-            for n in self.NAMES:
-                if n not in self.FITTED:
-                    parts.append(f"{n}=0:0:0:0:0:0")
-                    continue
-                st, flags, age = 1, 0, 0
-                dhz = {"IMU": 1250, "BARO": 742, "SD": 50, "ARM": 1250}[n]
-                if n == "BARO":
-                    if 8 < (t / 1000) % 24 < 13:      # transient caution
-                        st, flags, age = 2, 0x01, 640
-                elif n == "SD":
-                    if (t / 1000) % 24 > 18:          # sustained failure
-                        st, flags, age = 3, 0x21, 12000
-                parts.append(f"{n}={st}:{flags}:0:{random.randint(0, 3)}:{age}:{dhz}")
-            body = ",".join(parts)
-            ck = 0
-            for c in body:
-                ck ^= ord(c)
-            self.q.put(("line", f"${body}*{ck:02X}"))
-            time.sleep(0.5)
 
     def _run_tlm(self):
         sim = DemoFlight()
@@ -446,12 +435,12 @@ class BenchPanel:
         ("1  Baro", "1"), ("2  IMU", "2"), ("3  Mag", "3"), ("4  Flash", "4"),
         ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"),
         ("S  Servos", "S"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
-        ("C  Continuity", "C"), ("M  Mag calibrate", "M"), ("U  USB dump", "U"),
-        ("R  Menu", "R"),
+        ("C  Continuity", "C"), ("A  ARM sense", "A"), ("M  Mag calibrate", "M"),
+        ("U  USB dump", "U"), ("R  Menu", "R"),
     ]
 
     FLIGHT_CMDS = [
-        ("H  Status page", "H"), ("G  Calibrate gyro", "G"), ("X  Abort", "X"),
+        ("G  Calibrate gyro", "G"), ("X  Abort", "X"),
         ("R  Finalize log", "R"), ("U  USB dump", "U"),
         ("T  Telemetry on", "T"), ("t  Telemetry off", "t"),
     ]
@@ -464,7 +453,9 @@ class BenchPanel:
         self.frame = None
         self.last_rx = 0.0
         self.frames = 0
-        self.rejected = 0
+        self.health = TlmHealth()
+        self.rows_live = False         # annunciator rows show a fresh frame
+        self.bench_fw = False          # bench firmware's menu seen — it has no stream
         self.lamp_test_until = 0.0
 
         # Telemetry stream control — see _ensure_stream()
@@ -678,6 +669,11 @@ class BenchPanel:
                 return
             if self.link.connect(port, 115200):
                 self.conn_btn.configure(text="Disconnect")
+                self.frame = None
+                self.last_rx = 0.0
+                self.frames = 0
+                self.health.reset()
+                self.bench_fw = False
                 self.tlm_seen = False
                 self.stream_tries = 0
                 self.stream_last_try = time.time()   # let the board finish booting first
@@ -722,20 +718,18 @@ class BenchPanel:
     # ------------------------------------------------------------------
 
     def _on_tab(self, _evt=None):
-        self.stream_tries = 0          # a fresh look at the tab earns fresh retries
+        self.stream_tries = 0          # a fresh look at a tab earns fresh retries
         self._ensure_stream()
 
-    def _telemetry_tab_open(self):
-        return self.tabs.select() == str(self.tlm)
-
     def _ensure_stream(self):
-        """Send 'T' while the Telemetry tab is open and no frames are arriving.
+        """Send 'T' while connected and no frames are arriving — both tabs
+        run off the stream.
 
-        Capped at a few tries per connection or tab visit: the bench
-        firmware doesn't know 'T' and answers by reprinting its menu, so
-        retrying forever would bury the console.
+        Capped at a few tries per connection or tab visit, and stopped once
+        the bench firmware's menu shows up: it doesn't know 'T' and answers
+        by reprinting the menu, so retrying would bury the console.
         """
-        if self.demo or not self.link.connected or not self._telemetry_tab_open():
+        if self.demo or not self.link.connected or self.bench_fw:
             return
         if self.tlm.receiving(1.5) or self.stream_tries >= 3:
             return
@@ -787,22 +781,19 @@ class BenchPanel:
             fr = parse_tlm(line)
             if fr:
                 self.tlm_seen = True
+                self.bench_fw = False
                 self.stream_tries = 0
                 self.tlm.push(fr)
+                self.frame = self.health.frame(fr)
+                self.frames += 1
+                self.last_rx = time.time()
+                self._apply(self.frame)
             else:
                 self.tlm.note_rejected()
             return
 
-        if line.startswith("$"):
-            fr = parse_frame(line)
-            if fr:
-                self.frames += 1
-                self.frame = fr
-                self.last_rx = time.time()
-                self._apply(fr)
-            else:
-                self.rejected += 1
-            return
+        if "BENCH TEST" in line:       # the bench firmware's menu banner
+            self.bench_fw = True
 
         tag = None
         if "[PASS]" in line:
@@ -824,6 +815,13 @@ class BenchPanel:
         for name in self.ORDER:
             if name not in seen:
                 self.rows[name].set(None)
+        self.rows_live = True
+
+    def _fresh_frame(self):
+        """The latest health frame, or None once the stream has gone quiet."""
+        if self.frame and time.time() - self.last_rx < HEALTH_STALE_S:
+            return self.frame
+        return None
 
     # ------------------------------------------------------------------
     # Drawing
@@ -832,6 +830,10 @@ class BenchPanel:
     def _redraw(self):
         if self.lamp_test_until:
             return
+        if self.rows_live and not self._fresh_frame():
+            for row in self.rows.values():   # don't leave stale lamps lit
+                row.set(None)
+            self.rows_live = False
         self._draw_master()
         self._draw_arm()
 
@@ -850,9 +852,16 @@ class BenchPanel:
         c.delete("all")
         w, h = 452, 76
 
-        fr = self.frame
+        fr = self._fresh_frame()
         if forced:
             verdict, colour, reason = "GO", LAMP_GREEN, "lamp test"
+        elif not self.link.connected:
+            verdict, colour, reason = "NO LINK", LAMP_WHITE, "pick the port and press Connect"
+        elif self.bench_fw:
+            verdict, colour, reason = "BENCH", LAMP_WHITE, \
+                "bench firmware has no live health — run tests with the buttons below"
+        elif fr is None and self.frame:
+            verdict, colour, reason = "NO DATA", LAMP_WHITE, "telemetry stopped"
         elif fr is None:
             verdict, colour, reason = "NO DATA", LAMP_WHITE, "waiting for the flight computer"
         else:
@@ -886,13 +895,14 @@ class BenchPanel:
         c = self.arm
         c.delete("all")
         w, h = 452, 58
-        counts = self.frame.arm_counts if self.frame else 0
+        fr = self._fresh_frame()
+        counts = fr.arm_counts if fr else 0
         volts = counts * 3.3 / 4095.0
         armed = counts >= ARM_THRESHOLD_COUNTS
         colour = LAMP_AMBER if armed else LAMP_GREY
 
         c.create_text(16, 20, text=f"{volts:.2f} V", anchor="w",
-                      fill=TEXT if self.frame else TEXT_DIM,
+                      fill=TEXT if fr else TEXT_DIM,
                       font=self.fonts["reading"])
         c.create_text(104, 22, text=f"{counts} counts", anchor="w",
                       fill=TEXT_DIM, font=self.fonts["mono"])

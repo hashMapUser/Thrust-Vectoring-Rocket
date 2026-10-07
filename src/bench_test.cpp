@@ -21,6 +21,7 @@
 //    H — Barometer lift-height test (averaged baseline, lift prompt, 2.5 s delay, averaged delta)
 //    M — Magnetometer calibration (rotate ~50 s, then 'Y' to save to EEPROM)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
+//    A — ARM_SENSE readout (plain vs pull-down, then live as flight until a key)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
 // ============================================================
@@ -1027,7 +1028,7 @@ static void test_pyro_continuity() {
     digitalWrite(PIN_LED_RED,   LOW);
 
     analogReadResolution(12);
-    pinMode(PIN_ARM_SENSE,   INPUT);
+    pinMode(PIN_ARM_SENSE,   INPUT_PULLDOWN);   // as flight — an open pin reads 0 V, not junk
     pinMode(PIN_PYRO1_SENSE, INPUT);
     pinMode(PIN_PYRO2_SENSE, INPUT);
 
@@ -1081,6 +1082,127 @@ static void test_pyro_continuity() {
     } else {
         fail("Pyro Continuity — MAIN chute e-match reads OPEN. Do not arm.");
     }
+}
+
+// ============================================================
+//  TEST A — ARM_SENSE readout (pin 24 / A10)
+//  Shows what the flight firmware sees on ARM_SENSE. Samples the pin as
+//  plain INPUT, then with the internal pull-down on — the way
+//  main_control_loop.cpp sets it up. A plain-INPUT reading well above the
+//  pull-down one means nothing is driving the pin: it floats, and only
+//  the pull-down keeps it from reading as SW401 closed (buzzer on). Ends
+//  with a live stream, with the firmware's debounced verdict, so the
+//  switch can be flipped while watching.
+// ============================================================
+
+// Same threshold and debounce as main_control_loop.cpp.
+#define BENCH_ARM_SENSE_ARMED_V   1.2f
+#define BENCH_ARM_DEBOUNCE_MS     100
+#define BENCH_ARM_LOOP_MS         8      // flight loop period (125 Hz)
+#define ARM_SAMPLE_COUNT          10
+#define ARM_SAMPLE_INTERVAL_MS    200
+#define ARM_STREAM_INTERVAL_MS    250
+#define ARM_FLOAT_MARGIN_V        0.2f   // plain-vs-pull-down gap that means floating
+
+struct ArmSampleStats { float mean_v; uint8_t above; };
+
+static float arm_counts_to_v(uint16_t raw) { return raw * 3.30f / 4095.0f; }
+
+static void print_arm_reading(uint16_t raw) {
+    float v = arm_counts_to_v(raw);
+    Serial.print(v, 2);
+    Serial.print(F(" V  (raw "));
+    Serial.print(raw);
+    Serial.print(F(", pack "));
+    Serial.print(v / BENCH_ARM_SENSE_DIVIDER_RATIO, 2);
+    Serial.print(F(" V)  "));
+    Serial.print(v > BENCH_ARM_SENSE_ARMED_V ? F("ABOVE threshold") : F("below threshold"));
+}
+
+static ArmSampleStats sample_arm_sense(uint8_t mode, const char *label) {
+    pinMode(PIN_ARM_SENSE, mode);
+    delay(20);   // let the pull settle the pin before the first read
+    Serial.print(F("  ")); Serial.println(label);
+
+    uint16_t lo = 4095, hi = 0;
+    uint32_t sum = 0;
+    ArmSampleStats s = { 0.0f, 0 };
+    for (uint8_t i = 0; i < ARM_SAMPLE_COUNT; i++) {
+        uint16_t raw = analogRead(PIN_ARM_SENSE);
+        if (raw < lo) lo = raw;
+        if (raw > hi) hi = raw;
+        sum += raw;
+        if (arm_counts_to_v(raw) > BENCH_ARM_SENSE_ARMED_V) s.above++;
+        Serial.print(F("    ")); print_arm_reading(raw); Serial.println();
+        delay(ARM_SAMPLE_INTERVAL_MS);
+    }
+    s.mean_v = arm_counts_to_v(sum / ARM_SAMPLE_COUNT);
+
+    Serial.print(F("    min "));   Serial.print(arm_counts_to_v(lo), 2);
+    Serial.print(F(" V, max "));   Serial.print(arm_counts_to_v(hi), 2);
+    Serial.print(F(" V, mean "));  Serial.print(s.mean_v, 2);
+    Serial.print(F(" V — "));      Serial.print(s.above);
+    Serial.print(F(" of "));       Serial.print(ARM_SAMPLE_COUNT);
+    Serial.println(F(" above threshold"));
+    return s;
+}
+
+static void test_arm_sense() {
+    print_banner("TEST A: ARM_SENSE readout (pin 24 / A10)");
+    Serial.print(F("  Flight threshold: "));
+    Serial.print(BENCH_ARM_SENSE_ARMED_V, 2);
+    Serial.print(F(" V (pack "));
+    Serial.print(BENCH_ARM_SENSE_ARMED_V / BENCH_ARM_SENSE_DIVIDER_RATIO, 2);
+    Serial.print(F(" V), debounce "));
+    Serial.print(BENCH_ARM_DEBOUNCE_MS);
+    Serial.println(F(" ms. Above it = SW401 CLOSED = buzzer on."));
+
+    analogReadResolution(12);
+    ArmSampleStats plain = sample_arm_sense(INPUT,
+        "Plain INPUT, no pull — is anything driving the pin?");
+    ArmSampleStats pd    = sample_arm_sense(INPUT_PULLDOWN,
+        "INPUT_PULLDOWN (~100k to GND) — how the flight firmware reads it:");
+
+    bool floating = pd.mean_v < ARM_FLOAT_MARGIN_V &&
+                    plain.mean_v - pd.mean_v > ARM_FLOAT_MARGIN_V;
+    if (floating) {
+        info("Nothing is driving ARM_SENSE (it floats without the pull-down) — SW401/divider not connected?");
+    }
+    if (pd.above) {
+        info("Flight firmware reads SW401 CLOSED — buzzer on (right only if the switch is closed)");
+    } else {
+        pass("Flight firmware reads SW401 OPEN — buzzer silent");
+    }
+
+    // Live readout in the flight configuration (pin left as
+    // INPUT_PULLDOWN from the last pass), run through the same debounce
+    // as main_control_loop.cpp, so the line says what the flight
+    // firmware would decide — flip SW401 and watch it change.
+    Serial.println(F("  Live (INPUT_PULLDOWN, as flight) — send any key to stop:"));
+    bool     raw_prev   = false;
+    bool     armed      = false;
+    uint32_t edge_ms    = 0;
+    uint32_t last_print = 0;
+    while (true) {
+        if (Serial.available()) {
+            int c = Serial.read();
+            if (c != '\r' && c != '\n') break;   // ignore the line ending from the 'A' command
+        }
+        uint32_t now = millis();
+        uint16_t raw = analogRead(PIN_ARM_SENSE);
+        bool above = arm_counts_to_v(raw) > BENCH_ARM_SENSE_ARMED_V;
+        if (above != raw_prev) { edge_ms = now; raw_prev = above; }
+        if (now - edge_ms >= BENCH_ARM_DEBOUNCE_MS) armed = above;
+
+        if (now - last_print >= ARM_STREAM_INTERVAL_MS) {
+            last_print = now;
+            Serial.print(F("    ")); print_arm_reading(raw);
+            Serial.println(armed ? F("  -> firmware: ARMED, buzzer ON")
+                                 : F("  -> firmware: SAFE, buzzer off"));
+        }
+        delay(BENCH_ARM_LOOP_MS);
+    }
+    info("Live readout stopped");
 }
 
 // ============================================================
@@ -1263,6 +1385,7 @@ static void print_menu() {
     Serial.println(F("║  H - Barometer lift-height test          ║"));
     Serial.println(F("║  M - Magnetometer calibration (~50 s)    ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
+    Serial.println(F("║  A - ARM_SENSE readout (pin 24)          ║"));
     Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
     Serial.println(F("╚══════════════════════════════════════════╝"));
@@ -1317,6 +1440,7 @@ void loop() {
         case 'H': case 'h': test_baro_lift_height(); break;
         case 'M': case 'm': test_mag_calibrate(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
+        case 'A': case 'a': test_arm_sense(); break;
         case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;
         default:

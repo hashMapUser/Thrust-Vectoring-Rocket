@@ -7,7 +7,8 @@ over USB and shows:
   * a 3D view of the vehicle, drawn from the filter quaternion
   * a tilt scope of tip A / tip B, the two angles the PID drives to zero
   * numeric readouts, flight state and flag lamps
-  * strip charts of attitude, body rates, TVC command, altitude, velocity
+  * strip charts of attitude, body rates, magnetic field, TVC command,
+    altitude, velocity
   * CSV recording of every frame received
 
 Colour carries meaning in two ways. Lamps keep bench_gui's annunciator
@@ -15,16 +16,23 @@ convention (green normal, amber caution, red warning, grey off). Data
 is coloured by body axis everywhere it appears — 3D arrows, charts,
 readouts, scope — so blue is always body Y and orchid is always body Z.
 Body X (the long axis) and plain scalars are drawn in the panel's text
-colour.
+colour. On screen, axes carry the IMU names printed on the board:
+IMU X across the airframe, IMU Y along it (+ toward the nose), IMU Z
+out of the board face.
 
 Frames
 ------
-  * Body frame (firmware): +X nose-to-nozzle, +Y left, +Z completes it.
+  * Body frame (firmware): +X nose-to-nozzle, +Y = IMU +X, +Z = IMU +Z.
+    lsm6dsox_to_body() in include/lsm6dsox.h turns IMU axes into these.
   * The quaternion is in the filter frame, NED, after the remap in
     mahrs_integration.cpp: filter x = body Z, filter y = -body Y,
     filter z = body X. Identity = vertical on the pad, nose up.
-  * Heading is relative to power-up: there's no magnetometer fitted,
-    so filter "north" is wherever the board was pointing at boot.
+  * Magnetometer (mx/my/mz): calibrated, in the magnetometer's own axes
+    (which run the same way as the IMU's), NaN without a fresh sample.
+  * Heading: filter "north" is magnetic north — the magnetometer holds the
+    heading (rotation about the vertical) — falling back to the gyro when
+    there's no fresh mag sample. The 3D view homes its camera to the side
+    the board's +Z faces when telemetry starts.
 """
 
 import collections
@@ -46,6 +54,7 @@ TLM_FIELDS = (
     "tip_a", "tip_b", "spin",
     "gx", "gy", "gz",
     "ax", "ay", "az",
+    "mx", "my", "mz",
     "alt_m", "vel_ms", "baro_alt_m", "press_hpa", "temp_c",
     "pid_p", "pid_y", "servo_p_us", "servo_y_us",
     "pack_v", "loop_us",
@@ -60,6 +69,9 @@ F_PAD_REST   = 0x10
 F_LAUNCH_DET = 0x20
 F_GROUND_CAP = 0x40
 F_MAIN_FIRED = 0x80
+
+MAG_FIELDS = ("mx", "my", "mz")
+MAG_OK_GAUSS = (0.10, 1.00)   # Earth's field, with margin — same band as bench test 3
 
 LOOP_BUDGET_US = 8000      # LOOP_INTERVAL_US in main_control_loop.cpp
 PID_LIMIT_DEG  = 5.0       # PID_OUT_MAX in pid.h
@@ -88,6 +100,10 @@ def parse_tlm(line):
         return None
 
     f = body.split(",")
+    if len(f) == len(TLM_FIELDS) + 1 - len(MAG_FIELDS):
+        # Firmware from before the magnetometer fields: no mag data.
+        at = TLM_FIELDS.index(MAG_FIELDS[0]) + 1
+        f = f[:at] + ["nan"] * len(MAG_FIELDS) + f[at:]
     if len(f) != len(TLM_FIELDS) + 1:
         return None
     try:
@@ -106,6 +122,7 @@ def format_tlm(fr):
             "{tip_a:.2f},{tip_b:.2f},{spin:.2f},"
             "{gx:.2f},{gy:.2f},{gz:.2f},"
             "{ax:.3f},{ay:.3f},{az:.3f},"
+            "{mx:.4f},{my:.4f},{mz:.4f},"
             "{alt_m:.2f},{vel_ms:.2f},{baro_alt_m:.2f},{press_hpa:.2f},{temp_c:.1f},"
             "{pid_p:.3f},{pid_y:.3f},{servo_p_us:.0f},{servo_y_us:.0f},"
             "{pack_v:.2f},{loop_us}").format(**fr._asdict())
@@ -174,7 +191,12 @@ def nice_step(span, target=4):
 class AttitudeView(tk.Canvas):
     """Wireframe vehicle drawn from the filter quaternion. Drag to orbit."""
 
-    HOME_AZ, HOME_EL = 35.0, 16.0
+    # Home camera on the board's +Z side, as you'd stand facing it: IMU +Z
+    # points at the camera and IMU +X is on the right, so leans on screen
+    # go the same way as the real vehicle. HOME_AZ is for +Z pointing
+    # north; _home() adds the vehicle's actual heading, since that now
+    # comes from the magnetometer rather than the power-up direction.
+    HOME_AZ, HOME_EL = 200.0, 16.0
     CAM_DIST = 3.4
     GROUND = -0.62
 
@@ -197,6 +219,7 @@ class AttitudeView(tk.Canvas):
         self.frame = None
         self.live = False
         self._drag = None
+        self._homed = False            # camera placed on the +Z side for this stream
         self.w, self.h = 440, 300
 
         self.bind("<Configure>", self._on_resize)
@@ -223,11 +246,27 @@ class AttitudeView(tk.Canvas):
 
     def _reset_view(self, _e=None):
         self.az, self.el = self.HOME_AZ, self.HOME_EL
+        self._homed = False
         self.draw()
 
     def set(self, frame, live):
+        # Re-home on the first frame of a stream, and after a reboot.
+        if frame is not None and (self.frame is None or frame.t_ms < self.frame.t_ms):
+            self._homed = False
         self.frame = frame
         self.live = live
+
+    def _home(self, R):
+        """Put the camera on the side IMU +Z faces now. Only when homing —
+        following the heading continuously would hide the roll."""
+        zv = self._to_view(R, (1, 0, 0))            # body +Z (sensor +x), view coords
+        if math.hypot(zv[0], zv[1]) > 0.3:           # skip if +Z is near vertical
+            heading = math.degrees(math.atan2(zv[0], zv[1]))   # from north toward east
+            # The camera sits at compass bearing 180 - az (see _camera), so
+            # turning it with the heading means subtracting.
+            self.az = (self.HOME_AZ - heading) % 360
+        self.el = self.HOME_EL
+        self._homed = True
 
     # -- camera ---------------------------------------------------------
     def _camera(self):
@@ -257,10 +296,12 @@ class AttitudeView(tk.Canvas):
     def draw(self):
         self.delete("all")
         t = self.t
-        cam = self._camera()
-        c = cam[0]
         fr = self.frame
         R = quat_matrix(fr.q0, fr.q1, fr.q2, fr.q3) if fr else quat_matrix(1, 0, 0, 0)
+        if fr is not None and not self._homed:
+            self._home(R)
+        cam = self._camera()
+        c = cam[0]
         fade = 0.0 if self.live else 0.65
 
         def col(base, extra=0.0):
@@ -275,9 +316,6 @@ class AttitudeView(tk.Canvas):
                              *self._project((v, 0.88, g), cam), fill=col(t["RULE"], shade - 0.55))
             self.create_line(*self._project((-0.88, v, g), cam),
                              *self._project((0.88, v, g), cam), fill=col(t["RULE"], shade - 0.55))
-        for label, p in (("x", (0, 0.97, g)), ("y", (0.97, 0, g))):
-            self.create_text(*self._project(p, cam), text=label,
-                             fill=col(t["TEXT_DIM"]), font=self.fonts["small"])
 
         # Vertical reference and the vehicle's shadow on the pad
         self.create_line(*self._project((0, 0, g), cam), *self._project((0, 0, 0.80), cam),
@@ -325,8 +363,9 @@ class AttitudeView(tk.Canvas):
         for a, b in back:
             self.create_line(*a, *b, fill=back_col)
 
-        # Body-axis arrows: +Y (sensor -y) and +Z (sensor +x), mid-body
-        for label, d, base in (("+Y", (0, -1, 0), t["AXIS_Y"]), ("+Z", (1, 0, 0), t["AXIS_Z"])):
+        # Body-axis arrows, mid-body, labelled with the IMU axis names:
+        # body +Y (sensor -y) is IMU +X, body +Z (sensor +x) is IMU +Z.
+        for label, d, base in (("+X", (0, -1, 0), t["AXIS_Y"]), ("+Z", (1, 0, 0), t["AXIS_Z"])):
             dv = self._to_view(R, d)
             facing = dv[0] * c[0] + dv[1] * c[1] + dv[2] * c[2]
             colour = col(base, 0.0 if facing > -0.15 else 0.5)
@@ -340,6 +379,10 @@ class AttitudeView(tk.Canvas):
         for a, b in front:
             self.create_line(*a, *b, fill=front_col, width=1.4)
 
+        # IMU +Y runs along the airframe, out through the nose.
+        self.create_text(*self._project(self._to_view(R, (0, 0, self.NOSE[-1][0] - 0.09)), cam),
+                         text="+Y", fill=col(t["TEXT"]), font=self.fonts["label"])
+
         # Overlay: tilt readout, hints
         if fr is not None:
             self.create_text(16, 14, text=f"{tilt_deg(fr):5.1f}°", anchor="nw",
@@ -348,9 +391,9 @@ class AttitudeView(tk.Canvas):
             self.create_text(18, 50, text="tilt from vertical", anchor="nw",
                              fill=t["TEXT_DIM"], font=self.fonts["small"])
         self.create_text(12, self.h - 26, anchor="w", fill=t["TEXT_DIM"], font=self.fonts["small"],
-                         text="Heading is relative to power-up (no magnetometer)")
+                         text="Heading from the magnetometer (magnetic north)")
         self.create_text(12, self.h - 11, anchor="w", fill=t["TEXT_DIM"], font=self.fonts["small"],
-                         text="Drag to orbit, double-click to reset view")
+                         text="Drag to orbit, double-click to face the +Z side again")
 
         if not self.live:
             msg = "Waiting for telemetry" if fr is None else "Telemetry lost"
@@ -368,7 +411,13 @@ class AttitudeView(tk.Canvas):
 
 
 class TiltScope(tk.Canvas):
-    """Tip A vs tip B, with a short trail. Centre = what the PID is chasing."""
+    """Which way the nose leans, with a short trail. Centre = what the PID
+    is chasing.
+
+    Seen from above, oriented like the 3D view's home camera: IMU +X to
+    the right, IMU +Z toward you (down). A nose lean toward +X is a
+    negative tip B, toward +Z a positive tip A.
+    """
 
     SIZE = 204
     RANGE_DEG = 15.0
@@ -383,7 +432,7 @@ class TiltScope(tk.Canvas):
     def _xy(self, tip_a, tip_b):
         c = self.SIZE / 2
         k = (self.SIZE / 2 - 14) / self.RANGE_DEG
-        return c + tip_b * k, c - tip_a * k
+        return c - tip_b * k, c + tip_a * k
 
     def _static(self):
         t, c = self.t, self.SIZE / 2
@@ -392,12 +441,13 @@ class TiltScope(tk.Canvas):
             self.create_oval(c - r, c - r, c + r, c + r, outline=mix(t["RULE"], t["WELL"], 0.2))
             self.create_text(c + r * 0.72 + 3, c + r * 0.72 + 3, text=f"{deg}°", anchor="nw",
                              fill=t["TEXT_DIM"], font=self.fonts["small"])
-        self.create_line(8, c, self.SIZE - 8, c, fill=mix(t["AXIS_Z"], t["WELL"], 0.6))
-        self.create_line(c, 8, c, self.SIZE - 8, fill=mix(t["AXIS_Y"], t["WELL"], 0.6))
-        self.create_text(self.SIZE - 6, c - 4, text="Tip B", anchor="se",
-                         fill=t["AXIS_Z"], font=self.fonts["small"])
-        self.create_text(c + 5, 5, text="Tip A", anchor="nw",
+        # Coloured like the 3D arrows: IMU X is body Y, IMU Z is body Z.
+        self.create_line(8, c, self.SIZE - 8, c, fill=mix(t["AXIS_Y"], t["WELL"], 0.6))
+        self.create_line(c, 8, c, self.SIZE - 8, fill=mix(t["AXIS_Z"], t["WELL"], 0.6))
+        self.create_text(self.SIZE - 6, c - 4, text="+X", anchor="se",
                          fill=t["AXIS_Y"], font=self.fonts["small"])
+        self.create_text(c + 5, self.SIZE - 5, text="+Z", anchor="sw",
+                         fill=t["AXIS_Z"], font=self.fonts["small"])
 
     def draw(self, recent, live):
         self.delete("dyn")
@@ -439,7 +489,7 @@ class StripChart(tk.Canvas):
     PAD_L, PAD_R, PAD_T, PAD_B = 46, 10, 24, 15
 
     def __init__(self, parent, theme, fonts, title, unit, series,
-                 min_span, symmetric=True, fixed=None, limits=None):
+                 min_span, symmetric=True, fixed=None, limits=None, fmt="{:+.1f}"):
         super().__init__(parent, bg=theme["WELL"], highlightthickness=1,
                          highlightbackground=theme["RULE"], height=80, width=300)
         self.t = theme
@@ -447,6 +497,7 @@ class StripChart(tk.Canvas):
         self.title = title
         self.unit = unit
         self.series = series            # [(field, label, colour)]
+        self.fmt = fmt                  # legend value format
         self.min_span = min_span
         self.symmetric = symmetric
         self.fixed = fixed
@@ -563,7 +614,7 @@ class StripChart(tk.Canvas):
         x = self.w - 10
         for (field, label, colour), col in reversed(list(zip(self.series, cols))):
             val = col[-1] if col else float("nan")
-            txt = f"{label} {val:+.1f}" if finite(val) else f"{label}  —"
+            txt = f"{label} {self.fmt.format(val)}" if finite(val) else f"{label}  —"
             item = self.create_text(x, 4, text=txt, anchor="ne", tags="dyn",
                                     fill=colour if live else t["TEXT_DIM"], font=self.fonts["mono"])
             bx0, _, _, _ = self.bbox(item)
@@ -734,7 +785,12 @@ class TelemetryPanel(tk.Frame):
             StripChart(right, t, self.fonts, "attitude", "deg",
                        [("tip_a", "A", AY), ("tip_b", "B", AZ)], min_span=5),
             StripChart(right, t, self.fonts, "body rates", "deg/s",
-                       [("gx", "X", TX), ("gy", "Y", AY), ("gz", "Z", AZ)], min_span=20),
+                       [("gx", "spin", TX), ("gy", "X", AY), ("gz", "Z", AZ)], min_span=20),
+            # Magnetometer's own axes, coloured like the IMU axes of the same
+            # name — assumes the two chips are oriented alike on the board.
+            StripChart(right, t, self.fonts, "magnetic field", "G",
+                       [("mx", "X", AY), ("my", "Y", TX), ("mz", "Z", AZ)], min_span=0.2,
+                       fmt="{:+.3f}"),
             StripChart(right, t, self.fonts, "tvc command", "deg",
                        [("pid_p", "pitch", AY), ("pid_y", "yaw", AZ)], min_span=6,
                        fixed=(-6, 6), limits=(-PID_LIMIT_DEG, PID_LIMIT_DEG)),
@@ -764,7 +820,8 @@ class TelemetryPanel(tk.Frame):
         groups = [
             ("attitude", [("tip_a", "Tip A", AY), ("tip_b", "Tip B", AZ), ("spin", "Spin", None)]),
             ("motion", [("alt", "Altitude", None), ("vel", "Velocity", None),
-                        ("acc", "Accel", None), ("rate", "Rate", None)]),
+                        ("acc", "Accel", None), ("rate", "Rate", None),
+                        ("mag", "Mag field", None)]),
             ("control", [("pid_p", "Pitch cmd", AY), ("pid_y", "Yaw cmd", AZ),
                          ("srv_p", "Pitch servo", AY), ("srv_y", "Yaw servo", AZ)]),
             ("system", [("press", "Pressure", None), ("temp", "Temp", None),
@@ -921,6 +978,10 @@ class TelemetryPanel(tk.Frame):
         rate = math.sqrt(fr.gx ** 2 + fr.gy ** 2 + fr.gz ** 2)
         self._set("acc", num(acc, "{:.2f}"), "g", dim)
         self._set("rate", num(rate, "{:.0f}"), "deg/s", dim)
+        field = math.sqrt(fr.mx ** 2 + fr.my ** 2 + fr.mz ** 2)
+        lo, hi = MAG_OK_GAUSS
+        self._set("mag", num(field, "{:.3f}"), "G",
+                  dim or (None if not finite(field) or lo <= field <= hi else t["LAMP_AMBER"]))
 
         tvc_on = bool(fr.flags & F_TVC_LIVE)
         sat = t["LAMP_AMBER"]
@@ -1060,6 +1121,14 @@ class DemoFlight:
             up_s = (-R[2][0], -R[2][1], -R[2][2])      # R^T (0, 0, -1)
             ax, ay, az = up_s[2], -up_s[1], up_s[0]    # sensor -> body axes
 
+        # Earth's field (north and down, NED [G]) seen from the sensor,
+        # then body axes, then IMU axes — the magnetometer is assumed to
+        # be oriented like the IMU.
+        B = (0.20, -0.02, 0.45)
+        s = [sum(R[j][i] * B[j] for j in range(3)) for i in range(3)]   # R^T B
+        bx, by, bz = s[2], -s[1], s[0]
+        mx, my, mz = by, -bx, bz
+
         tvc = 10.0 <= tc < 13.4
         if tvc:
             pid_p = max(-5.0, min(5.0, -(0.34 * tip_a + 0.05 * rate_a)))
@@ -1090,6 +1159,7 @@ class DemoFlight:
             tip_a=tip_a, tip_b=tip_b, spin=self.spin,
             gx=spin_rate + noise(0, 0.3), gy=rate_a + noise(0, 0.3), gz=rate_b + noise(0, 0.3),
             ax=ax + noise(0, 0.01), ay=ay + noise(0, 0.01), az=az + noise(0, 0.01),
+            mx=mx + noise(0, 0.002), my=my + noise(0, 0.002), mz=mz + noise(0, 0.002),
             alt_m=alt + noise(0, 0.05), vel_ms=vel + noise(0, 0.08), baro_alt_m=baro_alt,
             press_hpa=self.GROUND_HPA * (1 - baro_alt / 44330.0) ** 5.255,
             temp_c=24.6 - alt * 0.0065,

@@ -31,6 +31,7 @@ bool telemetry_emit(const TelemetryFrame *f) {
         "%.2f,%.2f,%.2f,"
         "%.2f,%.2f,%.2f,"
         "%.3f,%.3f,%.3f,"
+        "%.4f,%.4f,%.4f,"
         "%.2f,%.2f,%.2f,%.2f,%.1f,"
         "%.3f,%.3f,%.0f,%.0f,"
         "%.2f,%lu",
@@ -39,6 +40,7 @@ bool telemetry_emit(const TelemetryFrame *f) {
         f->tip_a, f->tip_b, f->spin,
         f->gx, f->gy, f->gz,
         f->ax, f->ay, f->az,
+        f->mx, f->my, f->mz,
         f->alt_m, f->vel_ms, f->baro_alt_m, f->press_hpa, f->temp_c,
         f->pid_p, f->pid_y, f->servo_p_us, f->servo_y_us,
         f->pack_v, (unsigned long)f->loop_us);

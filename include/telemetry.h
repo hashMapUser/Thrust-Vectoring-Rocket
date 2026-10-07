@@ -9,7 +9,7 @@
 // One ASCII line per frame, in the same style as the $HLTH frames:
 //
 //   $TLM,t_ms,state,flags,q0,q1,q2,q3,tip_a,tip_b,spin,gx,gy,gz,ax,ay,az,
-//        alt_m,vel_ms,baro_alt_m,press_hpa,temp_c,pid_p,pid_y,
+//        mx,my,mz,alt_m,vel_ms,baro_alt_m,press_hpa,temp_c,pid_p,pid_y,
 //        servo_p_us,servo_y_us,pack_v,loop_us*XX
 //
 // XX is the XOR of every character between '$' and '*', as two hex
@@ -45,6 +45,8 @@ typedef struct {
 
     float gx, gy, gz;            // [deg/s] body frame, bias-corrected
     float ax, ay, az;            // [g] body frame
+    float mx, my, mz;            // [Gauss] magnetometer's own axes, calibrated;
+                                 // NaN when there's no fresh sample
 
     float alt_m;                 // altitude estimator output [m]
     float vel_ms;                // vertical velocity estimate [m/s]

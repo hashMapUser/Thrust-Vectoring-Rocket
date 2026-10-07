@@ -77,7 +77,9 @@ void setup() {
 
     // ARM_SENSE / PYRO1_SENSE — see the arming-switch block in loop()
     analogReadResolution(12);
-    pinMode(PIN_ARM_SENSE, INPUT);
+    // Pull-down so an unconnected ARM_SENSE reads 0 V — see
+    // main_control_loop.cpp's setup().
+    pinMode(PIN_ARM_SENSE, INPUT_PULLDOWN);
     pinMode(PIN_PYRO1_SENSE, INPUT);
 
     // IMU CS must be HIGH before SPI.begin()
@@ -133,6 +135,7 @@ void setup() {
     while (millis() - cal_start < 2000) {
         LSM6DSOX_Data d;
         lsm6dsox_read(&d, &gyro_bias);
+        lsm6dsox_to_body(&d);
         alt_calibrate_sample(&alt_est, -d.ax);
         delay(8);
     }
@@ -233,6 +236,7 @@ void loop() {
     // ── SENSOR INGESTION ──────────────────────────────────────
     LSM6DSOX_Data imu_data;
     lsm6dsox_read(&imu_data, &gyro_bias);
+    lsm6dsox_to_body(&imu_data);   // IMU axes -> body frame; everything below is body frame
 
     LPS22HB_Data baro_data;
     lps22hb_read(&baro_data);

@@ -59,6 +59,26 @@ static float assemble_axis(uint8_t out0, uint8_t out1, uint8_t out2) {
     return (float)signed_raw * MMC5603NJ_SCALE;
 }
 
+/**
+ * Burst-read all 9 output bytes starting at XOUT0 (0x00) and assemble
+ * them into Gauss. Layout:
+ *   data[0] = XOUT0   data[1] = XOUT1   data[2] = YOUT0
+ *   data[3] = YOUT1   data[4] = ZOUT0   data[5] = ZOUT1
+ *   data[6] = XOUT2   data[7] = YOUT2   data[8] = ZOUT2
+ *
+ * @return false on an I2C error, leaving `out` untouched.
+ */
+static bool read_output(mag_data *out) {
+    uint8_t data[9];
+    if (!read_registers(MMC5603NJ_REG_XOUT0, 9, data)) return false;
+
+    out->mag_x = assemble_axis(data[0], data[1], data[6]);
+    out->mag_y = assemble_axis(data[2], data[3], data[7]);
+    out->mag_z = assemble_axis(data[4], data[5], data[8]);
+    out->valid = true;
+    return true;
+}
+
 // --------------------------------------------------------
 // PUBLIC API
 // --------------------------------------------------------
@@ -118,21 +138,40 @@ void mag_read(mag_data *out) {
         delay(1);
     }
 
-    // 3. Burst-read all 9 output bytes starting at XOUT0 (0x00)
-    //    Layout:
-    //      data[0] = XOUT0   data[1] = XOUT1   data[2] = YOUT0
-    //      data[3] = YOUT1   data[4] = ZOUT0   data[5] = ZOUT1
-    //      data[6] = XOUT2   data[7] = YOUT2   data[8] = ZOUT2
-    uint8_t data[9];
-    if (!read_registers(MMC5603NJ_REG_XOUT0, 9, data)) {
+    // 3. Burst-read and assemble all three axes
+    if (!read_output(out)) {
         out->valid = false;
         out->mag_x = out->mag_y = out->mag_z = NAN;
-        return;
+    }
+}
+
+static bool     _measuring  = false;
+static uint32_t _meas_start = 0;
+
+bool mag_poll(mag_data *out) {
+    uint32_t now = millis();
+
+    if (!_measuring) {
+        if (now - _meas_start >= MMC5603NJ_POLL_PERIOD_MS) {
+            _measuring  = write_register(MMC5603NJ_REG_CTRL0, MMC5603NJ_TM_M);
+            _meas_start = now;
+        }
+        return false;
     }
 
-    // 4. Assemble 18-bit values and scale to Gauss
-    out->mag_x = assemble_axis(data[0], data[1], data[6]);
-    out->mag_y = assemble_axis(data[2], data[3], data[7]);
-    out-> mag_z = assemble_axis(data[4], data[5], data[8]);
-    out-> valid = true;
+    uint32_t elapsed = now - _meas_start;
+    if (elapsed < MMC5603NJ_MEAS_TIME_MS) return false;   // still converting — leave the bus alone
+
+    uint8_t status = 0;
+    if (!read_register(MMC5603NJ_REG_STATUS1, &status)) {
+        _measuring = false;
+        return false;
+    }
+    if (!(status & MMC5603NJ_MEAS_M_DONE)) {
+        if (elapsed > MMC5603NJ_MEAS_TIMEOUT_MS) _measuring = false;   // lost — start over next period
+        return false;
+    }
+
+    _measuring = false;
+    return read_output(out);
 }

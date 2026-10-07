@@ -65,6 +65,12 @@
 // Max poll time waiting for Meas_M_Done (datasheet typ: 8 ms)
 #define MMC5603NJ_MEAS_TIMEOUT_MS 15
 
+// mag_poll(): don't check STATUS1 until this long after the trigger
+// (conversion takes ~6.6 ms at the default bandwidth), and start a new
+// measurement at most this often — 50 Hz.
+#define MMC5603NJ_MEAS_TIME_MS    7
+#define MMC5603NJ_POLL_PERIOD_MS  20
+
 // --------------------------------------------------------
 // PIN ASSIGNMENTS — from board_pins.h
 // Wire1: SCL=PIN_MAG_SCL (16), SDA=PIN_MAG_SDA (17)
@@ -107,3 +113,31 @@ bool mag_init();
  * @param out  Populated on return. Always check out->valid.
  */
 void mag_read(mag_data *out);
+
+/**
+ * Non-blocking read for the control loop — call once per tick. Starts a
+ * measurement every MMC5603NJ_POLL_PERIOD_MS, and once it has had time
+ * to convert, checks STATUS1 and burst-reads it. Never waits on the
+ * conversion the way mag_read() does: a tick costs at most one status
+ * read, one 9-byte read and one trigger write.
+ *
+ * @param out  Filled only when this returns true.
+ * @return true when `out` holds a new sample.
+ */
+bool mag_poll(mag_data *out);
+
+/**
+ * Magnetometer mounting → body frame. On FC V2 the MMC5603NJ's axes run
+ * the same way as the LSM6DSOX's (confirmed on the bench: IMU/mag X is
+ * pitch, Y roll along the airframe, Z yaw), so this is the same 90° turn
+ * as lsm6dsox_to_body():
+ *
+ *   body X = -mag Y,   body Y = mag X,   body Z = mag Z
+ *
+ * Apply after the hard/soft-iron calibration, which is in chip axes.
+ */
+static inline void mag_to_body(mag_data *m) {
+    float x = m->mag_x;
+    m->mag_x = -m->mag_y;
+    m->mag_y = x;
+}

@@ -184,3 +184,23 @@ bool lsm6dsox_load_bias(GyroBias *bias);
  * @param bias  Pointer to calibrated bias, or nullptr to skip correction.
  */
 void lsm6dsox_read(LSM6DSOX_Data *out, const GyroBias *bias = nullptr);
+
+/**
+ * IMU mounting → body frame. On FC V2 the LSM6DSOX's +Y axis points
+ * toward the nose, X runs across the airframe and Z out of the board
+ * face. The flight code works in the body frame — +X nose-to-nozzle,
+ * Y and Z radial — so call this right after lsm6dsox_read():
+ *
+ *   body X = -IMU Y,   body Y = IMU X,   body Z = IMU Z
+ *
+ * A 90° turn about Z, so still right-handed. lsm6dsox_read() and the
+ * gyro bias stay in IMU axes (the bench test prints those, and the
+ * stored calibration keeps working), so this goes after the bias.
+ *
+ * Check on the bench: nose up, accel reads about (-1, 0, 0) g here.
+ */
+static inline void lsm6dsox_to_body(LSM6DSOX_Data *d) {
+    float gx = d->gx, ax = d->ax;
+    d->gx = -d->gy;  d->gy = gx;
+    d->ax = -d->ay;  d->ay = ax;
+}

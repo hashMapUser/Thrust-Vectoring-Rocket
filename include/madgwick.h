@@ -116,6 +116,42 @@ void madgwick_imu_update(MadgwickState *state,
                          float dt);
 
 /**
+ * Set the quaternion straight from one accelerometer reading, with yaw
+ * zero, so the filter starts at the measured tilt instead of converging
+ * to it from identity at beta's rate. Same accel convention as the
+ * update functions. Leaves the state unchanged if the reading has no
+ * magnitude.
+ *
+ * @param ax, ay, az  Accelerometer reading at rest [any unit]
+ */
+void madgwick_set_from_accel(MadgwickState *state, float ax, float ay, float az);
+
+/**
+ * Heading correction from a magnetometer reading — kept apart from the
+ * gradient step so the magnetometer can only turn the attitude about the
+ * vertical. Tilt stays referenced to the accelerometer alone, so a
+ * disturbed field can't pull it. Turns toward the heading where the
+ * field's horizontal part points along filter +x ("north"), at
+ * gain × error, capped at max_rate. Call after the IMU update. Skipped
+ * when the field is too close to vertical to give a heading.
+ *
+ * @param mx, my, mz  Magnetometer reading in the filter's sensor frame [any unit]
+ * @param gain        [1/s]; 0 disables
+ * @param max_rate    [rad/s]
+ */
+void madgwick_heading_update(MadgwickState *state, float mx, float my, float mz,
+                             float gain, float max_rate, float dt);
+
+/**
+ * Turn the attitude about the vertical in one step so the reading's
+ * horizontal part points along filter +x. For seeding at boot, after
+ * madgwick_set_from_accel().
+ *
+ * @return false if the field is too close to vertical to give a heading.
+ */
+bool madgwick_align_heading(MadgwickState *state, float mx, float my, float mz);
+
+/**
  * Convert the current quaternion to roll/pitch/yaw in degrees.
  * Computed on demand — call only when needed (telemetry, logging, debug).
  * Pitch saturates near ±90° due to Euler gimbal lock; use the quaternion

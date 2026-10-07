@@ -20,6 +20,32 @@ static const float RAD_TO_DEG = 57.29577951308232f;
 // Anything below this magnitude is treated as "no signal."
 static const float NORM_EPSILON = 1e-6f;
 
+// A field whose horizontal part is under this fraction of its magnitude
+// is too close to vertical to give a usable heading.
+static const float HEADING_MIN_HORIZ = 0.1f;
+
+// Heading of the field's horizontal part in the earth frame [rad], from
+// +x toward +y: rotate the reading by the current attitude, h = R(q) m.
+static bool field_heading(const MadgwickState *s, float mx, float my, float mz, float *psi) {
+    float q0 = s->q0, q1 = s->q1, q2 = s->q2, q3 = s->q3;
+    float hx = 2.0f*(mx*(0.5f - q2*q2 - q3*q3) + my*(q1*q2 - q0*q3) + mz*(q1*q3 + q0*q2));
+    float hy = 2.0f*(mx*(q1*q2 + q0*q3) + my*(0.5f - q1*q1 - q3*q3) + mz*(q2*q3 - q0*q1));
+    float n  = sqrtf(mx*mx + my*my + mz*mz);
+    if (n < NORM_EPSILON || sqrtf(hx*hx + hy*hy) < HEADING_MIN_HORIZ * n) return false;
+    *psi = atan2f(hy, hx);
+    return true;
+}
+
+// Turn the attitude about the earth vertical: q = (cos a/2, 0, 0, sin a/2) ⊗ q.
+static void rotate_about_vertical(MadgwickState *s, float angle) {
+    float c = cosf(0.5f * angle), sn = sinf(0.5f * angle);
+    float q0 = s->q0, q1 = s->q1, q2 = s->q2, q3 = s->q3;
+    s->q0 = c*q0 - sn*q3;
+    s->q1 = c*q1 - sn*q2;
+    s->q2 = c*q2 + sn*q1;
+    s->q3 = c*q3 + sn*q0;
+}
+
 // --------------------------------------------------------
 // PUBLIC API
 // --------------------------------------------------------
@@ -253,6 +279,43 @@ void madgwick_imu_update(MadgwickState *state,
     state->q1 = q1 * recip;
     state->q2 = q2 * recip;
     state->q3 = q3 * recip;
+}
+
+void madgwick_set_from_accel(MadgwickState *state, float ax, float ay, float az) {
+    float norm = sqrtf(ax*ax + ay*ay + az*az);
+    if (norm < NORM_EPSILON) return;
+
+    // The roll and pitch whose predicted gravity, (-sin p, sin r cos p,
+    // cos r cos p) — f1..f3 above without the measurement — matches the
+    // reading. Yaw is unobservable from gravity, so it starts at zero.
+    float roll  = atan2f(ay, az);
+    float pitch = atan2f(-ax, sqrtf(ay*ay + az*az));
+
+    float cr = cosf(0.5f * roll),  sr = sinf(0.5f * roll);
+    float cp = cosf(0.5f * pitch), sp = sinf(0.5f * pitch);
+    state->q0 =  cr * cp;
+    state->q1 =  sr * cp;
+    state->q2 =  cr * sp;
+    state->q3 = -sr * sp;
+}
+
+void madgwick_heading_update(MadgwickState *state, float mx, float my, float mz,
+                             float gain, float max_rate, float dt) {
+    float psi;
+    if (gain <= 0.0f || !field_heading(state, mx, my, mz, &psi)) return;
+
+    float step = -gain * psi * dt;          // turn the field back toward +x
+    float cap  = max_rate * dt;
+    if (step >  cap) step =  cap;
+    if (step < -cap) step = -cap;
+    rotate_about_vertical(state, step);
+}
+
+bool madgwick_align_heading(MadgwickState *state, float mx, float my, float mz) {
+    float psi;
+    if (!field_heading(state, mx, my, mz, &psi)) return false;
+    rotate_about_vertical(state, -psi);
+    return true;
 }
 
 void madgwick_get_euler(const MadgwickState *state, EulerAngles *euler) {
