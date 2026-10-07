@@ -51,7 +51,8 @@ uint32_t last_loop_time = 0;
 // state can never be the thing that blocks a deployment. What SW401
 // DOES drive in software: clearing the EEPROM "fired" flags for a new
 // flight, the STATE_IDLE<->STATE_ARMED display state, and the ARMED /
-// continuity-open buzzer feedback. See the arming-switch block in loop().
+// continuity-open buzzer feedback. See the arming-switch block in loop(),
+// and section 6 for the buzzer, which follows the ARM_SENSE level.
 //
 // These only track pad-rest edges for the accel bias calibration:
 // pad_still_prev — the pad-rest timer running (upright and still), which
@@ -82,6 +83,7 @@ static uint32_t arm_edge_ms   = 0;
 static bool     arm_now       = false;
 static bool     arm_prev      = false;
 static bool     seen_disarmed = false;   // latches once SW401 has read OFF since boot
+static bool     cont_open     = false;   // e-match read OPEN at the last arming edge — picks the buzzer pattern
 
 // White LED heartbeat — blinks for as long as the flight firmware is
 // running, so the build on the board is identifiable without a laptop.
@@ -293,7 +295,7 @@ void loop() {
             float pack_v  = read_pack_voltage();
             bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
             fsm_set_armed(&fsm, true);
-            buzzer_set(&buzz, cont_ok ? BUZZ_ARMED : BUZZ_CONT_OPEN);
+            cont_open = !cont_ok;
             Serial.print("[ARM] SW401 CLOSED — new flight armed. Continuity: ");
             Serial.print(cont_ok ? "OK" : "OPEN");
             Serial.print("  pack=");
@@ -308,7 +310,6 @@ void loop() {
         } else if (on_pad && !arm_now && arm_prev) {
             fsm_set_armed(&fsm, false);
             alt_ground_capture_cancel(&alt_est);
-            buzzer_off(&buzz);   // silent whenever disarmed
             Serial.println("[ARM] SW401 OPEN — disarmed.");
         }
         arm_prev = arm_now;
@@ -490,14 +491,12 @@ void loop() {
                 break;
             case STATE_LANDED:
                 servo_disable();
-                buzzer_set(&buzz, BUZZ_LOCATOR);
                 logger_finalize();
                 Serial.println("[INFO] Landed. Flight log written to SD.");
                 break;
             case STATE_ABORT:
                 pyro_safe_all(&pyros);
                 servo_center();
-                buzzer_off(&buzz);
                 break;
             default:
                 break;
@@ -540,6 +539,20 @@ void loop() {
     }
     pyro_update(&pyros);
     indicator_update(&indicator, fsm.state);
+
+    // Buzzer follows ARM_SENSE and nothing else: high (SW401 closed, pyro
+    // battery connected) → armed pattern, in every state, including a
+    // switch already closed at boot; low → silent. After landing the armed
+    // pattern becomes the locator. buzzer_set() is idempotent, so calling
+    // it every tick doesn't restart the pattern.
+    {
+        buzzer_pattern_t want = BUZZ_SILENT;
+        if (arm_now) {
+            if (fsm.state == STATE_LANDED) want = BUZZ_LOCATOR;
+            else                           want = cont_open ? BUZZ_CONT_OPEN : BUZZ_ARMED;
+        }
+        buzzer_set(&buzz, want);
+    }
     buzzer_update(&buzz);
     heartbeat_update(now_ms);
 

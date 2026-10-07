@@ -69,6 +69,7 @@ static uint32_t arm_edge_ms   = 0;
 static bool     arm_now       = false;
 static bool     arm_prev      = false;
 static bool     seen_disarmed = false;
+static bool     cont_open     = false;   // e-match read OPEN at the last arming edge — picks the buzzer pattern
 
 void setup() {
     Serial.begin(115200);
@@ -87,8 +88,11 @@ void setup() {
     Wire.begin();
     delay(100);
 
+    // The buzzer stays silent until SW401 arms — same rule as
+    // main_control_loop.cpp. A sensor-init fault blinks the red LED instead.
     buzzer_init(&buzz, &BUZZER_HAL_TEENSY, PIN_BUZZER, BUZZER_FREQ_HZ);
-    buzzer_set(&buzz, BUZZ_BOOT);
+    pinMode(PIN_LED_RED, OUTPUT);
+    digitalWrite(PIN_LED_RED, LOW);
     pyro_init(&pyros);
 
     // Sensor init before anything that could compete for power — see the
@@ -99,8 +103,10 @@ void setup() {
 
     if (!lsm6dsox_init()) {
         Serial.println("[FAULT] LSM6DSOX init failed — check SPI wiring");
-        buzzer_set(&buzz, BUZZ_SELFTEST_FAIL);
-        while (true) { buzzer_update(&buzz); delay(10); }
+        while (true) {
+            digitalWriteFast(PIN_LED_RED, ((millis() / 100) & 1) ? HIGH : LOW);
+            delay(10);
+        }
     }
     lsm6dsox_load_bias(&gyro_bias);
 
@@ -164,7 +170,6 @@ void setup() {
         wdt.begin(wdt_cfg);
     }
 
-    buzzer_set(&buzz, BUZZ_SELFTEST_PASS);
     Serial.println("FINNED RECOVERY FIRMWARE READY. Pyro ARMED. Waiting for launch.");
 }
 
@@ -181,8 +186,9 @@ void loop() {
     // ── ARMING SWITCH (SW401) ─────────────────────────────────
     // Lighter version of main_control_loop.cpp's block: this build has
     // no ARMED state, so all it does on a genuine new-flight arming edge
-    // is clear the fired flags, give an audible continuity check and
-    // start the launch ground-reference capture.
+    // is clear the fired flags, check continuity (which picks the buzzer
+    // pattern — see HOUSEKEEPING) and start the launch ground-reference
+    // capture.
     {
         bool arm_raw = read_arm_sense_v() > ARM_SENSE_ARMED_V;
         if (arm_raw != arm_raw_prev) { arm_edge_ms = now_ms; arm_raw_prev = arm_raw; }
@@ -196,7 +202,7 @@ void loop() {
             pyro_clear_fired(&pyros);
             float pack_v  = read_pack_voltage();
             bool  cont_ok = pyro_check_continuity(PIN_PYRO1_SENSE, pack_v);
-            buzzer_set(&buzz, cont_ok ? BUZZ_ARMED : BUZZ_CONT_OPEN);
+            cont_open = !cont_ok;
             Serial.print("[ARM] SW401 CLOSED — new flight armed. Continuity: ");
             Serial.println(cont_ok ? "OK" : "OPEN");
 
@@ -206,7 +212,6 @@ void loop() {
             Serial.println("[ALT] Capturing launch ground reference — hold still...");
         } else if (on_pad && !arm_now && arm_prev) {
             alt_ground_capture_cancel(&alt_est);
-            buzzer_set(&buzz, BUZZ_IDLE);
             Serial.println("[ARM] SW401 OPEN — disarmed.");
         }
         arm_prev = arm_now;
@@ -283,7 +288,6 @@ void loop() {
     if (simple_fsm_state_changed(&fsm)) {
         switch (fsm.state) {
             case SIMPLE_STATE_LANDED:
-                buzzer_set(&buzz, BUZZ_LOCATOR);
                 logger_finalize();
                 Serial.println("[INFO] Landed. Flight log written.");
                 break;
@@ -294,6 +298,18 @@ void loop() {
 
     // ── HOUSEKEEPING ──────────────────────────────────────────
     pyro_update(&pyros);
+
+    // Buzzer follows ARM_SENSE and nothing else — see the matching block in
+    // main_control_loop.cpp: high → armed pattern (locator once landed),
+    // low → silent.
+    {
+        buzzer_pattern_t want = BUZZ_SILENT;
+        if (arm_now) {
+            if (fsm.state == SIMPLE_STATE_LANDED) want = BUZZ_LOCATOR;
+            else                                  want = cont_open ? BUZZ_CONT_OPEN : BUZZ_ARMED;
+        }
+        buzzer_set(&buzz, want);
+    }
     buzzer_update(&buzz);
 
     // ── LOGGING ───────────────────────────────────────────────
