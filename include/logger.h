@@ -8,20 +8,35 @@
 // CONFIG
 // --------------------------------------------------------
 
-// The GD25Q128 NOR flash is not used for flight logging. Flight data is held
-// in a RAM ring buffer in flight, then dumped to the SD card (FLIGHT_XXX.CSV)
-// when logger_finalize() runs.
-// If the SD card isn't present or its init failed, the RAM buffer is the
-// only copy of the data — logger_finalize() falls back to streaming it as
-// CSV over USB serial instead of silently discarding it, and
+// Every record goes into a RAM ring buffer. From liftoff confirmation
+// (with the LOG_FLASH_PRELAUNCH_RECORDS before it) the records are also
+// streamed to the GD25Q128 flash, which survives a reset or a power loss.
+// On landing, logger_finalize() copies the flight to the SD card
+// (FLIGHT_XXX.CSV) — from flash when it holds the flight, otherwise from
+// the RAM buffer. A flight left in flash but not yet on the SD card (power
+// lost before landing, no card) is copied at the next boot.
+// With no SD card, the data streams as CSV over USB serial instead, and
 // logger_usb_dump() does the same thing on demand.
 
-// RAM ring buffer — absorbs high-rate writes during flight.
+// RAM ring buffer — every record, and the queue feeding the flash.
 // 4000 records × sizeof(LogRecord) bytes. DMAMEM places this in OCRAM2.
 // At 125 Hz this covers ~32 s; once full, the oldest records are
-// overwritten (ring buffer), so only the most recent ~32 s survive to
-// logger_finalize() if the flight runs longer than that.
+// overwritten. It's the whole flight log only when the flash is down.
 #define LOG_RAM_CAPACITY    4000
+
+// Flash flight-log region, clear of the bench test's scratch areas (Test 4
+// at 0x010000, Test 5 staging from 0x100000). 4 MB holds ~4 minutes at
+// 125 Hz. Page 0 is a header; records are packed two per 256-byte page.
+#define LOG_FLASH_BASE      0x200000u
+#define LOG_FLASH_SIZE      0x400000u
+
+// Records from before liftoff confirmation copied into the flash log too,
+// so it includes the pad and the launch trigger: 5 s at 125 Hz.
+#define LOG_FLASH_PRELAUNCH_RECORDS  625
+
+// Blocks erased in the background once the switch arms the pad, so liftoff
+// doesn't start with erases (only when the previous flight is safe on SD).
+#define LOG_FLASH_PREERASE_BYTES     0x100000u
 
 // --------------------------------------------------------
 // LOG RECORD — packed fixed-width struct
@@ -65,12 +80,22 @@ typedef struct __attribute__((packed)) {
 // --------------------------------------------------------
 
 /**
- * Initialise the logger: bring up the SD card and pick the next free
+ * Initialise the logger: bring up the SD card and the flash, copy a flight
+ * still waiting in flash to the card, and pick the next free
  * FLIGHT_XXX.CSV / FLIGHT_XXX.LOG filename pair.
  * @return true if the SD card is ready; false if SD.begin() failed
- *         (logging still works, but nothing will be saved).
+ *         (logging still works — to flash when it's up — but nothing
+ *         reaches the card this session).
  */
 bool logger_init();
+
+/**
+ * After a mid-flight watchdog reset, instead of logger_init(): bring the
+ * flash back up and keep appending to the flight already in it. Skips the
+ * SD card (its init can block for seconds); logger_finalize() then leaves
+ * the flight in flash, and the next normal boot copies it to the card.
+ */
+void logger_resume();
 
 /**
  * Register a function called once per CSV row during logger_finalize()
@@ -80,8 +105,9 @@ bool logger_init();
 void logger_set_keepalive(void (*keepalive)());
 
 /**
- * Store one record in the RAM ring buffer. Never touches the SD card,
- * never blocks. Call every loop iteration.
+ * Store one record in the RAM ring buffer and move the flash log along —
+ * at most one non-blocking flash operation per call. Never touches the SD
+ * card, never blocks. Call every loop iteration.
  */
 void logger_write(const LogRecord *rec);
 
@@ -89,20 +115,24 @@ void logger_write(const LogRecord *rec);
  * Append a state-transition checkpoint line directly to the SD .LOG file.
  * Call on every FSM state change. State changes are infrequent, so the
  * SD write here is fine, and it survives a power loss before finalize().
+ * Also drives the flash log: ARMED starts the background pre-erase,
+ * POWERED starts recording the flight.
  */
 void logger_checkpoint(FlightState state, float altitude_m);
 
 /**
- * Dump the RAM ring buffer to the SD .CSV file, oldest record first, and
- * close it out. Call on landing. Idempotent — a second call is a no-op.
- * Falls back to logger_usb_dump() if the SD card isn't ready or the file
- * can't be opened, so a failed card never means lost data.
+ * Close out the flight: finish writing it to flash, then copy it to the
+ * SD .CSV file, oldest record first — from flash when it holds the flight,
+ * otherwise from the RAM buffer. Call on landing. Idempotent — a second
+ * call is a no-op. Falls back to logger_usb_dump() if the SD card isn't
+ * ready or the file can't be opened, so a failed card never means lost data.
  */
 void logger_finalize();
 
 /**
- * Stream the RAM ring buffer as CSV directly over USB serial, between
- * "-----BEGIN FLIGHT CSV-----" / "-----END FLIGHT CSV-----" markers.
+ * Stream the flight as CSV directly over USB serial, between
+ * "-----BEGIN FLIGHT CSV-----" / "-----END FLIGHT CSV-----" markers — the
+ * flight in flash if there is one, otherwise the RAM ring buffer.
  * Use this to retrieve flight data when there's no SD card, or to inspect
  * it without pulling the card. Safe to call any time; not gated by
  * logger_finalize()'s idempotence, so it can be called repeatedly.

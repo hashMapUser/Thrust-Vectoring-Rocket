@@ -128,18 +128,28 @@ st = T.flight_state;
 st(isnan(st)) = 0;
 d.state = round(st);
 
+% A mid-flight watchdog reset restarts the flight computer's clock, and the
+% flash log carries on after it: keep time running forward across the jump.
+% (The ~1 s the reboot took isn't in the log, so it's left out.)
+ts = T.timestamp_ms;
+jumps = find(diff(ts) < -1000);
+for j = jumps'
+    ts(j + 1:end) = ts(j + 1:end) + (ts(j) - ts(j + 1)) + 8;
+end
+d.resets = numel(jumps);
+
 % Time from liftoff confirmation (first POWERED record), or from the first
 % record if the log has no flight in it.
 iLaunch = find(d.state == 2, 1);
 d.has_launch = ~isempty(iLaunch);
 if d.has_launch
-    t0 = T.timestamp_ms(iLaunch);
+    t0 = ts(iLaunch);
     d.tlabel = 'Time from liftoff [s]';
 else
-    t0 = T.timestamp_ms(1);
+    t0 = ts(1);
     d.tlabel = 'Time [s]';
 end
-d.t = (T.timestamp_ms - t0) / 1000;
+d.t = (ts - t0) / 1000;
 
 dt = [0; diff(d.t)];
 ok = dt > 0 & dt < 1;
@@ -268,6 +278,10 @@ fprintf('\n=== %s ===\n', label);
 fprintf('  %d records over %.1f s (%.0f Hz)\n', d.n, d.t(end) - d.t(1), 1 / median(d.dt));
 if ~d.has_launch
     fprintf('  No liftoff in this log (flight_state never reached POWERED) - times are from the first record.\n');
+end
+if d.resets > 0
+    fprintf('  The flight computer restarted %d time(s) during this log (watchdog reset) - time is\n', d.resets);
+    fprintf('  joined across it; the ~1 s each reboot took is missing.\n');
 end
 [v, i] = max(d.alt);   fprintf('  Max altitude        %8.1f m     at T%+.2f s\n', v, d.t(i));
 [v, i] = max(d.vel);   fprintf('  Max vertical speed  %8.1f m/s   at T%+.2f s\n', v, d.t(i));

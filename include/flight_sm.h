@@ -41,6 +41,15 @@
 #define PAD_REST_GYRO_DPS          5.0f
 #define PAD_REST_ACCEL_UP_G        0.85f  // vehicle must be vertical
 
+// Once latched, pad rest is only dropped after a disturbance lasts this
+// long. A launch passes through "not at rest" too: thrust ramps the
+// accelerometer through 1.1-1.8 g for ~120 ms (F-15) before it crosses
+// LAUNCH_ACCEL_THRESHOLD_G, and ignition shakes the gyro. Dropping the
+// latch on the first such tick disarmed launch detection for good — found
+// by the bench simulation. Handling the rocket lasts longer than this; a
+// knock that does pass the threshold is still rejected by the altitude check.
+#define PAD_REST_LOSS_MS           500
+
 // G3 — Flight-proof velocity latch. All simulated cases (weak motor to
 // heavy) peak between 16 and 24 m/s, so 25 was unreachable — set below
 // the weakest case with margin.
@@ -66,11 +75,21 @@
 // entry-relative timeout would ever fire.
 #define APOGEE_TIMEOUT_FROM_LAUNCH_MS   7000
 
-// Landing detection
+// Landing detection — all must hold for LANDED_TIME_MS: accel ~1 g, gyro
+// quiet, AND vertical speed near zero. Under a main chute that barely
+// swings, accel also reads ~1 g and the gyro stays quiet, so stillness
+// alone would call touchdown mid-air; the speed check rules that out.
 #define LANDED_ACCEL_LOW_G         0.75f
 #define LANDED_ACCEL_HIGH_G        1.35f
 #define LANDED_GYRO_THRESHOLD_DPS  10.0f
+#define LANDED_VELOCITY_MS         2.0f    // |vertical speed| below this (descent under the main is ~4.5 m/s)
 #define LANDED_TIME_MS             5000
+
+// Backstop, measured from liftoff: by now any flight is down. Stillness
+// alone is then enough (a dead baro leaves the speed estimate drifting),
+// and with a dead IMU, where stillness can't be judged, nothing else is
+// needed. Without it those flights would never close out their log.
+#define LANDED_FALLBACK_MS         120000
 
 // --------------------------------------------------------
 // STATES
@@ -117,10 +136,14 @@ typedef struct {
     // detection directly — no arm step in between)
     bool     pad_rest_satisfied;
     uint32_t pad_rest_start_ms;
+    bool     pad_rest_unsettled;       // latched, but disturbed since pad_rest_unsettled_ms
+    uint32_t pad_rest_unsettled_ms;
     float    pad_rest_baseline_alt_m;  // launch baseline: the armed ground reference once captured, else the altitude snapshot at pad-rest latch
     bool     baseline_from_arm;        // set by fsm_set_launch_baseline(); pad-rest latches stop overwriting the baseline
 
-    // Fault flags
+    // Fault flags. imu_fault latches on an invalid IMU reading: TVC goes
+    // off, and so does velocity-based apogee (the velocity is integrated
+    // accel) — the baro-drop and launch-timeout backstops still run.
     bool     imu_fault;
 
     // Set by fsm_resume() after a mid-flight watchdog reset. The velocity

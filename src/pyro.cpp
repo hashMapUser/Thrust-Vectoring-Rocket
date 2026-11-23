@@ -2,6 +2,14 @@
 #include <EEPROM.h>
 #include "pyro.h"
 
+// Energise a fire channel. The bench simulation build never does: it only
+// reports what would have fired, so a sim run can't set off an e-match.
+#ifdef SIM_MODE
+#define PYRO_PIN_FIRE(pin) Serial.printf("[SIM] Pyro pin %d NOT driven (simulation build)\n", (int)(pin))
+#else
+#define PYRO_PIN_FIRE(pin) digitalWrite((pin), HIGH)
+#endif
+
 // --------------------------------------------------------
 // PRIVATE — EEPROM helpers
 // --------------------------------------------------------
@@ -85,7 +93,7 @@ void pyro_fire_drogue(PyroState *pyro) {
     if (!pyro->drogue_armed) { Serial.println("[PYRO] Drogue fire blocked — not armed"); return; }
     if (pyro->drogue_fired)  { Serial.println("[PYRO] Drogue already fired"); return; }
 
-    digitalWrite(PIN_PYRO2_FIRE, HIGH);
+    PYRO_PIN_FIRE(PIN_PYRO2_FIRE);
     pyro->drogue_firing        = true;
     pyro->drogue_fire_start_ms = millis();
     pyro->drogue_fired         = true;
@@ -102,7 +110,7 @@ void pyro_fire_main(PyroState *pyro, float altitude_m) {
         return;
     }
 
-    digitalWrite(PIN_PYRO1_FIRE, HIGH);
+    PYRO_PIN_FIRE(PIN_PYRO1_FIRE);
     pyro->main_firing        = true;
     pyro->main_fire_start_ms = millis();
     pyro->main_fired         = true;

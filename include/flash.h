@@ -25,6 +25,7 @@
 // --------------------------------------------------------
 #define FLASH_PAGE_SIZE     256u
 #define FLASH_SECTOR_SIZE   4096u
+#define FLASH_BLOCK_SIZE    65536u
 #define FLASH_TOTAL_BYTES   (16u * 1024u * 1024u)
 
 // --------------------------------------------------------
@@ -67,3 +68,25 @@ void flash_erase_chip();
  * that need to verify the chip is idle before a time-critical operation.
  */
 void flash_wait_ready();
+
+// --------------------------------------------------------
+// Non-blocking operations — for the flight loop, which can't wait out an
+// erase. Start one, then check flash_busy() on later ticks before starting
+// the next; the chip ignores new commands while it's busy.
+// --------------------------------------------------------
+
+/** True while a program or erase is still running (STATUS1 WIP). */
+bool flash_busy();
+
+/**
+ * Start programming up to 256 bytes into one page and return at once
+ * (~0.6 ms typical to complete). The chip must be idle. Same page-wrap
+ * rule as flash_page_program().
+ */
+void flash_page_program_start(uint32_t addr, const uint8_t *data, uint16_t len);
+
+/**
+ * Start erasing the 64 KB block that contains `addr` and return at once
+ * (~150 ms typical to complete). The chip must be idle.
+ */
+void flash_erase_block_start(uint32_t addr);

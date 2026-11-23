@@ -38,6 +38,7 @@ static void update_pad_rest(FlightSM *fsm, float accel_mag_g, float gyro_rate_dp
     bool upright_ok = (accel_up_g    > PAD_REST_ACCEL_UP_G);
 
     if (accel_ok && gyro_ok && upright_ok) {
+        fsm->pad_rest_unsettled = false;
         if (fsm->pad_rest_start_ms == 0) {
             fsm->pad_rest_start_ms = now;
             Serial.println("[FSM] Pad rest timer started...");
@@ -54,11 +55,21 @@ static void update_pad_rest(FlightSM *fsm, float accel_mag_g, float gyro_rate_dp
             pad_rest_led_off_ms = now + PAD_REST_LED_FLASH_MS;
         }
     } else {
+        // Latched: hold on through a short disturbance — it may be the
+        // launch itself on its way up to the threshold (PAD_REST_LOSS_MS).
+        if (fsm->pad_rest_satisfied) {
+            if (!fsm->pad_rest_unsettled) {
+                fsm->pad_rest_unsettled    = true;
+                fsm->pad_rest_unsettled_ms = now;
+            }
+            if (now - fsm->pad_rest_unsettled_ms < PAD_REST_LOSS_MS) return;
+        }
         if (fsm->pad_rest_start_ms != 0 || fsm->pad_rest_satisfied) {
             Serial.println("[FSM] Pad rest LOST (movement detected). Resetting latch.");
         }
         fsm->pad_rest_start_ms  = 0;
         fsm->pad_rest_satisfied = false;
+        fsm->pad_rest_unsettled = false;
     }
 }
 
@@ -80,6 +91,8 @@ void fsm_init(FlightSM *fsm) {
     fsm->tvc_enabled             = false;
     fsm->pad_rest_satisfied      = false;
     fsm->pad_rest_start_ms       = 0;
+    fsm->pad_rest_unsettled      = false;
+    fsm->pad_rest_unsettled_ms   = 0;
     fsm->pad_rest_baseline_alt_m = 0.0f;
     fsm->baseline_from_arm       = false;
     fsm->imu_fault               = false;
@@ -260,7 +273,12 @@ void fsm_update(FlightSM *fsm,
                 bool gate = (fsm->peak_velocity_ms > MIN_FLIGHT_VELOCITY_MS) &&
                             (fsm_time_in_state(fsm) >= COAST_APOGEE_MIN_MS);
 
-                bool vel_apogee  = gate && !fsm->resumed && (velocity_ms <= 0.0f);   // level, not edge-triggered
+                // Velocity is integrated accel: not trusted after a reset (it
+                // restarted from zero) or an IMU fault (a dead chip feeds it
+                // zeros or a frozen reading, which can cross zero mid-burn).
+                // The baro-drop and timeout backstops still run.
+                bool vel_ok      = !fsm->resumed && !fsm->imu_fault;
+                bool vel_apogee  = gate && vel_ok && (velocity_ms <= 0.0f);   // level, not edge-triggered
                 bool baro_apogee = gate && ((fsm->peak_altitude_m - altitude_m) >= APOGEE_BARO_DROP_M);
                 bool timeout     = (since_launch >= APOGEE_TIMEOUT_FROM_LAUNCH_MS);   // no extra gates
 
@@ -290,14 +308,19 @@ void fsm_update(FlightSM *fsm,
                 bool accel_ok = (accel_mag_g >= LANDED_ACCEL_LOW_G &&
                                  accel_mag_g <= LANDED_ACCEL_HIGH_G);
                 bool gyro_ok  = (gyro_rate_dps < LANDED_GYRO_THRESHOLD_DPS);
+                bool still    = !fsm->imu_fault && accel_ok && gyro_ok;
+                bool slow     = fabsf(velocity_ms) < LANDED_VELOCITY_MS;
+                bool late     = (now - fsm->powered_entry_ms) >= LANDED_FALLBACK_MS;
+                bool down     = late ? (still || fsm->imu_fault) : (still && slow);
 
-                if (accel_ok && gyro_ok) {
+                if (down) {
                     if (fsm_time_in_state(fsm) >= LANDED_TIME_MS) {
-                        Serial.println("[FSM] >> TOUCHDOWN CONFIRMED.");
+                        Serial.println(late ? "[FSM] >> TOUCHDOWN CONFIRMED (fallback: time since liftoff)."
+                                            : "[FSM] >> TOUCHDOWN CONFIRMED.");
                         enter_state(fsm, STATE_LANDED);
                     }
                 } else {
-                    fsm->state_entry_ms = now;  
+                    fsm->state_entry_ms = now;   // restart the LANDED_TIME_MS hold
                 }
             }
             break;

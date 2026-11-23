@@ -25,7 +25,13 @@
 #define PYRO_MAIN_MIN_ALT_M   0.0f
 
 // EEPROM — persist fired flags across brownouts so a reset cannot re-arm a spent channel.
+#ifdef SIM_MODE
+// Bench simulation build: its own slot, so simulated flights never touch
+// the flight firmware's fired flags. (sim_hil.h keeps its record at 240.)
+#define PYRO_EEPROM_ADDR      230
+#else
 #define PYRO_EEPROM_ADDR      30   // bytes 30-33 (after gyro bias at 10-23, before mag calib at 40 — see mag_calib.h)
+#endif
 #define PYRO_EEPROM_MAGIC     0xF1A5u
 
 // --------------------------------------------------------

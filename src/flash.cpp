@@ -7,6 +7,7 @@
 #define CMD_PAGE_PROGRAM    0x02
 #define CMD_READ_DATA       0x03
 #define CMD_SECTOR_ERASE    0x20   // 4 KB
+#define CMD_BLOCK_ERASE     0xD8   // 64 KB
 #define CMD_CHIP_ERASE      0xC7
 #define CMD_READ_STATUS1    0x05
 #define CMD_JEDEC_ID        0x9F
@@ -128,4 +129,43 @@ void flash_erase_chip() {
     cs_high();
     SPI2.endTransaction();
     flash_wait_ready();
+}
+
+// --------------------------------------------------------
+// Non-blocking operations
+// --------------------------------------------------------
+
+bool flash_busy() {
+    SPI2.beginTransaction(kCfg);
+    cs_low();
+    SPI2.transfer(CMD_READ_STATUS1);
+    uint8_t status = SPI2.transfer(0x00);
+    cs_high();
+    SPI2.endTransaction();
+    return (status & STATUS_WIP) != 0;
+}
+
+void flash_page_program_start(uint32_t addr, const uint8_t *data, uint16_t len) {
+    write_enable();
+    SPI2.beginTransaction(kCfg);
+    cs_low();
+    SPI2.transfer(CMD_PAGE_PROGRAM);
+    SPI2.transfer((addr >> 16) & 0xFF);
+    SPI2.transfer((addr >>  8) & 0xFF);
+    SPI2.transfer((addr >>  0) & 0xFF);
+    SPI2.transfer(data, nullptr, len);   // bulk transfer — ~4x faster than byte by byte
+    cs_high();
+    SPI2.endTransaction();
+}
+
+void flash_erase_block_start(uint32_t addr) {
+    write_enable();
+    SPI2.beginTransaction(kCfg);
+    cs_low();
+    SPI2.transfer(CMD_BLOCK_ERASE);
+    SPI2.transfer((addr >> 16) & 0xFF);
+    SPI2.transfer((addr >>  8) & 0xFF);
+    SPI2.transfer((addr >>  0) & 0xFF);
+    cs_high();
+    SPI2.endTransaction();
 }

@@ -21,6 +21,10 @@ extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
 #include "telemetry.h"
 #include "flight_resume.h"
 
+#ifdef SIM_MODE
+#include "sim_hil.h"   // bench simulation build only — see platformio.ini [env:flight_sim]
+#endif
+
 // Forward declarations for mahrs_integration.cpp
 struct RocketAttitude { float tip_a; float tip_b; float spin; };
 void mahrs_init();
@@ -165,6 +169,49 @@ static void track_gyro_bias(const LSM6DSOX_Data *d, uint32_t now_ms, float dt) {
 // Last time the flight record was refreshed — see flight_resume.h.
 static uint32_t resume_saved_ms = 0;
 
+// Configure the RTWDOG (WDT3) directly instead of with WDT_T4's begin().
+// begin() always turns window mode on — its constrain() lifts the default
+// window = 0 up to 1/32 ms before testing it — and in window mode a feed
+// that comes too soon after the previous one resets the chip on the spot
+// (seen on the bench: back-to-back feeds rebooted the board). Code here
+// feeds in tight loops — the logger's flash/SD keepalive, the gyro
+// calibration — so: no window, and any feed is valid.
+// wdt.feed() writes the refresh key straight to the hardware, so it's
+// unaffected. The clock is the 32 kHz LPO; past 2 s the /256 prescaler.
+#define RTWDOG_CS_UPDATE   (1u << 5)
+#define RTWDOG_CS_EN       (1u << 7)
+#define RTWDOG_CS_CLK_LPO  (1u << 8)
+#define RTWDOG_CS_RCS      (1u << 10)
+#define RTWDOG_CS_ULK      (1u << 11)
+#define RTWDOG_CS_PRES     (1u << 12)
+#define RTWDOG_CS_CMD32EN  (1u << 13)
+#define RTWDOG_CS_FLG      (1u << 14)
+
+static void watchdog_start(uint32_t timeout_ms) {
+    CCM_CCGR5 |= CCM_CCGR5_WDOG3(CCM_CCGR_ON);   // register clock
+    uint32_t ticks = timeout_ms * 32u;
+    bool     pres  = ticks > 0xFFFFu;
+    if (pres) ticks /= 256u;
+    if (ticks > 0xFFFFu) ticks = 0xFFFFu;
+    if (ticks == 0)      ticks = 1;
+
+    __disable_irq();
+    if (WDOG3_CS & RTWDOG_CS_CMD32EN) {
+        WDOG3_CNT = 0xD928C520;                    // unlock
+    } else {
+        volatile uint16_t *cnt16 = (volatile uint16_t *)(IMXRT_WDOG3_ADDRESS + 4);
+        *cnt16 = 0xC520;
+        *cnt16 = 0xD928;
+    }
+    for (int i = 0; i < 10000 && !(WDOG3_CS & RTWDOG_CS_ULK); i++) {}
+    WDOG3_WIN   = 0;
+    WDOG3_TOVAL = ticks;
+    WDOG3_CS    = RTWDOG_CS_CMD32EN | RTWDOG_CS_CLK_LPO | RTWDOG_CS_UPDATE | RTWDOG_CS_EN |
+                  RTWDOG_CS_FLG | (pres ? RTWDOG_CS_PRES : 0);
+    for (int i = 0; i < 10000 && !(WDOG3_CS & RTWDOG_CS_RCS); i++) {}   // new config in effect
+    __enable_irq();
+}
+
 void setup() {
     // A watchdog reset in the air must get back to the control loop fast,
     // so the slow boot steps (USB wait, SD init, 1.3 s baro average) are
@@ -172,6 +219,15 @@ void setup() {
     bool         wdt_boot = resume_boot_was_watchdog();
     ResumeRecord resume;
     bool         resuming = wdt_boot && resume_load(&resume);
+
+    // 0. BOOT WATCHDOG — guard setup() itself against a hang, with a
+    // timeout long enough for a ground boot (USB wait, SD card, copying a
+    // flight out of flash, the 1.3 s baro average). A resume skips the slow
+    // steps, so it gets a short one: a hang there must recover quickly.
+    // Section 7 tightens it to 500 ms for the loop. See watchdog_start()
+    // for why this doesn't use WDT_T4's begin().
+    watchdog_start(resuming ? 3000 : 30000);
+    logger_set_keepalive([] { wdt.feed(); });   // long SD/flash copies feed it per row
 
     Serial.begin(115200);
     if (!wdt_boot) {
@@ -257,6 +313,7 @@ void setup() {
         // drops TVC and still runs the baro/timeout recovery path.
         if (!resuming) while (true) {
             digitalWriteFast(PIN_LED_RED, ((millis() / 100) & 1) ? HIGH : LOW);
+            wdt.feed();   // a deliberate halt on the pad, not a hang — stay here
             delay(10);
         }
     }
@@ -264,10 +321,11 @@ void setup() {
 
     servo_init();
 
-    // 4. LOGGER — skipped on a resume: SD init can block for seconds on a
-    // bad card. Logging still goes to RAM, and logger_finalize() falls
-    // back to a USB dump.
+    // 4. LOGGER — on a resume, only the flash comes back up (SD init can
+    // block for seconds on a bad card): the flight keeps appending to the
+    // flash log, and the next normal boot copies it to the card.
     if (!resuming) logger_init();
+    else           logger_resume();
 
     // 5. ALTITUDE ESTIMATOR INIT
     // Boot ground reference, averaged over ALT_GROUND_SAMPLES fresh baro
@@ -350,16 +408,16 @@ void setup() {
     pid_init(&pid_pitch, SERVO_PITCH_MAX_ANGLE_DEG);
     pid_init(&pid_yaw,   SERVO_YAW_MAX_ANGLE_DEG);
 
-    // 7. WATCHDOG — 500 ms timeout; fed every loop iteration.
+#ifdef SIM_MODE
+    sim_after_setup(&pyros, resuming);   // EEPROM write + menu: before the 500 ms window starts
+#endif
+
+    // 7. WATCHDOG — tightened to 500 ms, the last step before the loop,
+    // which feeds it every iteration.
     // On watchdog reset, setup() runs again: pyro pins go LOW first via
     // pyro_init(), servos centre via servo_init(), and the FSM resumes the
     // flight if one was in progress (see flight_resume.h).
-    {
-        WDT_timings_t wdt_cfg;
-        wdt_cfg.timeout = 500;   // ms — WDT3 (RTWDOG) takes milliseconds, not seconds
-        wdt.begin(wdt_cfg);
-    }
-    logger_set_keepalive([] { wdt.feed(); });
+    watchdog_start(500);
 
     Serial.println("FLIGHT COMPUTER READY. PYRO ARMED. WAITING FOR LAUNCH.");
 }
@@ -460,6 +518,11 @@ void loop() {
             // number of times, as long as power hasn't been lost.
             logger_usb_dump();
         }
+#ifdef SIM_MODE
+        else {
+            sim_command(c);   // scenario select, launch, reboot — see sim_hil.h
+        }
+#endif
     }
 
     // ── 2. SENSOR INGESTION ───────────────────────────────────
@@ -688,6 +751,10 @@ void loop() {
     }
     buzzer_update(&buzz);
     heartbeat_update(now_ms);
+
+#ifdef SIM_MODE
+    sim_observe(&fsm, pyros.main_fired, alt_est.altitude_m);   // deploys the simulated chute, grades the run
+#endif
 
     // ── 6b. BENCH TELEMETRY ───────────────────────────────────
     // One $TLM frame every TLM_DIVIDER ticks while the stream is on.

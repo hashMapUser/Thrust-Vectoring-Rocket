@@ -10,6 +10,14 @@
 #define RESUME_MAGIC        0xA7u
 #define RESUME_F_PROVEN     0x01u
 
+// The SNVS keeps its general-purpose registers zeroized — they read back 0
+// and writes don't stick — unless LPCR[GPR_Z_DIS] is set. Measured on the
+// bench: without it every resume_save() was lost, and a watchdog reset in
+// flight came back up "on the ground" and never fired the chute. LPCR is in
+// the always-on domain, so once set it holds across resets until power-off.
+// (SNVS_LPCR_GPR_Z_DIS is bit 24, from the Teensy core's imxrt.h.)
+static inline void gpr_enable() { SNVS_LPCR |= SNVS_LPCR_GPR_Z_DIS; }
+
 static uint32_t float_bits(float f)  { uint32_t u; memcpy(&u, &f, 4); return u; }
 static float    bits_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
@@ -29,6 +37,7 @@ bool resume_boot_was_watchdog() {
 }
 
 bool resume_load(ResumeRecord *out) {
+    gpr_enable();
     uint32_t w0 = SNVS_LPGPR0, w1 = SNVS_LPGPR1, w2 = SNVS_LPGPR2, w3 = SNVS_LPGPR3;
 
     if ((w0 >> 24) != RESUME_MAGIC) return false;
@@ -56,6 +65,7 @@ void resume_save(const ResumeRecord *rec) {
 
     // Payload first, header last: a reset between the writes leaves a
     // header whose checksum doesn't match, which resume_load() rejects.
+    gpr_enable();
     SNVS_LPGPR1 = w1;
     SNVS_LPGPR2 = w2;
     SNVS_LPGPR3 = w3;
