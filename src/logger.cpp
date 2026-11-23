@@ -8,8 +8,7 @@
 //                     LOG_RAM_CAPACITY records (~32 s at 125 Hz); older
 //                     records are overwritten once the buffer wraps.
 //
-//  GD25Q128 flash    : Not used. This board's flash is wired incorrectly
-//                     and cannot be read or written.
+//  GD25Q128 flash    : Not used.
 //
 //  SD card           : Written at two points only —
 //                       1. A checkpoint text line on every FSM state

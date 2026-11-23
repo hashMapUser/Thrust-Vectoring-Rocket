@@ -19,6 +19,7 @@
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
 //    8 — SD diagnostics (line/bridge checks, card init stage by stage)
+//    9 — Flash diagnostics (line/bridge checks, pinout search, SPI speed sweep)
 //    H — Barometer lift-height test (averaged baseline, lift prompt, 2.5 s delay, averaged delta)
 //    I — IMU tilt -> gimbal response (IMU init + noise removal; rock each axis while the gimbal answers as in flight, Y/N moves on)
 //    M — Magnetometer calibration (rotate ~50 s, then 'Y' to save to EEPROM)
@@ -83,7 +84,7 @@ static SdFs _bench_sd;
 #define FCMD_READ_DATA      0x03
 #define FSTATUS_WIP         (1u << 0)
 
-#define FLASH_SPI_FREQ      40000000UL
+#define FLASH_SPI_FREQ      10000000UL  // keep equal to GD25Q128_SPI_FREQ (flash.h)
 #define FLASH_SPI_MODE      SPI_MODE0
 #define FLASH_TEST_ADDR     0x010000u   // block 1 — well away from logger's sector 0/1
 
@@ -484,6 +485,7 @@ static void test_flash() {
         Serial.println(F("    - WP# and HOLD# pins pulled HIGH via 10k to 3.3V?"));
         Serial.println(F("    - SPI MODE0, MSBFIRST?"));
         Serial.println(F("    - 3.3V on VCC?"));
+        Serial.println(F("  Run 9 (flash diagnostics) to narrow it down."));
         return;
     }
     pass("JEDEC ID correct — GD25Q128 found");
@@ -578,7 +580,9 @@ static void test_flash() {
 //  3. Capture SD_BENCH_RECORDS LogRecords at 125 Hz. Each sensor that
 //     initialises gives real readings; any that doesn't is filled with
 //     synthetic data. The imu/baro/mag_valid CSV columns say which:
-//     1 = real reading, 0 = synthetic.
+//     1 = real reading, 0 = synthetic. For the baro, 0 also marks a row
+//     with no new reading (it makes 75 a second against 125 rows), which
+//     repeats the previous real one.
 //  4. Stage the records in the GD25Q128 flash if it passes a write/
 //     readback probe, otherwise in a Teensy RAM buffer.
 //  5. Transfer staging → BENCH_SD.CSV on the card, then re-open the
@@ -678,17 +682,27 @@ static void sd_bench_fill(LogRecord *r, uint16_t i, bool imu_ok, bool baro_ok,
         r->ax = 0.0f; r->ay = 0.0f; r->az = 1.0f;
     }
 
+    // The baro makes 75 readings/s against 125 rows/s, so ~40% of rows get
+    // no fresh sample. Those repeat the last reading with baro_valid = 0,
+    // the same meaning as in the flight log. Synthetic data only if the
+    // sensor never came up.
+    static float held_hpa = NAN, held_temp_c = NAN;
+    if (i == 0) held_hpa = held_temp_c = NAN;
     LPS22HB_Data baro = {};
     if (baro_ok) lps22hb_read(&baro);
     if (baro_ok && baro.valid) {
-        r->temperature_c = baro.temperature_c;
-        r->pressure_hpa  = baro.pressure_pa / 100.0f;
-        r->baro_valid    = true;
+        held_hpa      = baro.pressure_pa / 100.0f;
+        held_temp_c   = baro.temperature_c;
+        r->baro_valid = true;
+    }
+    if (baro_ok) {
+        r->temperature_c = held_temp_c;
+        r->pressure_hpa  = held_hpa;
     } else {
         r->temperature_c = 22.5f;
         r->pressure_hpa  = 1013.25f - 0.5f * t;    // ~4 m/s synthetic climb
     }
-    if (i == 0) *p0_hpa = r->pressure_hpa;
+    if (isnan(*p0_hpa)) *p0_hpa = r->pressure_hpa;  // first reading is altitude zero
     r->altitude_m = 44330.0f * (1.0f - powf(r->pressure_hpa / *p0_hpa, 0.1902949f));
 
     mag_data m = {};
@@ -757,7 +771,7 @@ static void test_sd() {
     Serial.print(F("  Capturing ")); Serial.print(SD_BENCH_RECORDS);
     Serial.println(F(" records at 125 Hz..."));
 
-    float p0_hpa = 1013.25f;
+    float p0_hpa = NAN;   // set from the first pressure in sd_bench_fill()
     uint32_t sum_wr = 2166136261u;
     uint32_t next_us = micros();
     for (uint16_t i = 0; i < SD_BENCH_RECORDS; i++) {
@@ -841,8 +855,9 @@ static void test_sd() {
 //      pull-up, then pull-down. A line that reads LOW against the pull-up
 //      is held down: bridged to GND at the socket, something unpowered on
 //      the net, or a damaged Teensy pin. One that reads HIGH against the
-//      pull-down is held up — the board has no SD pull-ups, so that's a
-//      bridge to 3.3 V.
+//      pull-down is held up: a bridge to 3.3 V, or a pull-up on the board.
+//      With the card out, CS is left undriven so a line bridged to CS
+//      doesn't read as held up — the bridge check finds that one.
 //   2. Bridge check (card out) — drives each line in turn and watches the
 //      others. The microSD socket's 0.8 mm pins bridge easily.
 //   3. Meter check (card out, optional) — drives one line HIGH at a time
@@ -926,12 +941,15 @@ static int read_with_pull(uint8_t pin, uint8_t mode) {
     return digitalRead(pin);
 }
 
-// Counts lines held LOW and lines pulled HIGH. The board has no pull-ups
-// on the SD lines, so with the card out a pulled-HIGH line is a fault too.
-static void sd_line_check(uint8_t *held_low, uint8_t *pulled_high) {
+// Counts lines held LOW and lines pulled HIGH.
+static void sd_line_check(bool card_in, uint8_t *held_low, uint8_t *pulled_high) {
     *held_low = *pulled_high = 0;
-    pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);   // card (if any) deselected
-    // CS (index 0) last, so it holds the card off while the others are read.
+    // Card in: hold CS HIGH so it stays deselected. Card out: leave CS
+    // undriven — driving it would lift any line bridged to CS, which would
+    // then read as PULLED HIGH instead of showing up in the bridge check.
+    if (card_in) { pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH); }
+    else         { pinMode(PIN_SD_CS, INPUT); }
+    // CS (index 0) last, so with a card in it holds the card off while the others are read.
     for (uint8_t k = 0; k < 4; k++) {
         const SdLine &l = SD_LINES[(k + 1) % 4];
         int up   = read_with_pull(l.pin, INPUT_PULLUP);
@@ -1013,8 +1031,8 @@ static void explain_sd_error(uint8_t code, uint8_t data) {
     case SD_CARD_ERROR_ACMD41:
         Serial.println(F("    -> The card talks but never finished powering up (2 s timeout)."));
         Serial.println(F("       Almost always the supply: 3.3 V at the socket sagging when the"));
-        Serial.println(F("       card draws its ~100 mA bursts. J701 has no decoupling on the"));
-        Serial.println(F("       schematic — add >= 10 uF + 100 nF across J701 pins 4 and 6."));
+        Serial.println(F("       card draws its ~100 mA bursts. Check for >= 10 uF + 100 nF"));
+        Serial.println(F("       across J701 pins 4 and 6, close to the socket."));
         break;
     default:
         Serial.println(F("    -> The handshake worked but data transfers failed at this clock:"));
@@ -1045,7 +1063,7 @@ static void test_sd_diag() {
     Serial.print(F("  Line check (card "));  Serial.print(card_in ? F("IN") : F("out"));
     Serial.println(F(", internal ~22k pull-up / ~100k pull-down):"));
     uint8_t held_low, pulled_high;
-    sd_line_check(&held_low, &pulled_high);
+    sd_line_check(card_in, &held_low, &pulled_high);
     if (card_in) pulled_high = 0;   // the card's own DAT3 pull-up can lift CS
 
     Serial.println(F("  Bridge check:"));
@@ -1057,8 +1075,8 @@ static void test_sd_diag() {
              "something unpowered on the net, or a damaged Teensy pin");
     }
     if (pulled_high) {
-        fail("A line is PULLED HIGH with no card in, and the board has no SD pull-ups — bridged to "
-             "3.3 V (J701's VDD pin 4 sits between CMD and CLK)");
+        fail("A line is PULLED HIGH with no card in — bridged to 3.3 V (J701's VDD pin 4 sits "
+             "between CMD and CLK), unless the board fits a pull-up on that line");
     }
     if (bridges) fail("SD lines are bridged — inspect the socket pins under magnification");
     if (!held_low && !pulled_high && !bridges) pass("No shorts: no line held LOW or HIGH, no bridges between them");
@@ -1116,11 +1134,286 @@ static void test_sd_diag() {
 }
 
 // ============================================================
+//  TEST 9 — Flash diagnostics
+//  For when Test 4's JEDEC ID read fails. Works from the Teensy pins
+//  out to the GD25Q128, leaving the SPI2 peripheral to the last step:
+//   1. Line check — each flash line under the Teensy's pull-up, then
+//      pull-down, with CS# held HIGH so the chip stays off the bus.
+//      LOW against the pull-up = held down: shorted to GND, or the chip
+//      is unpowered (its input clamp diodes drag lines to ~0 V). HIGH
+//      against the pull-down = held up: a bridge to 3.3 V, or, for CS
+//      only, a CS# pull-up resistor on the board.
+//   2. Bridge check — drives each line HIGH in turn and watches the
+//      rest. A solder bridge between neighbouring pins shows up here.
+//   3. Bit-banged JEDEC ID at ~100 kHz, where wire length can't matter,
+//      on the as-built pinout and three swapped ones. Each read runs
+//      with MISO pulled up, then down: the same bytes both times means
+//      the chip is driving MISO; FF FF FF then 00 00 00 means nothing
+//      is (no power, HOLD# low, or CS/SCK not reaching the chip).
+//   4. SPI2 JEDEC ID at 1 to 40 MHz, 20 reads each — finds the speed
+//      where it breaks. A read one bit off from C8 40 18 is MISO
+//      arriving late, not a wiring fault.
+//  Pinout trap: on the Teensy 4.0's underside, pin 36 is the SD "CLK"
+//  pad but carries CS2, and pin 37 is the "CMD" pad but carries SCK2.
+// ============================================================
+#define FLASH_JEDEC_EXPECT  0xC84018u   // GD25Q128E: GigaDevice, SPI NOR, 128 Mbit
+#define FLASH_SWEEP_READS   20
+
+struct FlashLine { const char *name; uint8_t pin; };
+static const FlashLine FLASH_LINES[4] = {    // CS first — it's held HIGH once checked
+    { "CS   (Teensy " BT_STR(PIN_FLASH_CS)   " -> flash pin 1 CS#) ", PIN_FLASH_CS   },
+    { "SCK  (Teensy " BT_STR(PIN_FLASH_SCK)  " -> flash pin 6 SCLK)", PIN_FLASH_SCK  },
+    { "MOSI (Teensy " BT_STR(PIN_FLASH_MOSI) " -> flash pin 5 SI)  ", PIN_FLASH_MOSI },
+    { "MISO (Teensy " BT_STR(PIN_FLASH_MISO) " <- flash pin 2 SO)  ", PIN_FLASH_MISO },
+};
+
+struct FlashWiring { const char *name; uint8_t cs, sck, mosi, miso; };
+static const FlashWiring FLASH_WIRINGS[4] = {   // [0] must be the as-built pinout
+    { "as built (board_pins.h)", PIN_FLASH_CS,  PIN_FLASH_SCK, PIN_FLASH_MOSI, PIN_FLASH_MISO },
+    { "MISO/MOSI swapped",       PIN_FLASH_CS,  PIN_FLASH_SCK, PIN_FLASH_MISO, PIN_FLASH_MOSI },
+    { "CS/SCK swapped",          PIN_FLASH_SCK, PIN_FLASH_CS,  PIN_FLASH_MOSI, PIN_FLASH_MISO },
+    { "both swapped",            PIN_FLASH_SCK, PIN_FLASH_CS,  PIN_FLASH_MISO, PIN_FLASH_MOSI },
+};
+
+static void print_jedec(uint32_t id) {
+    for (int s = 16; s >= 0; s -= 8) {
+        uint8_t b = (id >> s) & 0xFF;
+        if (b < 0x10) Serial.print('0');
+        Serial.print(b, HEX);
+        if (s) Serial.print(' ');
+    }
+}
+
+// Sampled one SCK edge late (or early): the right ID, shifted one bit.
+static bool jedec_one_bit_off(uint32_t id) {
+    return (id & 0x7FFFFFu) == (FLASH_JEDEC_EXPECT >> 1) ||
+           (id >> 1)        == (FLASH_JEDEC_EXPECT & 0x7FFFFFu);
+}
+
+// Returns the number of lines held to a rail.
+static uint8_t flash_line_check() {
+    Serial.println(F("  1. Line check — Teensy pull-up, then pull-down:"));
+    uint8_t bad = 0;
+    for (const FlashLine &l : FLASH_LINES) {
+        int up   = read_with_pull(l.pin, INPUT_PULLUP);
+        int down = read_with_pull(l.pin, INPUT_PULLDOWN);
+        Serial.print(F("     ")); Serial.print(l.name);
+        Serial.print(F("  up: "));   Serial.print(up   ? F("HIGH") : F("LOW "));
+        Serial.print(F("  down: ")); Serial.print(down ? F("HIGH") : F("LOW "));
+        if (up && !down) {
+            Serial.println(F("  ok"));
+        } else if (!up) {
+            Serial.println(F("  HELD LOW — short to GND, or the flash has no power"));
+            bad++;
+        } else if (l.pin == PIN_FLASH_CS) {
+            Serial.println(F("  held HIGH — fine if the board has a CS# pull-up"));
+        } else {
+            Serial.println(F("  HELD HIGH — bridged to 3.3 V"));
+            bad++;
+        }
+        if (l.pin == PIN_FLASH_CS) { pinMode(l.pin, OUTPUT); digitalWrite(l.pin, HIGH); }
+    }
+    return bad;
+}
+
+// Returns the number of bridged pairs. A line already HIGH under the
+// pull-down (CS with a board pull-up) can't show a bridge into it.
+static uint8_t flash_bridge_check() {
+    Serial.println(F("  2. Bridge check — each line driven HIGH, the rest pulled down:"));
+    bool raised[4][4] = {};
+    for (uint8_t i = 0; i < 4; i++) {
+        int base[4];
+        for (uint8_t j = 0; j < 4; j++) base[j] = read_with_pull(FLASH_LINES[j].pin, INPUT_PULLDOWN);
+        pinMode(FLASH_LINES[i].pin, OUTPUT);
+        digitalWrite(FLASH_LINES[i].pin, HIGH);
+        delay(1);
+        for (uint8_t j = 0; j < 4; j++)
+            if (j != i && !base[j] && digitalRead(FLASH_LINES[j].pin)) raised[i][j] = true;
+        pinMode(FLASH_LINES[i].pin, INPUT_PULLDOWN);
+    }
+    pinMode(PIN_FLASH_CS, OUTPUT); digitalWrite(PIN_FLASH_CS, HIGH);
+
+    uint8_t bridges = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        for (uint8_t j = i + 1; j < 4; j++) {
+            if (!raised[i][j] && !raised[j][i]) continue;
+            Serial.print(F("     BRIDGED: ")); Serial.print(FLASH_LINES[i].name);
+            Serial.print(F(" <-> "));          Serial.println(FLASH_LINES[j].name);
+            bridges++;
+        }
+    }
+    if (!bridges) Serial.println(F("     none found"));
+    return bridges;
+}
+
+// Mode 0 at ~100 kHz: MOSI set while SCK is low, MISO read while it's high.
+static uint8_t bb_flash_xfer(const FlashWiring &w, uint8_t out) {
+    uint8_t in = 0;
+    for (int b = 7; b >= 0; b--) {
+        digitalWrite(w.mosi, (out >> b) & 1);
+        delayMicroseconds(5);
+        digitalWrite(w.sck, HIGH);
+        delayMicroseconds(5);
+        in = (uint8_t)((in << 1) | digitalRead(w.miso));
+        digitalWrite(w.sck, LOW);
+    }
+    return in;
+}
+
+// Wrong pinouts can't make the chip drive a pin we're driving: its SO
+// only turns on after a complete read command, which they never send.
+static uint32_t bb_flash_jedec(const FlashWiring &w, uint8_t miso_pull) {
+    pinMode(w.cs,   OUTPUT); digitalWrite(w.cs,   HIGH);
+    pinMode(w.sck,  OUTPUT); digitalWrite(w.sck,  LOW);
+    pinMode(w.mosi, OUTPUT); digitalWrite(w.mosi, LOW);
+    pinMode(w.miso, miso_pull);
+    delay(1);
+
+    digitalWrite(w.cs, LOW);                 // release from deep power-down
+    bb_flash_xfer(w, FCMD_RELEASE_PD);
+    digitalWrite(w.cs, HIGH);
+    delayMicroseconds(50);                   // tRES1
+
+    digitalWrite(w.cs, LOW);
+    bb_flash_xfer(w, FCMD_JEDEC_ID);
+    uint32_t id = 0;
+    for (int i = 0; i < 3; i++) id = (id << 8) | bb_flash_xfer(w, 0x00);
+    digitalWrite(w.cs, HIGH);
+    return id;
+}
+
+// Returns the index into FLASH_WIRINGS that read C8 40 18, or -1.
+static int flash_bitbang_check() {
+    Serial.println(F("  3. Bit-banged JEDEC ID at ~100 kHz (expect C8 40 18):"));
+    int match = -1;
+    for (uint8_t i = 0; i < 4; i++) {
+        const FlashWiring &w = FLASH_WIRINGS[i];
+        uint32_t up   = bb_flash_jedec(w, INPUT_PULLUP);
+        uint32_t down = bb_flash_jedec(w, INPUT_PULLDOWN);
+        Serial.print(F("     ")); Serial.print(w.name);
+        for (size_t k = strlen(w.name); k < 23; k++) Serial.print(' ');
+        Serial.print(F("  MISO up: ")); print_jedec(up);
+        Serial.print(F("  down: "));    print_jedec(down);
+        if (up == FLASH_JEDEC_EXPECT && down == FLASH_JEDEC_EXPECT) {
+            Serial.println(F("  <- CORRECT"));
+            if (match < 0) match = i;
+        } else if (up == 0xFFFFFFu && down == 0) {
+            Serial.println(F("  no answer"));
+        } else if (up == down && up == 0) {
+            Serial.println(F("  MISO stuck LOW"));
+        } else if (up == down && up == 0xFFFFFFu) {
+            Serial.println(F("  MISO stuck HIGH"));
+        } else if (up == down) {
+            Serial.println(F("  something answers, but not C8 40 18"));
+        } else {
+            Serial.println(F("  unstable — MISO partly floating"));
+        }
+    }
+    // Hand the pins back: begin() re-muxes MISO/MOSI/SCK; CS stays a GPIO.
+    pinMode(PIN_FLASH_CS, OUTPUT); digitalWrite(PIN_FLASH_CS, HIGH);
+    SPI2.begin();
+    return match;
+}
+
+static uint32_t hw_flash_jedec(uint32_t hz) {
+    SPISettings s(hz, MSBFIRST, FLASH_SPI_MODE);
+    SPI2.beginTransaction(s);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
+    SPI2.transfer(FCMD_RELEASE_PD);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
+    SPI2.endTransaction();
+    delayMicroseconds(50);
+
+    SPI2.beginTransaction(s);
+    digitalWriteFast(PIN_FLASH_CS, LOW);
+    SPI2.transfer(FCMD_JEDEC_ID);
+    uint32_t id = 0;
+    for (int i = 0; i < 3; i++) id = (id << 8) | SPI2.transfer(0x00);
+    digitalWriteFast(PIN_FLASH_CS, HIGH);
+    SPI2.endTransaction();
+    return id;
+}
+
+// Returns the highest clock (MHz) that, along with every slower one,
+// read the ID correctly FLASH_SWEEP_READS times out of FLASH_SWEEP_READS. 0 if 1 MHz didn't.
+static uint8_t flash_speed_sweep() {
+    static const uint8_t MHZ[] = { 1, 4, 10, 20, 40 };
+    Serial.println(F("  4. SPI2 JEDEC ID by clock speed:"));
+    uint8_t best  = 0;
+    bool    clean = true;
+    for (uint8_t mhz : MHZ) {
+        uint8_t  good = 0;
+        uint32_t last_bad = 0;
+        for (int n = 0; n < FLASH_SWEEP_READS; n++) {
+            uint32_t id = hw_flash_jedec(mhz * 1000000UL);
+            if (id == FLASH_JEDEC_EXPECT) good++; else last_bad = id;
+        }
+        Serial.print(F("     ")); if (mhz < 10) Serial.print(' ');
+        Serial.print(mhz); Serial.print(F(" MHz: "));
+        Serial.print(good); Serial.print('/'); Serial.print(FLASH_SWEEP_READS);
+        if (good == FLASH_SWEEP_READS) {
+            Serial.println(F(" ok"));
+            if (clean) best = mhz;
+            continue;
+        }
+        clean = false;
+        Serial.print(F(" — bad read: ")); print_jedec(last_bad);
+        if (jedec_one_bit_off(last_bad))                   Serial.println(F("  one bit off: MISO arriving late"));
+        else if (last_bad == 0xFFFFFFu || last_bad == 0)   Serial.println(F("  no answer"));
+        else                                               Serial.println(F("  garbled"));
+    }
+    return best;
+}
+
+static void test_flash_diag() {
+    print_banner("TEST 9: GD25Q128 flash diagnostics");
+    uint8_t bad_lines = flash_line_check();
+    uint8_t bridges   = flash_bridge_check();
+    int     wiring    = flash_bitbang_check();
+    uint8_t best_mhz  = flash_speed_sweep();
+    const uint8_t set_mhz = FLASH_SPI_FREQ / 1000000UL;
+    char msg[120];
+
+    Serial.println(F("  Diagnosis:"));
+    if (wiring == 0 && best_mhz >= set_mhz) {
+        pass("Flash answers on the as-built pinout at the firmware's SPI clock");
+        info("If Test 4 still fails, the fault is past the ID read — see which step it stops at");
+        info("Note: the flight build never calls flash_init() — logger.cpp logs to RAM + SD only");
+    } else if (wiring == 0 && best_mhz) {
+        snprintf(msg, sizeof msg, "Wiring is correct, but SPI2 reads fail above %u MHz", (unsigned)best_mhz);
+        fail(msg);
+        snprintf(msg, sizeof msg, "Set FLASH_SPI_FREQ (bench_test.cpp) and GD25Q128_SPI_FREQ (flash.h) to %u MHz or less",
+                 (unsigned)(best_mhz > 1 ? best_mhz / 2 : 1));
+        info(msg);
+    } else if (wiring == 0) {
+        fail("The flash answers when bit-banged at 100 kHz but not on SPI2, even at 1 MHz");
+        info("Suspect very slow edges on the flash lines, or code re-muxing pins 34/35/37 after SPI2.begin()");
+    } else if (wiring > 0) {
+        snprintf(msg, sizeof msg, "The flash only answers as %s — the board doesn't match board_pins.h",
+                 FLASH_WIRINGS[wiring].name);
+        fail(msg);
+        if (FLASH_WIRINGS[wiring].mosi == PIN_FLASH_MISO)
+            info("MISO/MOSI crossed: flash SO (pin 2) must reach Teensy 34, SI (pin 5) Teensy 35");
+        if (FLASH_WIRINGS[wiring].cs == PIN_FLASH_SCK)
+            info("CS/SCK crossed: flash CS# (pin 1) goes to Teensy 36 (SD 'CLK' pad), SCLK (pin 6) to 37 (SD 'CMD' pad)");
+    } else if (bad_lines || bridges) {
+        fail("No pinout gets an answer — fix the line faults in steps 1-2 first");
+    } else {
+        fail("No pinout gets an answer and the lines look clean — check with a meter:");
+        Serial.println(F("    Powered: flash pin 8 (VCC) to pin 4 (GND) = 3.3 V"));
+        Serial.println(F("    Powered: pin 7 (HOLD#/RESET#) and pin 3 (WP#) = 3.3 V — a low or floating HOLD#"));
+        Serial.println(F("             freezes the chip and leaves SO off, which reads exactly like this"));
+        Serial.println(F("    Unpowered, continuity: Teensy 34 -> flash 2, 35 -> 5, 36 -> 1, 37 -> 6"));
+        Serial.println(F("    Pins 34-37 are Teensy underside pads — reflow those joints if any reads open"));
+    }
+    pinMode(PIN_FLASH_CS, OUTPUT); digitalWriteFast(PIN_FLASH_CS, HIGH);
+}
+
+// ============================================================
 //  TEST 6 — Full logger round-trip
 //  Writes 50 fake LogRecords via logger_write() (RAM ring buffer only),
 //  then logger_finalize() dumps them straight to FLIGHT_XXX.CSV on the
-//  SD card. GD25Q128 flash is not used for flight logging — it's wired
-//  incorrectly on this board (see FC_V2_1_PIN_REFERENCE.md).
+//  SD card. GD25Q128 flash is not used for flight logging.
 // ============================================================
 static void test_logger_roundtrip() {
     print_banner("TEST 6: Logger Round-Trip (RAM buffer → SD CSV)");
@@ -2270,6 +2563,7 @@ static void print_menu() {
     Serial.println(F("║  6 - Logger round-trip (RAM → SD CSV)    ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
     Serial.println(F("║  8 - SD diagnostics (when 5 fails)       ║"));
+    Serial.println(F("║  9 - Flash diagnostics (when 4 fails)    ║"));
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
     Serial.println(F("║  I - IMU tilt -> gimbal response         ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
@@ -2328,6 +2622,7 @@ void loop() {
         case '6': test_logger_roundtrip(); break;
         case '7': run_all();              break;
         case '8': test_sd_diag();         break;
+        case '9': test_flash_diag();      break;
         case 'S': case 's': test_servos(); break;
         case 'I': case 'i': test_tilt_response(); break;
         case 'L': case 'l': test_leds();   break;

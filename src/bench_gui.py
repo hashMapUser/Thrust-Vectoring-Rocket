@@ -436,7 +436,7 @@ class BenchPanel:
         ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"), ("8  SD diag", "8"),
         ("S  Servos", "S"), ("I  IMU tilt", "I"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
         ("C  Continuity", "C"), ("F  Pyro fire", "F"), ("A  ARM sense", "A"), ("M  Mag calibrate", "M"),
-        ("U  USB dump", "U"), ("R  Menu", "R"),
+        ("9  Flash diag", "9"), ("U  USB dump", "U"), ("R  Menu", "R"),
     ]
 
     FLIGHT_CMDS = [
