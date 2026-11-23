@@ -8,7 +8,11 @@
 // GD25Q128ESIGR — SPI NOR Flash (128 Mbit / 16 MB)
 // Teensy 4.0 SPI2 bus (MISO=34, MOSI=35, CS=36, SCK=37)
 // --------------------------------------------------------
-#define GD25Q128_SPI_FREQ   40000000UL   // 40 MHz — safe for short PCB traces
+// 10 MHz, not 40: the Teensy's LPSPI clock is 240 MHz, so 40 MHz is a real
+// 40 MHz and MISO gets ~12 ns to arrive — too tight through the Teensy's
+// underside pads. Logging needs far less. Raise only after bench
+// Test 9's speed sweep shows margin. Keep FLASH_SPI_FREQ (bench_test.cpp) equal.
+#define GD25Q128_SPI_FREQ   10000000UL
 #define GD25Q128_SPI_MODE   SPI_MODE0
 
 // JEDEC ID bytes

@@ -10,7 +10,7 @@
 #define PIN_IMU_MISO     12
 #define PIN_IMU_SCK      13
 
-// --- SPI1 (microSD — H6 fixed: SD VDD rewired to 3.3V, card now safe) ---
+// --- SPI1 (microSD) ---
 #define PIN_SD_CS        0
 #define PIN_SD_MISO      1
 #define PIN_SD_MOSI      26
@@ -27,7 +27,7 @@
 #define PIN_BARO_SDA     18
 #define PIN_BARO_SCL     19
 
-// --- I2C1 Wire1 (magnetometer — MMC5603NJ, not fitted this flight) ---
+// --- I2C1 Wire1 (magnetometer — MMC5603NJ) ---
 #define PIN_MAG_SCL      16
 #define PIN_MAG_SDA      17
 

@@ -8,9 +8,9 @@
 // CONFIG
 // --------------------------------------------------------
 
-// GD25Q128 NOR flash is wired incorrectly on this board and cannot be used
-// for flight logging. Flight data is held in a RAM ring buffer in flight,
-// then dumped to the SD card (FLIGHT_XXX.CSV) when logger_finalize() runs.
+// The GD25Q128 NOR flash is not used for flight logging. Flight data is held
+// in a RAM ring buffer in flight, then dumped to the SD card (FLIGHT_XXX.CSV)
+// when logger_finalize() runs.
 // If the SD card isn't present or its init failed, the RAM buffer is the
 // only copy of the data — logger_finalize() falls back to streaming it as
 // CSV over USB serial instead of silently discarding it, and

@@ -13,7 +13,8 @@
 //        servo_p_us,servo_y_us,pack_v,loop_us*XX
 //
 // XX is the XOR of every character between '$' and '*', as two hex
-// digits. Field order must mirror TLM_FIELDS in src/telemetry_panel.py.
+// digits. Field order must mirror TLM_FIELDS in src/telemetry_panel.py
+// and in tools/flight_live.py.
 //
 // Off by default so the PlatformIO serial monitor stays readable:
 // send 'T' to start the stream, 't' to stop it. bench_gui.py sends
