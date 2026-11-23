@@ -4,16 +4,23 @@ TVC Simulator - PID Tuning Tool
 Forked from fszewczyk's "TVC Simulator" project
 https://github.com/fszewczyk/tvc-simulator
 
-2D pitch-axis simulator for tuning the PID controller on a thrust-vector-controlled
-model rocket. Models servo rate/angle limits, actuator delay, TVC noise/bias,
-gyro noise/bias, Estes F-15 thrust curve, atmospheric drag, gravity, and altitude.
+PID tuning simulator for the thrust-vector-controlled rocket. Runs a 2D model
+once per TVC axis (pitch and yaw) with the same gains, because the firmware
+flies one set of gains on both. Mirrors the firmware: the PID in src/pid.cpp
+at 125 Hz with its integral clamp, nozzle limits and linkages from
+include/servo_driver.h, and servos that get a new pulse every 20 ms. Also
+models servo speed and delay, nozzle pointing error, attitude noise/bias, the
+Estes F-15 thrust curve, propellant burn-off, drag, gravity, and altitude.
+
+Units: the PID's output is nozzle deflection in degrees, as in the firmware.
 
 Usage:
-    python TVCSim.py
+    python tvc_sim
 
 Tweak the parameters in the "CONFIG" block below, then run. A matplotlib window
-opens with six plots. Iterate on kp/ki/kd until the rocket angle settles quickly
-with acceptable overshoot and the commanded TVC angle isn't saturating.
+opens with six plots (pitch in red, yaw in blue) and the summary is printed.
+Iterate on kp/ki/kd until both axes settle quickly with acceptable overshoot
+and the commanded nozzle angle isn't saturating.
 """
 
 import math
@@ -26,10 +33,15 @@ import matplotlib.pyplot as plt
 # ============================================================================
 
 # --- PID gains (what you're tuning) ---
+# One set for both axes, as in the firmware (PID_DEFAULT_* in include/pid.h).
+# Units: degrees of nozzle per degree of tilt.
 kp = 0.34
 ki = 0.215
 kd = 0.05
-alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter)
+alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter).
+                                    # The firmware has no D filter — keep 1.0 to match it.
+integralLimit = 8.5                 # deg     PID_INTEGRAL_LIMIT in pid.h; capped per axis
+                                    #         at that axis's nozzle limit, as pid_init() does
 
 # --- Rocket physical parameters ---
 # mass/MOI/lever-arms below are the LOADED (liftoff) values. Propellant
@@ -56,32 +68,41 @@ dragCoefficient = 0.45              # C_d
 propellantMass = 0.060              # kg (Estes F15 propellant weight, certified)
 propellantCgOffsetAftOfCOM = 0.10   # m  ESTIMATE — verify against the mass model
 
-# --- TVC / servo parameters ---
-SERVO_PWM_HZ = 200                  # Hz — matches SERVO_PWM_HZ in servo_driver.h
-PIDDT = 0.008                       # s       (controller update period — matches the
-                                    #          firmware's 125 Hz flight loop, not the sim's
-                                    #          old 200 Hz PIDDT)
-servoDelay = 0.005                  # s       (command -> motion delay)
-maxTVCSpeed = 250                   # deg/s   (slew rate limit)
-# Matches PID_OUT_MAX in pid.h (the firmware's authority clamp), NOT the
-# gimbal's mechanical limit — those are two different numbers until the
-# servo-horn-degrees -> gimbal-degrees linkage ratio is bench-measured
-# (see firmware review item 12 / SERVO_PER_GIMBAL_RATIO). If that ratio
-# turns out not to be 1:1, both this and PID_OUT_MAX need to move together.
-absMaxTVCAngle = 5                  # deg
-TVCBias = 0.0                       # deg     (constant TVC misalignment)
-TVCNoiseAmplitude = 1.5             # deg     (peak TVC jitter)
+# --- TVC axes ---
+# Nozzle deflection at full servo travel (measured 2026-11-20) and the servo
+# pulse span that produces it: SERVO_*_MAX_ANGLE_DEG and SERVO_*_SPAN_US in
+# include/servo_driver.h. The nozzle limit is also the firmware's PID output
+# limit. span_us / limit is the linkage (us per nozzle degree), which with
+# the servo speed below sets how fast the nozzle can move on that axis.
+AXES = {
+    "pitch": dict(limit=7.0,  span_us=510),   # nozzle along Z, servo on pin 6
+    "yaw":   dict(limit=10.0, span_us=215),   # nozzle along X, servo on pin 5
+}
 
-# --- Sensor parameters (gyro/IMU) ---
+# --- Servo / actuator ---
+PIDDT = 0.008                       # s       controller period (firmware's 125 Hz loop)
+SERVO_REFRESH_HZ = 50               # Hz      Teensy Servo.h sends a new pulse every 20 ms,
+                                    #         so the servo's target only changes that often
+servoDelay = 0.005                  # s       pulse -> motion delay inside the servo
+# Servo speed — ESTIMATE until you have the datasheet figure. Hobby servos are
+# specced in seconds per 60 deg of horn travel (0.08-0.20 typical) and turn
+# roughly 0.1 deg of horn per us of pulse.
+servoSecPer60 = 0.12                # s / 60 deg
+servoHornDegPerUs = 0.10            # deg / us
+TVCBias = 0.0                       # deg     constant nozzle misalignment
+TVCNoiseAmplitude = 1.5             # deg     nozzle pointing error (deadband, linkage slop),
+                                    #         re-drawn each time the servo gets a new pulse
+
+# --- Sensor (the firmware's attitude-filter tilt) ---
 angleSensorBias = 0.0               # deg
-angleSensorNoiseAmplitude = 0.5     # deg
+# The firmware steers by the attitude filter's tilt, which is integrated gyro,
+# so sample-to-sample noise is small. ESTIMATE — bench test I prints the tilt
+# wander at rest ("wandering X deg p-p"); half of that is a conservative value.
+angleSensorNoiseAmplitude = 0.05    # deg
 
 # --- Simulation parameters ---
-# Physics step is tied to SERVO_PWM_HZ: the servo's commanded position
-# can only actually change once per PWM period, so stepping physics at
-# that same rate is what gives the sim its 200 Hz actuator quantization
-# for free, without a separate zero-order-hold block.
-dt = 1.0 / SERVO_PWM_HZ              # s       (physics step)
+dt = 0.001                          # s       physics step — divides the 8 ms PID and
+                                    #         20 ms servo periods exactly
 simLength = 7.0                     # s
 initAngle = 5.0                     # deg     (initial pitch disturbance)
 initSetpoint = 0.0                  # deg
@@ -139,7 +160,8 @@ F15_CURVE = np.array([
     [3.418,  4.895],
     [3.450,  0.000],
 ])
-F15_TOTAL_IMPULSE = float(np.trapz(F15_CURVE[:, 1], F15_CURVE[:, 0]))   # N*s, ~49.6
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz   # trapz was removed in numpy 2
+F15_TOTAL_IMPULSE = float(_trapezoid(F15_CURVE[:, 1], F15_CURVE[:, 0]))   # N*s, ~49.6
 
 def getThrust(t):
     """Thrust (N) at time t (s)."""
@@ -178,10 +200,16 @@ def propellantRemainingFrac(t):
 # Simulation
 # ============================================================================
 
-def run():
+def run(axis):
+    """Simulate one TVC axis ("pitch" or "yaw" from AXES) with the shared gains."""
     if randomSeed is not None:
         random.seed(randomSeed)
         np.random.seed(randomSeed)
+
+    limit      = AXES[axis]["limit"]                        # nozzle deg = PID output limit
+    i_limit    = min(integralLimit, limit)                  # as pid_init() caps it
+    us_per_deg = AXES[axis]["span_us"] / limit              # linkage
+    slew       = (60.0 / servoSecPer60) / servoHornDegPerUs / us_per_deg   # nozzle deg/s
 
     # --- Solve the fixed dry-airframe CG and propellant CG positions
     # (both measured as a distance from the nozzle, "forward" = larger)
@@ -195,7 +223,9 @@ def run():
     x_dry = (x_combined_liftoff * mass - propellantMass * x_propellant) / dryMass
 
     steps = int(simLength / dt)
-    delaySteps = max(int(servoDelay / dt), 1)
+    pid_every     = max(1, round(PIDDT / dt))
+    refresh_every = max(1, round(1.0 / SERVO_REFRESH_HZ / dt))
+    delaySteps    = round(servoDelay / dt)
 
     # State histories
     t        = np.zeros(steps)
@@ -203,10 +233,10 @@ def run():
     omega    = np.zeros(steps)   # angular velocity (deg/s)
     alpha_a  = np.zeros(steps)   # angular accel (deg/s^2)
 
-    thetaMeas    = np.zeros(steps)   # what the gyro reports
-    tvcCmd       = np.zeros(steps)   # PID output (before limiting)
-    tvcCmdLim    = np.zeros(steps)   # after clamp + slew-rate limit
-    tvcActual    = np.zeros(steps)   # what the nozzle actually points at (after delay + noise + bias)
+    thetaMeas    = np.zeros(steps)   # tilt the controller sees
+    tvcCmd       = np.zeros(steps)   # PID output before the output clamp
+    tvcCmdLim    = np.zeros(steps)   # servo target: clamped, held between 20 ms pulses
+    tvcActual    = np.zeros(steps)   # where the nozzle points (delay, servo speed, error, bias)
     setpoint_hist = np.zeros(steps)
 
     altitude = np.zeros(steps)
@@ -219,12 +249,16 @@ def run():
     # Initial conditions
     theta[0] = initAngle
 
-    # PID state
+    # PID state (integral holds the i-term, ki already applied, as in pid.cpp)
     integral = 0.0
     prev_err = initSetpoint - (initAngle + angleSensorBias)
     d_filt = 0.0
-    last_pid_t = 0.0
     pid_output = 0.0
+
+    # Servo state
+    servo_target = 0.0
+    point_err = 0.0
+    nozzle = 0.0
 
     for i in range(steps - 1):
         t[i] = i * dt
@@ -243,40 +277,29 @@ def run():
                         + random.uniform(-angleSensorNoiseAmplitude,
                                           angleSensorNoiseAmplitude))
 
-        # --- PID (runs at PIDDT, not every physics step) ---
-        if now - last_pid_t >= PIDDT - 1e-9:
-            pid_dt = now - last_pid_t if last_pid_t > 0 else PIDDT
+        # --- PID, as in src/pid.cpp (every PIDDT) ---
+        if i % pid_every == 0:
             err = sp - thetaMeas[i]
-            d_raw = (err - prev_err) / pid_dt
+            d_raw = (err - prev_err) / PIDDT
             d_filt = alpha * d_raw + (1.0 - alpha) * d_filt
-            # Conditional integration anti-windup: only accumulate the integral
-            # when the previous output wasn't saturated, OR when the new error
-            # would push the output back inside the linear range.
-            prev_unsat = abs(pid_output) < absMaxTVCAngle
-            same_sign = (pid_output * err) > 0
-            if prev_unsat or not same_sign:
-                integral += err * pid_dt
-            pid_output = kp * err + ki * integral + kd * d_filt
+            integral += ki * err * PIDDT
+            integral = max(-i_limit, min(i_limit, integral))
+            pid_output = kp * err + integral + kd * d_filt
             prev_err = err
-            last_pid_t = now
         tvcCmd[i] = pid_output
+        cmd_clamped = max(-limit, min(limit, pid_output))
 
-        # --- Clamp to mechanical limit ---
-        cmd_clamped = max(-absMaxTVCAngle, min(absMaxTVCAngle, pid_output))
+        # --- Servo: a new pulse (target) only every 20 ms ---
+        if i % refresh_every == 0:
+            servo_target = cmd_clamped
+            point_err = random.uniform(-TVCNoiseAmplitude, TVCNoiseAmplitude)
+        tvcCmdLim[i] = servo_target
 
-        # --- Slew-rate limit (servo can't snap instantly) ---
-        max_step = maxTVCSpeed * dt
-        prev_lim = tvcCmdLim[i - 1] if i > 0 else 0.0
-        delta = cmd_clamped - prev_lim
-        if delta >  max_step: delta =  max_step
-        if delta < -max_step: delta = -max_step
-        tvcCmdLim[i] = prev_lim + delta
-
-        # --- Delay: actual nozzle angle reflects a command from `delaySteps` ago ---
-        cmd_delayed = tvcCmdLim[i - delaySteps] if i >= delaySteps else 0.0
-        tvcActual[i] = (cmd_delayed
-                        + TVCBias
-                        + random.uniform(-TVCNoiseAmplitude, TVCNoiseAmplitude))
+        # --- Servo delay, then the nozzle moves toward the target at servo speed ---
+        target = tvcCmdLim[i - delaySteps] if i >= delaySteps else 0.0
+        max_step = slew * dt
+        nozzle += max(-max_step, min(max_step, target - nozzle))
+        tvcActual[i] = nozzle + TVCBias + point_err
 
         # --- Dynamics ---
         T = getThrust(now)
@@ -377,6 +400,7 @@ def run():
     thrust_hist[-1]  = thrust_hist[-2]
 
     return {
+        'axis': axis, 'limit': limit, 'slew': slew,
         't': t, 'theta': theta, 'omega': omega, 'alpha': alpha_a,
         'thetaMeas': thetaMeas,
         'tvcCmd': tvcCmd, 'tvcCmdLim': tvcCmdLim, 'tvcActual': tvcActual,
@@ -387,117 +411,112 @@ def run():
 
 
 # ============================================================================
-# Plotting
+# Summary + plotting
 # ============================================================================
 
-def plot(r):
-    fig = plt.figure('TVC Simulator - PID Tuning', figsize=(13, 8))
-    g = plt.GridSpec(3, 2, hspace=0.45, wspace=0.25)
+AXIS_COLOR = {"pitch": "#d62728", "yaw": "#1f77b4"}
+AXIS_WIDTH = {"pitch": 2.6, "yaw": 1.1}   # pitch drawn wider underneath, so it shows where they overlap
 
-    ax = fig.add_subplot(g[0, 0])
-    ax.plot(r['t'], r['theta'],     label='True angle',     color='#d62728', linewidth=1.6)
-    ax.plot(r['t'], r['thetaMeas'], label='Measured',       color='#1f77b4', linewidth=0.7, alpha=0.6)
-    ax.plot(r['t'], r['setpoint'],  label='Setpoint',       color='black',   linewidth=0.8, linestyle='--')
-    ax.set_title('Rocket Pitch Angle')
-    ax.set_xlabel('time (s)'); ax.set_ylabel('angle (deg)')
-    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
 
-    ax = fig.add_subplot(g[0, 1])
-    ax.plot(r['t'], r['tvcCmd'],    label='PID command',    color='#ff7f0e', linewidth=0.9)
-    ax.plot(r['t'], r['tvcCmdLim'], label='After limits',   color='#2ca02c', linewidth=1.2)
-    ax.plot(r['t'], r['tvcActual'], label='Actual (w/ noise)', color='#9467bd', linewidth=0.6, alpha=0.6)
-    ax.axhline( absMaxTVCAngle, color='red', linestyle=':', linewidth=0.8)
-    ax.axhline(-absMaxTVCAngle, color='red', linestyle=':', linewidth=0.8)
-    ax.set_title('TVC Angle')
-    ax.set_xlabel('time (s)'); ax.set_ylabel('angle (deg)')
-    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
+def summarize(r):
+    """Stats over powered flight only (when TVC has authority). After burnout
+    an unstable rocket will tumble — that's expected, not a tuning problem."""
+    powered = r['thrust'] > 0.1
+    last = int(np.where(powered)[0][-1]) if powered.any() else len(r['t']) - 1
+    t_p, th_p, sp_p = r['t'][:last + 1], r['theta'][:last + 1], r['setpoint'][:last + 1]
 
-    ax = fig.add_subplot(g[1, 0])
-    ax.plot(r['t'], r['omega'], color='#d62728')
-    ax.set_title('Angular Velocity')
-    ax.set_xlabel('time (s)'); ax.set_ylabel('deg/s'); ax.grid(alpha=0.3)
-
-    ax = fig.add_subplot(g[1, 1])
-    ax.plot(r['t'], r['thrust'], color='#d62728')
-    ax.set_title('Thrust')
-    ax.set_xlabel('time (s)'); ax.set_ylabel('N'); ax.grid(alpha=0.3)
-
-    ax = fig.add_subplot(g[2, 0])
-    ax.plot(r['t'], r['altitude'], label='Altitude', color='#1f77b4')
-    ax.plot(r['t'], r['vz'],       label='V_z',      color='#ff7f0e')
-    ax.set_title('Altitude & Vertical Speed')
-    ax.set_xlabel('time (s)'); ax.set_ylabel('m  /  m/s')
-    ax.grid(alpha=0.3); ax.legend(loc='best', fontsize=8)
-
-    ax = fig.add_subplot(g[2, 1])
-    ax.plot(r['x'], r['altitude'], color='#2ca02c')
-    ax.set_title('Trajectory (x vs altitude)')
-    ax.set_xlabel('x (m)'); ax.set_ylabel('altitude (m)')
-    ax.grid(alpha=0.3); ax.set_aspect('equal', adjustable='datalim')
-
-    # Summary stats computed ONLY during powered flight (when TVC has authority).
-    # After motor burnout, an unstable rocket will tumble — that's expected, not a tuning problem.
-    thrust_arr = r['thrust']
-    powered = thrust_arr > 0.1
-    if powered.any():
-        last_powered = int(np.where(powered)[0][-1])
-    else:
-        last_powered = len(r['t']) - 1
-    burn_end_t = r['t'][last_powered]
-
-    theta = r['theta']
-    theta_p = theta[:last_powered + 1]
-    t_p = r['t'][:last_powered + 1]
-
-    overshoot = abs(theta_p).max()
-    # Settling time: first t (within powered phase) where |theta - sp| stays under 5% of initAngle for 0.25s
+    # Settling time: first t where |theta - sp| stays under 5% of initAngle for 0.25 s
     band = 0.05 * max(abs(initAngle), 1.0)
-    settle_t = None
     window = int(0.25 / dt)
-    sp_arr = r['setpoint']
-    for i in range(len(theta_p) - window):
-        if np.all(np.abs(theta_p[i:i + window] - sp_arr[i:i + window]) < band):
-            settle_t = t_p[i]
+    settle = None
+    for i in range(len(th_p) - window):
+        if np.all(np.abs(th_p[i:i + window] - sp_p[i:i + window]) < band):
+            settle = t_p[i]
             break
-    ss_err = abs(theta_p[-1] - sp_arr[last_powered])
-    sat_pct = 100.0 * np.mean(np.abs(r['tvcCmd'][:last_powered + 1]) > absMaxTVCAngle)
+    return {
+        'burn_end':  r['t'][last],
+        'max_theta': float(np.abs(th_p).max()),
+        'settle':    settle,
+        'ss_err':    float(abs(th_p[-1] - sp_p[-1])),
+        'sat':       100.0 * float(np.mean(np.abs(r['tvcCmd'][:last + 1]) > r['limit'])),
+    }
 
-    # Shade coast phase on pitch plot
-    axs = fig.axes
-    for ax_ in axs[:4]:
-        ax_.axvspan(burn_end_t, r['t'][-1], color='gray', alpha=0.08, zorder=0)
 
-    # Optionally zoom time-axis plots to powered phase + small coast tail.
-    # The trajectory plot (x vs altitude) is left unzoomed since it doesn't have a time axis.
+def describe(r, s):
+    settle = 'n/a' if s['settle'] is None else f"{s['settle']:.2f}s"
+    return (f"{r['axis']:<5} (+/-{r['limit']:g} deg, nozzle up to {r['slew']:.0f} deg/s): "
+            f"max tilt {s['max_theta']:.2f} deg   settle {settle}   "
+            f"ss err {s['ss_err']:.2f} deg   saturation {s['sat']:.1f}%")
+
+
+def plot(runs):
+    fig = plt.figure('TVC Simulator - PID Tuning', figsize=(13, 8.5))
+    g = plt.GridSpec(3, 2, hspace=0.5, wspace=0.25, top=0.86)
+    axs = [fig.add_subplot(g[row, col]) for row in range(3) for col in range(2)]
+    # axs[0]=tilt, [1]=nozzle, [2]=omega, [3]=thrust, [4]=altitude/vz, [5]=trajectory
+
+    for r in runs:
+        c, w, name = AXIS_COLOR[r['axis']], AXIS_WIDTH[r['axis']], r['axis']
+        axs[0].plot(r['t'], r['theta'],     color=c, linewidth=w, label=f'{name} true')
+        axs[0].plot(r['t'], r['thetaMeas'], color=c, linewidth=0.6, alpha=0.4, label=f'{name} measured')
+        axs[1].plot(r['t'], r['tvcCmd'],    color=c, linewidth=0.7, alpha=0.5, linestyle='--',
+                    label=f'{name} PID command')
+        axs[1].plot(r['t'], r['tvcActual'], color=c, linewidth=w, label=f'{name} nozzle')
+        for lim in (r['limit'], -r['limit']):
+            axs[1].axhline(lim, color=c, linestyle=':', linewidth=0.8)
+        axs[2].plot(r['t'], r['omega'], color=c, linewidth=w, label=name)
+        axs[4].plot(r['t'], r['altitude'], color=c, linewidth=w, label=f'{name} altitude')
+        axs[4].plot(r['t'], r['vz'],       color=c, linewidth=w, linestyle='--', label=f'{name} V_z')
+        axs[5].plot(r['x'], r['altitude'], color=c, linewidth=w, label=name)
+    axs[0].plot(runs[0]['t'], runs[0]['setpoint'], color='black', linewidth=0.8, linestyle='--',
+                label='setpoint')
+    axs[3].plot(runs[0]['t'], runs[0]['thrust'], color='#2ca02c')
+
+    titles = [('Rocket Tilt', 'angle (deg)'), ('Nozzle Angle', 'angle (deg)'),
+              ('Angular Velocity', 'deg/s'), ('Thrust', 'N'),
+              ('Altitude & Vertical Speed', 'm  /  m/s'), ('Trajectory (x vs altitude)', 'altitude (m)')]
+    for ax_, (title, ylabel) in zip(axs, titles):
+        ax_.set_title(title)
+        ax_.set_ylabel(ylabel)
+        ax_.set_xlabel('x (m)' if ax_ is axs[5] else 'time (s)')
+        ax_.grid(alpha=0.3)
+    for ax_ in (axs[0], axs[1], axs[2], axs[4], axs[5]):
+        ax_.legend(loc='best', fontsize=7)
+    axs[5].set_aspect('equal', adjustable='datalim')
+
+    stats = [summarize(r) for r in runs]
+    burn_end_t = stats[0]['burn_end']
+
+    # Shade the coast phase on the time plots
+    for ax_ in axs[:5]:
+        ax_.axvspan(burn_end_t, runs[0]['t'][-1], color='gray', alpha=0.08, zorder=0)
+
+    # Optionally zoom the time plots to powered phase + a short coast tail,
+    # re-fitting y to what's visible. The trajectory plot has no time axis.
     if focusOnPoweredPhase:
         x_max = burn_end_t + 0.5
-        # axes[0]=pitch, [1]=tvc, [2]=omega, [3]=thrust, [4]=altitude/vz, [5]=trajectory
-        for ax_ in (axs[0], axs[1], axs[2], axs[3], axs[4]):
-            ax_.set_xlim(0, x_max)
-        # Re-fit y-limits to the data within the visible window
-        end_idx = min(int(x_max / dt) + 1, len(r['t']))
-        def _yfit(ax_, *series):
-            allvals = np.concatenate([s[:end_idx] for s in series])
+        end_idx = min(int(x_max / dt) + 1, len(runs[0]['t']))
+        def _yfit(ax_, keys):
+            allvals = np.concatenate([r[k][:end_idx] for r in runs for k in keys])
             lo, hi = float(np.min(allvals)), float(np.max(allvals))
             pad = max(0.1, 0.1 * (hi - lo))
             ax_.set_ylim(lo - pad, hi + pad)
-        _yfit(axs[0], r['theta'], r['thetaMeas'], r['setpoint'])
-        _yfit(axs[1], r['tvcCmdLim'], r['tvcActual'])  # ignore raw cmd which can be huge
-        _yfit(axs[2], r['omega'])
-        _yfit(axs[3], r['thrust'])
-        _yfit(axs[4], r['altitude'], r['vz'])
+        for ax_ in axs[:5]:
+            ax_.set_xlim(0, x_max)
+        _yfit(axs[0], ('theta', 'thetaMeas', 'setpoint'))
+        _yfit(axs[1], ('tvcCmdLim', 'tvcActual'))   # ignore the raw command, which can be huge
+        _yfit(axs[2], ('omega',))
+        _yfit(axs[3], ('thrust',))
+        _yfit(axs[4], ('altitude', 'vz'))
 
-    fig.suptitle(
-        f"kp={kp}  ki={ki}  kd={kd}    |    (powered phase, 0–{burn_end_t:.2f}s)    "
-        f"max |θ|={overshoot:.2f}°   "
-        f"settle={'n/a' if settle_t is None else f'{settle_t:.2f}s'}   "
-        f"ss err={ss_err:.2f}°   "
-        f"saturation={sat_pct:.1f}%",
-        fontsize=10)
-
+    fig.suptitle(f"kp={kp}  ki={ki}  kd={kd}    |    powered phase 0-{burn_end_t:.2f}s\n"
+                 + "\n".join(describe(r, s) for r, s in zip(runs, stats)), fontsize=9)
     plt.show()
 
 
 if __name__ == '__main__':
-    results = run()
-    plot(results)
+    runs = [run(axis) for axis in AXES]
+    print(f"kp={kp}  ki={ki}  kd={kd}  (powered phase)")
+    for r in runs:
+        print("  " + describe(r, summarize(r)))
+    plot(runs)

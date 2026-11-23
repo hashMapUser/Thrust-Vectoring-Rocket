@@ -54,7 +54,7 @@ typedef struct {
     float press_hpa;             // last valid baro sample
     float temp_c;
 
-    float pid_p, pid_y;          // [deg] nozzle deflection commanded
+    float pid_p, pid_y;          // [deg] nozzle deflection commanded (PID output)
     float servo_p_us, servo_y_us;
 
     float    pack_v;             // via ARM_SENSE — reads 0 when SW401 is open

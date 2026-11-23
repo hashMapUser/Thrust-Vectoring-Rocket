@@ -8,44 +8,38 @@ static float _pitch_us = SERVO_PITCH_CENTER_US;
 static float _yaw_us   = SERVO_YAW_CENTER_US;
 static bool  _enabled  = false;
 
-// Map angle to pulse width, applying invert flag and hard-clamping to
-// the measured mechanical limits before writeMicroseconds().
-static float angle_to_us(float angle_deg, bool invert, float center_us,
-                          float min_us, float max_us, float max_angle_deg) {
-    float a = invert ? -angle_deg : angle_deg;
-    float clamped = constrain(a, -max_angle_deg, max_angle_deg);
-    float scale   = clamped / max_angle_deg;   // -1 to +1
-    // Span is asymmetric-safe: scales toward max_us on positive, min_us on negative.
-    float us = center_us + scale * (float)(scale >= 0 ? (max_us - center_us) : (center_us - min_us));
-    // Hard-clamp to mechanical limits — never command past a hard stop.
-    return constrain(us, min_us, max_us);
+// Nozzle angle [deg] to pulse width, applying the invert flag and clamping
+// to the axis's travel so it never commands past a limit.
+static float angle_to_us(float angle_deg, bool invert, float center_us, float span_us,
+                         float us_per_deg) {
+    const float a = invert ? -angle_deg : angle_deg;
+    return constrain(center_us + a * us_per_deg, center_us - span_us, center_us + span_us);
 }
 
 void servo_init() {
-    _pitch_servo.attach(PIN_SERVO_X, SERVO_PITCH_MIN_US, SERVO_PITCH_MAX_US);
-    _yaw_servo.attach(PIN_SERVO_Y,   SERVO_YAW_MIN_US,   SERVO_YAW_MAX_US);
+    _pitch_servo.attach(SERVO_PITCH_PIN, SERVO_PITCH_MIN_US, SERVO_PITCH_MAX_US);
+    _yaw_servo.attach(SERVO_YAW_PIN,     SERVO_YAW_MIN_US,   SERVO_YAW_MAX_US);
 
     _enabled = true;
     servo_center();
 
-    Serial.print("[SERVO] Initialized on pins ");
-    Serial.print(PIN_SERVO_X);
-    Serial.print(" (X/pitch) and ");
-    Serial.print(PIN_SERVO_Y);
-    Serial.println(" (Y/yaw)");
+    Serial.print("[SERVO] Initialized: pitch on pin ");
+    Serial.print(SERVO_PITCH_PIN);
+    Serial.print(", yaw on pin ");
+    Serial.println(SERVO_YAW_PIN);
 }
 
 void servo_set_pitch(float angle_deg) {
     if (!_enabled) return;
-    _pitch_us = angle_to_us(angle_deg, (bool)SERVO_X_INVERT, SERVO_PITCH_CENTER_US,
-                             SERVO_PITCH_MIN_US, SERVO_PITCH_MAX_US, SERVO_PITCH_MAX_ANGLE_DEG);
+    _pitch_us = angle_to_us(angle_deg, (bool)SERVO_PITCH_INVERT, SERVO_PITCH_CENTER_US,
+                            SERVO_PITCH_SPAN_US, SERVO_PITCH_US_PER_DEG);
     _pitch_servo.writeMicroseconds((int)_pitch_us);
 }
 
 void servo_set_yaw(float angle_deg) {
     if (!_enabled) return;
-    _yaw_us = angle_to_us(angle_deg, (bool)SERVO_Y_INVERT, SERVO_YAW_CENTER_US,
-                           SERVO_YAW_MIN_US, SERVO_YAW_MAX_US, SERVO_YAW_MAX_ANGLE_DEG);
+    _yaw_us = angle_to_us(angle_deg, (bool)SERVO_YAW_INVERT, SERVO_YAW_CENTER_US,
+                          SERVO_YAW_SPAN_US, SERVO_YAW_US_PER_DEG);
     _yaw_servo.writeMicroseconds((int)_yaw_us);
 }
 

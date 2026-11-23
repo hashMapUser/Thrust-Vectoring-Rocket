@@ -433,9 +433,9 @@ class BenchPanel:
 
     BENCH_CMDS = [
         ("1  Baro", "1"), ("2  IMU", "2"), ("3  Mag", "3"), ("4  Flash", "4"),
-        ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"),
-        ("S  Servos", "S"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
-        ("C  Continuity", "C"), ("A  ARM sense", "A"), ("M  Mag calibrate", "M"),
+        ("5  SD", "5"), ("6  Logger", "6"), ("7  Run all", "7"), ("8  SD diag", "8"),
+        ("S  Servos", "S"), ("I  IMU tilt", "I"), ("L  LEDs", "L"), ("B  Buzzer", "B"),
+        ("C  Continuity", "C"), ("F  Pyro fire", "F"), ("A  ARM sense", "A"), ("M  Mag calibrate", "M"),
         ("U  USB dump", "U"), ("R  Menu", "R"),
     ]
 

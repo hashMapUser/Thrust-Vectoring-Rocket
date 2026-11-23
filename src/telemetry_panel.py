@@ -74,7 +74,8 @@ MAG_FIELDS = ("mx", "my", "mz")
 MAG_OK_GAUSS = (0.10, 1.00)   # Earth's field, with margin — same band as bench test 3
 
 LOOP_BUDGET_US = 8000      # LOOP_INTERVAL_US in main_control_loop.cpp
-PID_LIMIT_DEG  = 5.0       # PID_OUT_MAX in pid.h
+PID_LIMIT_PITCH_DEG = 7.0    # SERVO_PITCH_MAX_ANGLE_DEG in servo_driver.h (nozzle deg, full travel)
+PID_LIMIT_YAW_DEG   = 10.0   # SERVO_YAW_MAX_ANGLE_DEG
 STALE_S        = 1.0       # no frame for this long = telemetry lost
 CHART_WINDOW_S = 10.0
 TRAIL_S        = 2.0
@@ -316,6 +317,13 @@ class AttitudeView(tk.Canvas):
                              *self._project((v, 0.88, g), cam), fill=col(t["RULE"], shade - 0.55))
             self.create_line(*self._project((-0.88, v, g), cam),
                              *self._project((0.88, v, g), cam), fill=col(t["RULE"], shade - 0.55))
+        # Compass on the floor — the world frame: filter north is magnetic
+        # north (the magnetometer holds the heading). Letters, not x/y, so
+        # they can't be mixed up with the IMU axes on the vehicle.
+        for label, p in (("N", (0, 0.99, g)), ("E", (0.99, 0, g)),
+                         ("S", (0, -0.99, g)), ("W", (-0.99, 0, g))):
+            self.create_text(*self._project(p, cam), text=label, font=self.fonts["label"],
+                             fill=col(t["TEXT"] if label == "N" else t["TEXT_DIM"]))
 
         # Vertical reference and the vehicle's shadow on the pad
         self.create_line(*self._project((0, 0, g), cam), *self._project((0, 0, 0.80), cam),
@@ -588,6 +596,8 @@ class StripChart(tk.Canvas):
 
         if self.limits:
             for lv in self.limits:
+                if not lo <= lv <= hi:
+                    continue
                 y = ymap(lv)
                 self.create_line(x0, y, x1, y, dash=(4, 3), tags="dyn",
                                  fill=mix(t["LAMP_AMBER"], t["WELL"], 0.45))
@@ -793,7 +803,8 @@ class TelemetryPanel(tk.Frame):
                        fmt="{:+.3f}"),
             StripChart(right, t, self.fonts, "tvc command", "deg",
                        [("pid_p", "pitch", AY), ("pid_y", "yaw", AZ)], min_span=6,
-                       fixed=(-6, 6), limits=(-PID_LIMIT_DEG, PID_LIMIT_DEG)),
+                       fixed=(-11, 11), limits=(-PID_LIMIT_PITCH_DEG, PID_LIMIT_PITCH_DEG,
+                               -PID_LIMIT_YAW_DEG, PID_LIMIT_YAW_DEG)),
             StripChart(right, t, self.fonts, "altitude", "m",
                        [("alt_m", "est", TX), ("baro_alt_m", "baro", t["TEXT_DIM"])],
                        min_span=2, symmetric=False),
@@ -986,10 +997,10 @@ class TelemetryPanel(tk.Frame):
         tvc_on = bool(fr.flags & F_TVC_LIVE)
         sat = t["LAMP_AMBER"]
         self._set("pid_p", num(fr.pid_p, "{:+.2f}"), "deg",
-                  dim or (sat if abs(fr.pid_p) >= PID_LIMIT_DEG - 1e-3 else
+                  dim or (sat if abs(fr.pid_p) >= PID_LIMIT_PITCH_DEG - 1e-3 else
                           (None if tvc_on else t["TEXT_DIM"])))
         self._set("pid_y", num(fr.pid_y, "{:+.2f}"), "deg",
-                  dim or (sat if abs(fr.pid_y) >= PID_LIMIT_DEG - 1e-3 else
+                  dim or (sat if abs(fr.pid_y) >= PID_LIMIT_YAW_DEG - 1e-3 else
                           (None if tvc_on else t["TEXT_DIM"])))
         self._set("srv_p", num(fr.servo_p_us, "{:.0f}"), "µs", dim)
         self._set("srv_y", num(fr.servo_y_us, "{:.0f}"), "µs", dim)
@@ -1131,8 +1142,9 @@ class DemoFlight:
 
         tvc = 10.0 <= tc < 13.4
         if tvc:
-            pid_p = max(-5.0, min(5.0, -(0.34 * tip_a + 0.05 * rate_a)))
-            pid_y = max(-5.0, min(5.0, -(0.34 * tip_b + 0.05 * rate_b)))
+            lp, ly = PID_LIMIT_PITCH_DEG, PID_LIMIT_YAW_DEG
+            pid_p = max(-lp, min(lp, -(0.34 * tip_a + 0.05 * rate_a)))
+            pid_y = max(-ly, min(ly, -(0.34 * tip_b + 0.05 * rate_b)))
         else:
             pid_p = pid_y = 0.0
 
@@ -1164,7 +1176,7 @@ class DemoFlight:
             press_hpa=self.GROUND_HPA * (1 - baro_alt / 44330.0) ** 5.255,
             temp_c=24.6 - alt * 0.0065,
             pid_p=pid_p, pid_y=pid_y,
-            servo_p_us=1200 + pid_p * 5.556, servo_y_us=1175 + pid_y * 5.556,
+            servo_p_us=1175 + pid_p * 510 / 7, servo_y_us=1200 + pid_y * 21.5,
             pack_v=(7.86 + noise(0, 0.01)) if flags & F_ARM_SWITCH else 0.0,
             loop_us=int(noise(520 if tvc else 380, 25)),
         )

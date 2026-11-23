@@ -347,8 +347,8 @@ void setup() {
                          ? 0.0f : fmaxf(resume.peak_altitude_m, alt_est.altitude_m);
         fsm_resume(&fsm, resume.state, resume.ms_since_launch, peak, resume.flight_proven);
     }
-    pid_init(&pid_pitch);
-    pid_init(&pid_yaw);
+    pid_init(&pid_pitch, SERVO_PITCH_MAX_ANGLE_DEG);
+    pid_init(&pid_yaw,   SERVO_YAW_MAX_ANGLE_DEG);
 
     // 7. WATCHDOG — 500 ms timeout; fed every loop iteration.
     // On watchdog reset, setup() runs again: pyro pins go LOW first via

@@ -18,9 +18,12 @@
 //    5 — Test SD card              (card detect → sensor data → flash/RAM → SD CSV)
 //    6 — Full logger round-trip    (write fake flight → dump CSV → verify)
 //    7 — Run ALL tests in sequence
+//    8 — SD diagnostics (line/bridge checks, card init stage by stage)
 //    H — Barometer lift-height test (averaged baseline, lift prompt, 2.5 s delay, averaged delta)
+//    I — IMU tilt -> gimbal response (IMU init + noise removal; rock each axis while the gimbal answers as in flight, Y/N moves on)
 //    M — Magnetometer calibration (rotate ~50 s, then 'Y' to save to EEPROM)
 //    C — Pyro continuity test (LEDs as visual aid, pyro battery must be live)
+//    F — Pyro fire test (bench load only; SW401 + continuity + typed FIRE + countdown)
 //    A — ARM_SENSE readout (plain vs pull-down, then live as flight until a key)
 //    U — USB log dump (RAM buffer -> Serial CSV, no SD card needed)
 //    R — Reset / reprint menu
@@ -42,11 +45,21 @@
 #include "mag_calib.h"
 #include "logger.h"
 #include "servo_driver.h"
+#include "pid.h"
 #include "buzzer.h"
 #include "pyro.h"
 #include "flash.h"
 
 extern "C" const buzzer_hal_t BUZZER_HAL_TEENSY;
+
+// The flight attitude filter (mahrs_integration.cpp, linked into this
+// build too) — Test I steers by the same filter the flight loop does.
+// Declared the same way main_control_loop.cpp does.
+struct RocketAttitude { float tip_a; float tip_b; float spin; };
+void mahrs_init();
+void mahrs_seed_from_accel(float ax, float ay, float az);
+void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag);
+void mahrs_get_attitude(RocketAttitude *out);
 
 // SdFat, bound explicitly to &SPI1 — the SD card is wired to SPI1
 // (pins 0/1/26/27). SD.begin(csPin) has no way to select a non-default
@@ -95,6 +108,10 @@ static void fail(const char *msg) {
 static void info(const char *msg) {
     Serial.print(F("  [INFO] ")); Serial.println(msg);
 }
+
+// Macro value as a string literal, e.g. BT_STR(SERVO_PITCH_PIN) -> "6".
+#define BT_STR2(x) #x
+#define BT_STR(x)  BT_STR2(x)
 
 // ============================================================
 //  Flash low-level (duplicated here so bench_test.cpp compiles
@@ -817,6 +834,288 @@ static void test_sd() {
 }
 
 // ============================================================
+//  TEST 8 — SD diagnostics
+//  For when Test 5's mount fails. Works along the SD path from the
+//  Teensy pins out to the card:
+//   1. Line check (card out) — each SD line under the Teensy's internal
+//      pull-up, then pull-down. A line that reads LOW against the pull-up
+//      is held down: bridged to GND at the socket, something unpowered on
+//      the net, or a damaged Teensy pin. One that reads HIGH against the
+//      pull-down is held up — the board has no SD pull-ups, so that's a
+//      bridge to 3.3 V.
+//   2. Bridge check (card out) — drives each line in turn and watches the
+//      others. The microSD socket's 0.8 mm pins bridge easily.
+//   3. Meter check (card out, optional) — drives one line HIGH at a time
+//      to be measured at J701. The only check that catches an OPEN line,
+//      which reads like a healthy one in 1 and 2. MOSI (26) and SCK (27)
+//      reach H4 through the Teensy's underside pads, so they're the
+//      likeliest opens.
+//   4. Card init (card in) — the SdFat handshake (always run at 400 kHz)
+//      and the filesystem mount, at 16, then 4, then 1 MHz, printing the
+//      step that failed and what that points to.
+// ============================================================
+#define SD_DIAG_WAIT_MS  60000
+
+struct SdLine { const char *name; uint8_t pin; uint8_t j701; };
+static const SdLine SD_LINES[4] = {    // CS first — it's skipped as a driver with a card in
+    { "CS   (pin 0,  J701-2 DAT3)", PIN_SD_CS,   2 },
+    { "MISO (pin 1,  J701-7 DAT0)", PIN_SD_MISO, 7 },
+    { "MOSI (pin 26, J701-3 CMD) ", PIN_SD_MOSI, 3 },
+    { "SCK  (pin 27, J701-5 CLK) ", PIN_SD_SCK,  5 },
+};
+
+// Next key, upper-cased, line endings ignored; 0 after SD_DIAG_WAIT_MS.
+static int wait_key() {
+    uint32_t t0 = millis();
+    while (millis() - t0 < SD_DIAG_WAIT_MS) {
+        if (!Serial.available()) continue;
+        int c = Serial.read();
+        if (c != '\r' && c != '\n') return toupper(c);
+    }
+    return 0;
+}
+
+// Card out only — with a card in, driving MISO would fight its DAT0.
+static void sd_meter_check() {
+    Serial.println(F("  Meter check — DC volts, black lead on a Teensy GND pin (H2 pin 02), not"));
+    Serial.println(F("  J701-6, so a socket ground that isn't connected can't skew the readings."));
+    Serial.println(F("    First: J701 pin 4 -> 3.3 V to Teensy GND AND to J701 pin 6. Lower to"));
+    Serial.println(F("    pin 6 means VSS isn't grounded."));
+    for (uint8_t i = 0; i < 4; i++) {
+        for (const SdLine &l : SD_LINES) { pinMode(l.pin, OUTPUT); digitalWrite(l.pin, LOW); }
+        digitalWrite(SD_LINES[i].pin, HIGH);
+        Serial.print(F("    ")); Serial.print(SD_LINES[i].name);
+        Serial.print(F(" HIGH: J701 pin ")); Serial.print(SD_LINES[i].j701);
+        Serial.println(F(" -> 3.3 V, pins 2/3/5/7 otherwise ~0 V. Any key = next, Q = stop"));
+        int c = wait_key();
+        if (c == 'Q' || c == 0) break;
+    }
+    for (const SdLine &l : SD_LINES) pinMode(l.pin, INPUT);
+    Serial.println(F("  A pin reading ~0 V while its line was HIGH is open between the Teensy chip"));
+    Serial.println(F("  and J701 — for 26/27, suspect the joint on the Teensy's underside pad first."));
+    Serial.println(F("  3.3 V on the wrong J701 pin means the lines are crossed."));
+}
+
+static bool sd_card_present_now() {
+    pinMode(PIN_SD_CD, INPUT);
+    return digitalRead(PIN_SD_CD) == SD_CD_PRESENT_LEVEL;
+}
+
+// Wait for card detect to show `present` for SD_CD_DEBOUNCE_MS, or for a
+// key (line endings ignored). Returns true if card detect got there.
+static bool wait_for_card(bool present) {
+    while (Serial.available()) Serial.read();
+    bool     holding = false;
+    uint32_t since   = 0;
+    uint32_t t0      = millis();
+    while (millis() - t0 < SD_DIAG_WAIT_MS) {
+        if (Serial.available()) {
+            int c = Serial.read();
+            if (c != '\r' && c != '\n') return false;
+        }
+        if (sd_card_present_now() != present) { holding = false; continue; }
+        if (!holding) { holding = true; since = millis(); }
+        if (millis() - since >= SD_CD_DEBOUNCE_MS) return true;
+    }
+    return false;
+}
+
+static int read_with_pull(uint8_t pin, uint8_t mode) {
+    pinMode(pin, mode);
+    delay(1);   // 100k against the socket's few pF settles in microseconds
+    return digitalRead(pin);
+}
+
+// Counts lines held LOW and lines pulled HIGH. The board has no pull-ups
+// on the SD lines, so with the card out a pulled-HIGH line is a fault too.
+static void sd_line_check(uint8_t *held_low, uint8_t *pulled_high) {
+    *held_low = *pulled_high = 0;
+    pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);   // card (if any) deselected
+    // CS (index 0) last, so it holds the card off while the others are read.
+    for (uint8_t k = 0; k < 4; k++) {
+        const SdLine &l = SD_LINES[(k + 1) % 4];
+        int up   = read_with_pull(l.pin, INPUT_PULLUP);
+        int down = read_with_pull(l.pin, INPUT_PULLDOWN);
+        pinMode(l.pin, INPUT);
+        Serial.print(F("    ")); Serial.print(l.name);
+        Serial.print(F("  pull-up: "));   Serial.print(up   ? F("HIGH") : F("LOW "));
+        Serial.print(F("  pull-down: ")); Serial.print(down ? F("HIGH") : F("LOW "));
+        if (!up) {
+            (*held_low)++;
+            Serial.println(F("  HELD LOW"));
+        } else if (down) {
+            (*pulled_high)++;
+            Serial.println(F("  PULLED HIGH"));
+        } else {
+            Serial.println(F("  OK"));
+        }
+    }
+    pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);
+}
+
+// Drive one line HIGH then LOW with the rest on the opposite pull; a line
+// that follows both ways is bridged to it. Returns the number of bridges.
+static uint8_t sd_bridge_check(bool card_in) {
+    uint8_t bridges = 0;
+    const uint8_t first = card_in ? 1 : 0;   // with a card in, CS stays HIGH — driving it LOW selects the card
+    pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);
+    for (uint8_t d = first; d < 4; d++) {
+        bool hi[4] = {}, lo[4] = {};
+        pinMode(SD_LINES[d].pin, OUTPUT);
+        digitalWrite(SD_LINES[d].pin, HIGH);
+        for (uint8_t o = first; o < 4; o++) if (o != d) hi[o] = read_with_pull(SD_LINES[o].pin, INPUT_PULLDOWN);
+        digitalWrite(SD_LINES[d].pin, LOW);
+        for (uint8_t o = first; o < 4; o++) if (o != d) lo[o] = read_with_pull(SD_LINES[o].pin, INPUT_PULLUP);
+        pinMode(SD_LINES[d].pin, INPUT);
+        for (uint8_t o = d + 1; o < 4; o++) {   // each pair once
+            if (hi[o] && !lo[o]) {
+                bridges++;
+                Serial.print(F("    BRIDGE: ")); Serial.print(SD_LINES[d].name);
+                Serial.print(F(" <-> "));       Serial.println(SD_LINES[o].name);
+            }
+        }
+        for (uint8_t o = first; o < 4; o++) pinMode(SD_LINES[o].pin, INPUT);
+    }
+    if (!bridges) Serial.println(F("    No bridges between the SD lines"));
+    return bridges;
+}
+
+// What a failed begin() points to, from SdFat's error code and the last
+// byte the card sent.
+static void explain_sd_error(uint8_t code, uint8_t data) {
+    Serial.print(F("    SdError 0x")); Serial.print(code, HEX);
+    Serial.print(F(" ("));            printSdErrorSymbol(&Serial, code);
+    Serial.print(F("), data 0x"));    Serial.println(data, HEX);
+    switch (code) {
+    case SD_CARD_ERROR_NONE:
+        Serial.println(F("    -> The card works; there's no FAT32/exFAT filesystem on it."));
+        Serial.println(F("       Format it with the SD Association's SD Card Formatter."));
+        break;
+    case SD_CARD_ERROR_CMD0:
+        if (data == 0xFF) {
+            Serial.println(F("    -> The card never answered (MISO stayed HIGH). The card has no"));
+            Serial.println(F("       power, or CS/SCK/MOSI don't reach it, or its DAT0 doesn't reach"));
+            Serial.println(F("       pin 1. J701-4 should read 3.3 V to the Teensy's GND AND to"));
+            Serial.println(F("       J701-6 (less to pin 6 = VSS not grounded). Then re-run 8 with"));
+            Serial.println(F("       the meter check (M) to find an open line."));
+        } else if (data == 0x00) {
+            Serial.println(F("    -> MISO is stuck LOW: a bridge to GND, a damaged pin 1, or a card"));
+            Serial.println(F("       with no power dragging DAT0 down through its protection diodes."));
+        } else {
+            Serial.println(F("    -> The card answered with garbage: noisy or marginal signals."));
+        }
+        break;
+    case SD_CARD_ERROR_CMD8:
+    case SD_CARD_ERROR_CMD58:
+        Serial.println(F("    -> The card answered the reset but garbled the next reply:"));
+        Serial.println(F("       marginal supply or signal quality at the socket."));
+        break;
+    case SD_CARD_ERROR_ACMD41:
+        Serial.println(F("    -> The card talks but never finished powering up (2 s timeout)."));
+        Serial.println(F("       Almost always the supply: 3.3 V at the socket sagging when the"));
+        Serial.println(F("       card draws its ~100 mA bursts. J701 has no decoupling on the"));
+        Serial.println(F("       schematic — add >= 10 uF + 100 nF across J701 pins 4 and 6."));
+        break;
+    default:
+        Serial.println(F("    -> The handshake worked but data transfers failed at this clock:"));
+        Serial.println(F("       signal quality. Trying slower."));
+        break;
+    }
+}
+
+// Handshake-stage failures happen at the fixed 400 kHz init clock, so a
+// slower data clock can't fix them.
+static bool sd_error_is_handshake(uint8_t code) {
+    return code == SD_CARD_ERROR_NONE || code == SD_CARD_ERROR_CMD0 || code == SD_CARD_ERROR_CMD8 ||
+           code == SD_CARD_ERROR_CMD58 || code == SD_CARD_ERROR_ACMD41;
+}
+
+static void test_sd_diag() {
+    print_banner("TEST 8: SD Diagnostics (SPI1 lines, socket, card init)");
+    _bench_sd.end();   // release SPI1 so the pins can be tested as GPIO
+    SPI1.end();
+
+    // --- Line + bridge checks, card out ---
+    bool card_in = sd_card_present_now();
+    if (card_in) {
+        Serial.println(F("  Remove the card for the line checks (or send any key to test with it in)..."));
+        wait_for_card(false);
+        card_in = sd_card_present_now();
+    }
+    Serial.print(F("  Line check (card "));  Serial.print(card_in ? F("IN") : F("out"));
+    Serial.println(F(", internal ~22k pull-up / ~100k pull-down):"));
+    uint8_t held_low, pulled_high;
+    sd_line_check(&held_low, &pulled_high);
+    if (card_in) pulled_high = 0;   // the card's own DAT3 pull-up can lift CS
+
+    Serial.println(F("  Bridge check:"));
+    if (card_in) info("Card is in — CS skipped (driving it LOW would select the card)");
+    uint8_t bridges = sd_bridge_check(card_in);
+
+    if (held_low) {
+        fail("A line is HELD LOW — bridged to GND at the socket (DAT0, J701-7, sits next to VSS), "
+             "something unpowered on the net, or a damaged Teensy pin");
+    }
+    if (pulled_high) {
+        fail("A line is PULLED HIGH with no card in, and the board has no SD pull-ups — bridged to "
+             "3.3 V (J701's VDD pin 4 sits between CMD and CLK)");
+    }
+    if (bridges) fail("SD lines are bridged — inspect the socket pins under magnification");
+    if (!held_low && !pulled_high && !bridges) pass("No shorts: no line held LOW or HIGH, no bridges between them");
+
+    if (!card_in) {
+        Serial.println(F("  Those can't see an OPEN line. Send M for the multimeter check (each"));
+        Serial.println(F("  line driven HIGH in turn, measured at J701), any other key to skip."));
+        while (Serial.available()) Serial.read();
+        if (wait_key() == 'M') sd_meter_check();
+    }
+
+    // --- Card init, card in ---
+    if (!card_in) {
+        Serial.println(F("  Insert the card (or send any key to try without card detect)..."));
+        if (!wait_for_card(true)) {
+            info("Card detect never showed a card — trying init anyway (the CD switch is separate "
+                 "from the contacts)");
+        }
+    }
+    delay(250);   // let the card's supply settle after insertion
+
+    SPI1.setMISO(PIN_SD_MISO);
+    SPI1.setMOSI(PIN_SD_MOSI);
+    SPI1.setSCK(PIN_SD_SCK);
+
+    const uint8_t clocks_mhz[] = { 16, 4, 1 };
+    for (uint8_t mhz : clocks_mhz) {
+        Serial.print(F("  Card init, data clock ")); Serial.print(mhz); Serial.print(F(" MHz ... "));
+        uint32_t t0 = millis();
+        bool ok = _bench_sd.begin(SdSpiConfig(PIN_SD_CS, SHARED_SPI, SD_SCK_MHZ(mhz), &SPI1));
+        uint32_t ms = millis() - t0;
+        if (ok) {
+            Serial.print(F("OK in ")); Serial.print(ms); Serial.println(F(" ms"));
+            Serial.print(F("    Card: "));
+            uint8_t type = _bench_sd.card()->type();
+            Serial.print(type == SD_CARD_TYPE_SDHC ? F("SDHC/SDXC") : type == SD_CARD_TYPE_SD2 ? F("SD v2") : F("SD v1"));
+            Serial.print(F(", ")); Serial.print(_bench_sd.card()->sectorCount() / 2048UL);
+            Serial.print(F(" MB, ")); _bench_sd.printFatType(&Serial); Serial.println();
+            if (mhz == 16) {
+                pass("SD card initialises and mounts at the firmware's 16 MHz — Test 5 should pass now");
+            } else {
+                char msg[140];
+                snprintf(msg, sizeof(msg), "Card only works at %u MHz — set SD_CLOCK_MHZ (logger.cpp) and "
+                         "BENCH_SD_CLOCK_MHZ to %u, and check signal quality", (unsigned)mhz, (unsigned)mhz);
+                fail(msg);
+            }
+            return;
+        }
+        Serial.print(F("FAILED after ")); Serial.print(ms); Serial.println(F(" ms"));
+        uint8_t code = _bench_sd.sdErrorCode();
+        explain_sd_error(code, _bench_sd.sdErrorData());
+        if (sd_error_is_handshake(code)) break;
+    }
+    fail("SD card init failed — see the diagnosis above");
+}
+
+// ============================================================
 //  TEST 6 — Full logger round-trip
 //  Writes 50 fake LogRecords via logger_write() (RAM ring buffer only),
 //  then logger_finalize() dumps them straight to FLIGHT_XXX.CSV on the
@@ -907,12 +1206,13 @@ static void test_usb_dump() {
 }
 
 // ============================================================
-//  TEST S — Servos (PIN_SERVO_X=5, PIN_SERVO_Y=6)
+//  TEST S — Servos (SERVO_PITCH_PIN, SERVO_YAW_PIN)
 //  Watch the TVC mount physically while this runs.
-//  Expected travel: ±72° pitch, ±36° yaw (SERVO_*_MAX_ANGLE_DEG) from centre.
+//  Sweeps each axis to its full travel (SERVO_*_MIN_US / MAX_US).
 // ============================================================
 static void test_servos() {
-    print_banner("TEST S: TVC Servos (X=pin5, Y=pin6)");
+    print_banner("TEST S: TVC Servos (pitch = pin " BT_STR(SERVO_PITCH_PIN)
+                 ", yaw = pin " BT_STR(SERVO_YAW_PIN) ")");
     servo_init();
 
     auto sweep = [](const char *name, auto set_fn, float max_angle_deg, float centre_us) {
@@ -931,8 +1231,8 @@ static void test_servos() {
         set_fn(0.0f); delay(600);
     };
 
-    sweep("SERVO X (pitch)", servo_set_pitch, SERVO_PITCH_MAX_ANGLE_DEG, SERVO_PITCH_CENTER_US);
-    sweep("SERVO Y (yaw)  ", servo_set_yaw,   SERVO_YAW_MAX_ANGLE_DEG,   SERVO_YAW_CENTER_US);
+    sweep("PITCH (pin " BT_STR(SERVO_PITCH_PIN) ")", servo_set_pitch, SERVO_PITCH_MAX_ANGLE_DEG, SERVO_PITCH_CENTER_US);
+    sweep("YAW   (pin " BT_STR(SERVO_YAW_PIN) ")",   servo_set_yaw,   SERVO_YAW_MAX_ANGLE_DEG,   SERVO_YAW_CENTER_US);
 
     // Diagonal corners to verify independence
     Serial.println(F("  Corner sweep (both axes together):"));
@@ -960,6 +1260,409 @@ static void test_servos() {
     Serial.println(F(")"));
 
     pass("Servos PASSED — confirm physical travel matched printout");
+}
+
+// ============================================================
+//  TEST I — IMU tilt -> gimbal response
+//  Checks that the IMU sees the rocket being tipped off its central axis,
+//  and that the gimbal answers the way it would in flight.
+//   1. IMU init (WHO_AM_I), then a fresh gyro-offset calibration, held
+//      still. The offset is what the attitude filter would otherwise
+//      integrate into a creeping tilt. Used for this run only — not saved.
+//   2. Noise check at rest: residual gyro offset and noise, accel noise,
+//      and how far the filtered attitude wanders.
+//   3. Z axis: rock the nose toward and away from you for as long as you
+//      like while the gimbal swings along Z in answer, then send Y or N for
+//      whether it went the right way in both directions. Nothing moves on
+//      until you answer. Then the X axis the same way.
+//  The gimbal runs exactly as in flight throughout — same rate, gains and
+//  limits: the flight attitude filter (mahrs_tick, 125 Hz) -> tip_a / tip_b
+//  -> pid_update with the flight gains and limits (each axis's full servo
+//  travel) -> servo_set_pitch / servo_set_yaw. Nothing is scaled up for
+//  the bench, so the swing is flight-sized.
+//  Directions: facing the IMU side, nose up, +Z is toward you and +X to
+//  your right. tip_a > 0 is the nose leaning toward +Z, tip_b > 0 toward
+//  -X (mahrs_get_attitude, after lsm6dsox_to_body). The PID commands
+//  -gain * tip, and the servos must turn that into a nozzle swing AWAY
+//  from the lean:
+//    +pitch -> nozzle +Z    -pitch -> nozzle -Z    (SERVO_PITCH_PIN)
+//    -yaw   -> nozzle +X    +yaw   -> nozzle -X    (SERVO_YAW_PIN)
+//  "Nozzle" is the exhaust end of the motor.
+// ============================================================
+#define TILT_HZ               125         // flight loop rate — mahrs_tick() assumes it
+#define TILT_DT               (1.0f / TILT_HZ)
+#define TILT_CAL_TRIES        3
+#define TILT_SEED_SAMPLES     50
+#define TILT_NOISE_TICKS      250         // 2 s at rest
+#define TILT_LPF_TAU_S        0.1f        // smooths the readout only — the PID gets the
+                                          // filter output unsmoothed, as in flight
+#define TILT_SEEN_DEG         5.0f        // lean the IMU must see each way, on each axis
+#define TILT_PRINT_MS         250
+#define TILT_MAX_ATT_PP_DEG   0.5f        // attitude wander allowed at rest
+#define TILT_MAX_GYRO_OFF_DPS 0.3f        // residual offset after calibration
+#define TILT_MAX_GYRO_SD_DPS  0.5f
+#define TILT_MAX_ACCEL_SD_G   0.02f
+
+struct TiltRun {
+    GyroBias       bias;
+    uint32_t       next_us;
+    LSM6DSOX_Data  imu;              // last sample, body frame
+    RocketAttitude att;              // as the flight PID sees it
+    float          lean_z, lean_x;   // smoothed lean: nose toward IMU +Z / +X [deg]
+    bool           quit;             // Q was sent
+};
+
+struct TiltAxis {
+    float peak_pos, peak_neg;        // furthest lean seen toward +axis / -axis [deg]
+    char  answer;                    // 'Y' / 'N' as entered
+};
+
+static void print_signed(float v, uint8_t digits) {
+    if (v >= 0.0f) Serial.print('+');
+    Serial.print(v, digits);
+}
+
+static const char *tilt_where(char sign, char axis) {
+    if (axis == 'Z') return sign == '+' ? "toward you" : "away from you";
+    return sign == '+' ? "to your right" : "to your left";
+}
+
+// Which way a controller output sends the nozzle along `axis`: '+', '-',
+// or 0 for (near) centre. +pitch -> +Z, -yaw -> +X.
+static char tilt_nozzle_sign(char axis, float pitch, float yaw) {
+    const float v = axis == 'Z' ? pitch : -yaw;
+    if (fabsf(v) < 0.25f) return 0;
+    return v > 0.0f ? '+' : '-';
+}
+
+// Next key sent, upper-cased, skipping spaces and line endings; 0 if none.
+static int tilt_key() {
+    while (Serial.available()) {
+        int c = Serial.read();
+        if (c != ' ' && c != '\r' && c != '\n') return toupper(c);
+    }
+    return 0;
+}
+
+// One 125 Hz tick of the flight attitude path: read, body frame, filter.
+// Returns false if the IMU stopped reading.
+static bool tilt_tick(TiltRun *t) {
+    const uint32_t tick_us = 1000000UL / TILT_HZ;
+    while ((int32_t)(micros() - t->next_us) < 0) {}
+    const uint32_t now = micros();
+    t->next_us += tick_us;
+    if ((int32_t)(now - t->next_us) > 0) t->next_us = now + tick_us;   // fell behind — don't burst
+
+    lsm6dsox_read(&t->imu, &t->bias);
+    if (!t->imu.valid) {
+        fail("IMU stopped returning valid data — run Test 2");
+        return false;
+    }
+    lsm6dsox_to_body(&t->imu);
+    mag_data no_mag = {};            // valid = false: tilt only, no heading needed
+    mahrs_tick(&t->imu, &no_mag);
+    mahrs_get_attitude(&t->att);
+    const float a = TILT_DT / (TILT_LPF_TAU_S + TILT_DT);
+    t->lean_z += a * ( t->att.tip_a - t->lean_z);
+    t->lean_x += a * (-t->att.tip_b - t->lean_x);
+    return true;
+}
+
+// The flight loop's control step (main_control_loop.cpp, section 5).
+static void tilt_steer(const TiltRun *t, PIDController *pp, PIDController *py,
+                       float *pitch, float *yaw) {
+    *pitch = pid_update(pp, 0.0f, t->att.tip_a, TILT_DT);
+    *yaw   = pid_update(py, 0.0f, t->att.tip_b, TILT_DT);
+    servo_set_pitch(*pitch);
+    servo_set_yaw(*yaw);
+}
+
+// Tick, and stop on Q. False on Q (t->quit) or IMU loss.
+static bool tilt_tick_or_quit(TiltRun *t) {
+    if (tilt_key() == 'Q') { t->quit = true; return false; }
+    return tilt_tick(t);
+}
+
+// One live line: the lean on `axis` (and on the other axis, which should
+// stay small), the controller's output to that axis's servo, and where that
+// puts the nozzle.
+static void tilt_print_live(const TiltRun *t, char axis, float pitch, float yaw) {
+    const bool  z   = axis == 'Z';
+    const float cmd = z ? pitch : yaw;
+    const int   us  = z ? (int)servo_get_pitch_us() - SERVO_PITCH_CENTER_US
+                        : (int)servo_get_yaw_us()   - SERVO_YAW_CENTER_US;
+    Serial.print(F("        nose ")); Serial.print(axis); Serial.print(' ');
+    print_signed(z ? t->lean_z : t->lean_x, 1);
+    Serial.print(F(" (")); Serial.print(z ? 'X' : 'Z'); Serial.print(' ');
+    print_signed(z ? t->lean_x : t->lean_z, 1);
+    Serial.print(F(") deg  ->  ")); Serial.print(z ? F("pitch ") : F("yaw "));
+    print_signed(cmd, 1); Serial.print(F(" deg = "));
+    if (us >= 0) Serial.print('+');
+    Serial.print(us); Serial.print(F(" us"));
+    const float lim = z ? SERVO_PITCH_MAX_ANGLE_DEG : SERVO_YAW_MAX_ANGLE_DEG;
+    if (fabsf(cmd) >= lim - 0.05f) Serial.print(F(" (limit)"));
+    Serial.print(F("  ->  nozzle "));
+    const char n = tilt_nozzle_sign(axis, pitch, yaw);
+    if (!n) { Serial.println(F("centred")); return; }
+    Serial.print(n); Serial.print(axis); Serial.print(F(", ")); Serial.println(tilt_where(n, axis));
+}
+
+// One axis, live until you answer: rock the nose toward +axis and -axis as
+// often as you like while the gimbal answers as in flight, then send Y / N.
+// Nothing moves on until you do. False on Q or IMU loss.
+static bool tilt_axis(TiltRun *t, PIDController *pp, PIDController *py,
+                      char axis, bool last, TiltAxis *out) {
+    *out = { 0.0f, 0.0f, 0 };
+    Serial.println();
+    Serial.print(F("  ---- ")); Serial.print(axis); Serial.print(F(" axis ("));
+    Serial.print(axis == 'Z' ? F("pitch servo, pin " BT_STR(SERVO_PITCH_PIN))
+                             : F("yaw servo, pin " BT_STR(SERVO_YAW_PIN)));
+    Serial.println(F(") ----"));
+    Serial.print(F("  Rock the nose ")); Serial.print(tilt_where('+', axis));
+    Serial.print(F(" (+")); Serial.print(axis); Serial.print(F(") and "));
+    Serial.print(tilt_where('-', axis));
+    Serial.print(F(" (-")); Serial.print(axis); Serial.println(F("), about 10-15 deg,"));
+    Serial.println(F("  back and forth as long as you like. The nozzle should swing the"));
+    Serial.println(F("  opposite way each time:"));
+    for (uint8_t i = 0; i < 2; i++) {
+        const char  lean = i == 0 ? '+' : '-', noz = i == 0 ? '-' : '+';
+        const char *w    = tilt_where(lean, axis);
+        Serial.print(F("    nose ")); Serial.print(lean); Serial.print(axis);
+        Serial.print(F(" (")); Serial.print(w); Serial.print(')');
+        for (size_t k = strlen(w); k < 14; k++) Serial.print(' ');
+        Serial.print(F("->  nozzle ")); Serial.print(noz); Serial.print(axis);
+        Serial.print(F(" (")); Serial.print(tilt_where(noz, axis)); Serial.println(')');
+    }
+    Serial.println(F("  Send Y if it went that way in BOTH directions, N if not. Nothing moves"));
+    Serial.print(F("  on until you answer — then "));
+    Serial.println(last ? F("the test finishes.") : F("it's the X axis."));
+
+    pid_reset(pp);   // a fresh start, as on the flight loop's TVC-enable edge
+    pid_reset(py);
+    float    pitch = 0.0f, yaw = 0.0f;
+    float    pr_lean = NAN, pr_off = NAN, pr_cmd = NAN;   // NaN: nothing printed yet
+    uint32_t last_print = 0;
+
+    while (true) {
+        const int c = tilt_key();
+        if (c == 'Y' || c == 'N') { out->answer = (char)c; break; }
+        if (c == 'Q') { t->quit = true; return false; }
+        if (c) Serial.println(F("        ? Send Y, N or Q"));
+
+        if (!tilt_tick(t)) return false;
+        tilt_steer(t, pp, py, &pitch, &yaw);
+
+        const float lean = axis == 'Z' ? t->lean_z : t->lean_x;
+        const float off  = axis == 'Z' ? t->lean_x : t->lean_z;
+        const float cmd  = axis == 'Z' ? pitch : yaw;
+        out->peak_pos = fmaxf(out->peak_pos,  lean);
+        out->peak_neg = fmaxf(out->peak_neg, -lean);
+
+        // Live readout — whenever something has moved, at most every TILT_PRINT_MS.
+        const uint32_t now = millis();
+        if (now - last_print >= TILT_PRINT_MS &&
+            !(fabsf(lean - pr_lean) < 0.5f && fabsf(off - pr_off) < 0.5f && fabsf(cmd - pr_cmd) < 0.2f)) {
+            tilt_print_live(t, axis, pitch, yaw);
+            pr_lean = lean; pr_off = off; pr_cmd = cmd; last_print = now;
+        }
+    }
+
+    Serial.print(F("        > ")); Serial.println(out->answer);
+    Serial.print(F("        IMU saw the nose lean up to +")); Serial.print(axis); Serial.print(' ');
+    Serial.print(out->peak_pos, 1); Serial.print(F(" deg and -")); Serial.print(axis); Serial.print(' ');
+    Serial.print(out->peak_neg, 1); Serial.println(F(" deg"));
+    return true;
+}
+
+static void test_tilt_response() {
+    print_banner("TEST I: IMU Tilt -> Gimbal Response (flight controller)");
+    Serial.println(F("  Stand the rocket nose up on its central axis and hold it still."));
+    Serial.println(F("  Starting in 3 s..."));
+    delay(3000);
+
+    // --- 1. IMU init ---
+    if (!lsm6dsox_init()) {
+        fail("lsm6dsox_init() returned false — IMU not responding (run Test 2)");
+        return;
+    }
+    pass("lsm6dsox_init() OK — WHO_AM_I 0x6C confirmed");
+    servo_init();   // centred
+
+    // --- 2. Remove the noise: measure the gyro's offset at rest ---
+    TiltRun t = {};
+    bool cal_ok = false;
+    for (uint8_t i = 1; i <= TILT_CAL_TRIES && !cal_ok; i++) {
+        cal_ok = lsm6dsox_calibrate_gyro(&t.bias);
+        if (!cal_ok && i < TILT_CAL_TRIES) {
+            Serial.println(F("  Keep it still — retrying..."));
+            delay(1000);
+        }
+    }
+    if (cal_ok) {
+        pass("Gyro offset measured and removed (this run only — not saved to EEPROM)");
+    } else if (lsm6dsox_load_bias(&t.bias)) {
+        Serial.println(F("  [WARN] Couldn't hold still long enough — using the gyro offset saved in EEPROM"));
+    } else {
+        fail("Gyro calibration kept detecting motion and no offset is saved — rest the rocket "
+             "against something and re-run I");
+        return;
+    }
+
+    // Start the attitude filter at the measured tilt, as the flight firmware does at boot.
+    float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+    int   n  = 0;
+    for (int i = 0; i < TILT_SEED_SAMPLES; i++) {
+        LSM6DSOX_Data s;
+        lsm6dsox_read(&s, &t.bias);
+        lsm6dsox_to_body(&s);
+        if (s.valid) { sx += s.ax; sy += s.ay; sz += s.az; n++; }
+        delay(1000 / TILT_HZ);
+    }
+    if (n < TILT_SEED_SAMPLES / 2) {
+        fail("Too many invalid IMU reads — SPI issue (run Test 2)");
+        return;
+    }
+    mahrs_init();
+    mahrs_seed_from_accel(sx / n, sy / n, sz / n);
+    mahrs_get_attitude(&t.att);
+    t.lean_z  =  t.att.tip_a;
+    t.lean_x  = -t.att.tip_b;
+    t.next_us = micros();
+    while (Serial.available()) Serial.read();   // drop the 'I' line ending
+
+    // Noise check: what's left at rest, through the same filter the flight loop uses.
+    Serial.println(F("  Measuring noise at rest (2 s)..."));
+    float g_sum[3] = {}, g_sq[3] = {}, a_sum = 0.0f, a_sq = 0.0f;
+    float ta_min = INFINITY, ta_max = -INFINITY, tb_min = INFINITY, tb_max = -INFINITY;
+    for (int i = 0; i < TILT_NOISE_TICKS; i++) {
+        if (!tilt_tick_or_quit(&t)) {
+            servo_center();
+            if (t.quit) info("Stopped");
+            return;
+        }
+        const float g[3] = { t.imu.gx, t.imu.gy, t.imu.gz };
+        for (int k = 0; k < 3; k++) { g_sum[k] += g[k]; g_sq[k] += g[k] * g[k]; }
+        const float am = sqrtf(t.imu.ax * t.imu.ax + t.imu.ay * t.imu.ay + t.imu.az * t.imu.az);
+        a_sum += am; a_sq += am * am;
+        ta_min = fminf(ta_min, t.att.tip_a); ta_max = fmaxf(ta_max, t.att.tip_a);
+        tb_min = fminf(tb_min, t.att.tip_b); tb_max = fmaxf(tb_max, t.att.tip_b);
+    }
+    const float N = (float)TILT_NOISE_TICKS;
+    float g_off_max = 0.0f, g_sd_max = 0.0f;
+    Serial.print(F("  Gyro residual offset (body x/y/z):"));
+    for (int k = 0; k < 3; k++) {
+        const float mean = g_sum[k] / N;
+        g_off_max = fmaxf(g_off_max, fabsf(mean));
+        g_sd_max  = fmaxf(g_sd_max, sqrtf(fmaxf(g_sq[k] / N - mean * mean, 0.0f)));
+        Serial.print(' '); print_signed(mean, 3);
+    }
+    Serial.print(F(" dps, noise ")); Serial.print(g_sd_max, 3); Serial.println(F(" dps (1 sd)"));
+    const float a_mean = a_sum / N;
+    const float a_sd   = sqrtf(fmaxf(a_sq / N - a_mean * a_mean, 0.0f));
+    Serial.print(F("  Accel ")); Serial.print(a_mean, 3);
+    Serial.print(F(" g, noise ")); Serial.print(a_sd, 4); Serial.println(F(" g (1 sd)"));
+    const float att_pp = fmaxf(ta_max - ta_min, tb_max - tb_min);
+    Serial.print(F("  Attitude: ")); Serial.print(hypotf(t.att.tip_a, t.att.tip_b), 1);
+    Serial.print(F(" deg from vertical, wandering ")); Serial.print(att_pp, 2); Serial.println(F(" deg p-p"));
+
+    if (a_mean < 0.9f || a_mean > 1.1f) {
+        servo_center();
+        fail("Accel doesn't read 1 g at rest — the IMU isn't measuring gravity correctly (run Test 2)");
+        return;
+    }
+    bool quiet = true;
+    if (g_off_max > TILT_MAX_GYRO_OFF_DPS) {
+        quiet = false;
+        Serial.println(F("  [WARN] Gyro offset left over after calibration — it moved, or the offset is drifting"));
+    }
+    if (g_sd_max > TILT_MAX_GYRO_SD_DPS || a_sd > TILT_MAX_ACCEL_SD_G) {
+        quiet = false;
+        Serial.println(F("  [WARN] Noisy at rest — vibration, a loose board, or it moved"));
+    }
+    if (att_pp > TILT_MAX_ATT_PP_DEG) {
+        quiet = false;
+        Serial.println(F("  [WARN] Attitude wandered at rest — it moved, or the readings are noisy"));
+    }
+    if (quiet) pass("Noise removed — attitude holds steady at rest");
+
+    // --- 3. Rock each axis while the gimbal answers as in flight ---
+    Serial.println();
+    Serial.println(F("  Face the IMU side of the board, nose up: +Z is toward you, +X to your"));
+    Serial.println(F("  right. From here the gimbal runs exactly as in flight: 125 Hz, flight"));
+    Serial.print(F("  gains, limits of +/-")); Serial.print(SERVO_PITCH_MAX_ANGLE_DEG, 1);
+    Serial.print(F(" deg (+/-")); Serial.print(SERVO_PITCH_SPAN_US);
+    Serial.print(F(" us) on pitch and +/-")); Serial.print(SERVO_YAW_MAX_ANGLE_DEG, 1);
+    Serial.print(F(" deg (+/-")); Serial.print(SERVO_YAW_SPAN_US); Serial.println(F(" us) on yaw:"));
+    Serial.println(F("  the full servo travel. Nothing is scaled up, so the swing grows with the"));
+    Serial.println(F("  lean and with how long you hold it. After a long hold the swing back"));
+    Serial.println(F("  takes a few seconds (the integral term unwinding). The readout shows the"));
+    Serial.println(F("  command, with (limit) when it's at full travel."));
+    Serial.println(F("  Send Q to stop."));
+
+    PIDController pid_p, pid_y;
+    pid_init(&pid_p, SERVO_PITCH_MAX_ANGLE_DEG);   // flight gains and limits
+    pid_init(&pid_y, SERVO_YAW_MAX_ANGLE_DEG);
+
+    TiltAxis z, x;
+    if (!tilt_axis(&t, &pid_p, &pid_y, 'Z', false, &z) ||
+        !tilt_axis(&t, &pid_p, &pid_y, 'X', true,  &x)) {
+        servo_center();
+        if (t.quit) info("Stopped — gimbal centred, no result");
+        return;
+    }
+    servo_center();
+
+    // --- Summary ---
+    Serial.println();
+    const TiltAxis *axes[2]  = { &z, &x };
+    const char      names[2] = { 'Z', 'X' };
+    bool imu_ok = true;
+    for (uint8_t i = 0; i < 2; i++) {
+        const TiltAxis *a    = axes[i];
+        const bool      seen = a->peak_pos >= TILT_SEEN_DEG && a->peak_neg >= TILT_SEEN_DEG;
+        if (!seen) imu_ok = false;
+        Serial.print(F("    ")); Serial.print(names[i]);
+        Serial.print(a->answer == 'Y' ? F(" axis   you: correct       IMU saw it lean +")
+                                      : F(" axis   you: NOT correct   IMU saw it lean +"));
+        Serial.print(a->peak_pos, 1); Serial.print(F(" / -")); Serial.print(a->peak_neg, 1);
+        Serial.print(F(" deg"));
+        if (!seen) { Serial.print(F("  <- under ")); Serial.print(TILT_SEEN_DEG, 0); Serial.print(F(" deg")); }
+        Serial.println();
+    }
+
+    if (imu_ok) {
+        pass("IMU saw the rocket tip off its central axis both ways, on both axes");
+    } else {
+        fail("IMU didn't see a 5+ deg lean both ways on every axis — tilt further, or the IMU is "
+             "reading the tilt on the other axis (watch the 'nose' readout; lsm6dsox_to_body)");
+    }
+
+    if (z.answer == 'Y') {
+        pass("Z axis (pitch servo, pin " BT_STR(SERVO_PITCH_PIN) "): nozzle swings away from the lean both ways");
+    } else {
+        fail("Z axis (pitch servo, pin " BT_STR(SERVO_PITCH_PIN) ") moved wrong. Readout's nose sign "
+             "matched your tilt but the nozzle went toward the lean: flip SERVO_PITCH_INVERT in "
+             "include/servo_driver.h. Readout's sign was wrong: the IMU axes are mapped wrong "
+             "(lsm6dsox_to_body). Moved along X instead: swap SERVO_PITCH_PIN / SERVO_YAW_PIN and "
+             "their MIN/MAX/CENTER numbers in servo_driver.h (not the plugs). Didn't move: servo "
+             "power, pin " BT_STR(SERVO_PITCH_PIN) " lead");
+    }
+    if (x.answer == 'Y') {
+        pass("X axis (yaw servo, pin " BT_STR(SERVO_YAW_PIN) "): nozzle swings away from the lean both ways");
+    } else {
+        fail("X axis (yaw servo, pin " BT_STR(SERVO_YAW_PIN) ") moved wrong. Readout's nose sign "
+             "matched your tilt but the nozzle went toward the lean: flip SERVO_YAW_INVERT in "
+             "include/servo_driver.h. Readout's sign was wrong: the IMU axes are mapped wrong "
+             "(lsm6dsox_to_body). Moved along Z instead: swap SERVO_PITCH_PIN / SERVO_YAW_PIN and "
+             "their MIN/MAX/CENTER numbers in servo_driver.h (not the plugs). Didn't move: servo "
+             "power, pin " BT_STR(SERVO_YAW_PIN) " lead");
+    }
+
+    if (imu_ok && z.answer == 'Y' && x.answer == 'Y') {
+        pass("Tilt response PASSED — the gimbal corrects a lean on both axes as in flight");
+    } else {
+        fail("Tilt response FAILED — do NOT fly until the IMU and both axes are right");
+    }
 }
 
 // ============================================================
@@ -1206,6 +1909,193 @@ static void test_arm_sense() {
 }
 
 // ============================================================
+//  TEST F — Pyro fire
+//  Fires one channel through the flight driver (pyro_fire_main /
+//  pyro_fire_drogue, PYRO_FIRE_DURATION_MS pulse) into a bench load: a
+//  loose e-match NOT in a charge, or a resistor/bulb load. Never with a
+//  charge loaded.
+//
+//  Gates, in order: pyro power at the load, "FIRE" typed, then a
+//  countdown any key aborts. "Power at the load" is the channel's
+//  continuity sense node, which only reads when the pack is connected,
+//  SW401 is closed AND a load completes the circuit — the direct test of
+//  whether a fire can do anything. ARM_SENSE is reported alongside (it
+//  tells "no power" from "no load") but doesn't gate: it reads the same
+//  pack one step removed, and a misreading pin 24 shouldn't block a test.
+//
+//  Evidence, from the continuity sense node (low-side switch: PYRO PWR ->
+//  match -> sense node -> MOSFET -> GND, see pyro.h):
+//    during the pulse — the node drops to ~0 V: the MOSFET switched on
+//    after the pulse  — continuity gone: the e-match burned open
+//  plus the pack sag on ARM_SENSE while current flowed.
+//
+//  pyro_fire_*() saves a "fired" flag to EEPROM, and the flight firmware
+//  only clears it on an arming edge seen after boot. A bench fire left in
+//  EEPROM would stop the main firing in flight if the board then boots
+//  with SW401 already closed — so the flags are cleared again afterwards.
+// ============================================================
+#define PYRO_TEST_CONFIRM_MS   30000
+#define PYRO_TEST_COUNTDOWN_S  5
+#define PYRO_TEST_SETTLE_MS    500     // after the pulse, before re-checking continuity
+#define PYRO_TEST_MIN_SENSE_V  0.5f    // ~2 V at the load; a 2S pack gives 1.5-2.1 V here
+
+static float bench_pack_v() {
+    return arm_counts_to_v(analogRead(PIN_ARM_SENSE)) / BENCH_ARM_SENSE_DIVIDER_RATIO;
+}
+
+// 16 samples, as pyro_check_continuity() averages them.
+static float avg_pin_v(uint8_t pin) {
+    uint32_t acc = 0;
+    for (int i = 0; i < 16; i++) { acc += analogRead(pin); delayMicroseconds(200); }
+    return arm_counts_to_v(acc / 16);
+}
+
+// True only if the next four characters (line endings skipped) are "FIRE".
+static bool read_fire_word() {
+    static const char WORD[] = "FIRE";
+    uint8_t  n  = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < PYRO_TEST_CONFIRM_MS) {
+        if (!Serial.available()) continue;
+        int c = Serial.read();
+        if (c == '\r' || c == '\n') continue;
+        if (c != WORD[n]) return false;
+        if (++n == 4) return true;
+    }
+    return false;
+}
+
+// One chirp + red LED flash per second; any key (line endings ignored)
+// aborts. Returns false if aborted.
+static bool pyro_countdown() {
+    pinMode(PIN_LED_RED, OUTPUT);
+    for (int s = PYRO_TEST_COUNTDOWN_S; s > 0; s--) {
+        Serial.print(F("    ")); Serial.print(s); Serial.println(F("..."));
+        digitalWrite(PIN_LED_RED, HIGH);
+        BUZZER_HAL_TEENSY.tone_on(PIN_BUZZER, BUZZER_FREQ_HZ);
+        bool     beeping = true;
+        uint32_t t0      = millis();
+        while (millis() - t0 < 1000) {
+            if (beeping && millis() - t0 >= 150) {
+                BUZZER_HAL_TEENSY.tone_off(PIN_BUZZER);
+                digitalWrite(PIN_LED_RED, LOW);
+                beeping = false;
+            }
+            if (!Serial.available()) continue;
+            int c = Serial.read();
+            if (c == '\r' || c == '\n') continue;   // the Enter after "FIRE"
+            BUZZER_HAL_TEENSY.tone_off(PIN_BUZZER);
+            digitalWrite(PIN_LED_RED, LOW);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void test_pyro_fire() {
+    print_banner("TEST F: Pyro Fire (flight driver, bench load only)");
+    Serial.println(F("  Load: a loose e-match NOT in a charge, or a resistor/bulb test load."));
+    Serial.println(F("  NEVER with a charge loaded. Keep hands and face clear of the match."));
+
+    analogReadResolution(12);
+    pinMode(PIN_ARM_SENSE,   INPUT_PULLDOWN);   // as flight
+    pinMode(PIN_PYRO1_SENSE, INPUT);
+    pinMode(PIN_PYRO2_SENSE, INPUT);
+
+    PyroState pyro;
+    pyro_init(&pyro);   // fire pins LOW before their drivers are enabled
+
+    Serial.println(F("  Channel? 1 = PYRO1 (main, pin 32)  2 = PYRO2 (pin 31)  anything else cancels"));
+    while (Serial.available()) Serial.read();
+    int ch = wait_key();
+    if (ch != '1' && ch != '2') { info("Cancelled — nothing fired"); return; }
+    const bool    is_main   = (ch == '1');
+    const uint8_t fire_pin  = is_main ? PIN_PYRO1_FIRE  : PIN_PYRO2_FIRE;
+    const uint8_t sense_pin = is_main ? PIN_PYRO1_SENSE : PIN_PYRO2_SENSE;
+
+    // --- Gate 1: pyro power at the load ---
+    float arm_v        = avg_pin_v(PIN_ARM_SENSE);
+    bool  arm_reads    = arm_v > BENCH_ARM_SENSE_ARMED_V;
+    float pack_before  = arm_v / BENCH_ARM_SENSE_DIVIDER_RATIO;
+    float sense_before = avg_pin_v(sense_pin);
+    Serial.print(F("  ARM_SENSE:        ")); Serial.print(arm_v, 2);
+    Serial.print(F(" V -> pack "));         Serial.print(pack_before, 2); Serial.println(F(" V"));
+    Serial.print(F("  Continuity sense: ")); Serial.print(sense_before, 2);
+    Serial.print(F(" V -> pack at the load ")); Serial.print(sense_before / PYRO_CONT_DIVIDER_RATIO, 2);
+    Serial.println(F(" V"));
+    if (sense_before < PYRO_TEST_MIN_SENSE_V) {
+        if (arm_reads) fail("Pyro power is on but nothing is connected — connect the e-match/test load, then re-run F");
+        else           fail("No pyro power at the load — connect the pyro battery, close SW401, connect the "
+                            "load, then re-run F");
+        return;
+    }
+    if (!arm_reads) {
+        info("ARM_SENSE reads low, but the load sees pyro power — pin 24 (an H4 underside pad) or its "
+             "divider isn't reaching the Teensy. Going by the sense node (run A to look at ARM_SENSE)");
+    }
+
+    // --- Gate 2: typed confirmation, Gate 3: countdown ---
+    Serial.print(F("  Type FIRE (capitals) to fire channel ")); Serial.print((char)ch);
+    Serial.println(F(" — anything else cancels (30 s)."));
+    while (Serial.available()) Serial.read();
+    if (!read_fire_word()) { info("Cancelled — nothing fired"); return; }
+    Serial.print(F("  Firing in ")); Serial.print(PYRO_TEST_COUNTDOWN_S);
+    Serial.println(F(" s — send any key to ABORT"));
+    if (!pyro_countdown()) { pyro_safe_all(&pyro); info("ABORTED — nothing fired"); return; }
+
+    // --- Fire through the flight driver ---
+    pyro_arm(&pyro);
+    pyro_clear_fired(&pyro);   // a flag left by an earlier flight or test would block the fire
+    float    sense_min = sense_before, pack_min = pack_before;
+    uint32_t t0 = millis();
+    if (is_main) pyro_fire_main(&pyro, PYRO_MAIN_MIN_ALT_M);   // the altitude floor is a flight gate, not a bench one
+    else         pyro_fire_drogue(&pyro);
+    while ((is_main ? pyro.main_firing : pyro.drogue_firing) &&
+           millis() - t0 < PYRO_FIRE_DURATION_MS + 100) {      // bound in case the pulse never ends
+        float s = arm_counts_to_v(analogRead(sense_pin));
+        float p = bench_pack_v();
+        if (s < sense_min) sense_min = s;
+        if (p < pack_min)  pack_min  = p;
+        pyro_update(&pyro);
+    }
+    uint32_t pulse_ms = millis() - t0;
+    pyro_safe_all(&pyro);
+
+    delay(PYRO_TEST_SETTLE_MS);
+    float sense_after = avg_pin_v(sense_pin);
+    bool  cont_after  = sense_after > 0.5f * sense_before;   // still near its pre-fire level = load intact
+    pyro_clear_fired(&pyro);   // leave EEPROM as an unflown board — see the header
+
+    // --- Report ---
+    Serial.print(F("  Pulse: ")); Serial.print(pulse_ms);
+    Serial.print(F(" ms on pin ")); Serial.println(fire_pin);
+    Serial.print(F("  Sense node: ")); Serial.print(sense_before, 2);
+    Serial.print(F(" V before -> "));  Serial.print(sense_min, 2);
+    Serial.print(F(" V min during -> ")); Serial.print(sense_after, 2); Serial.println(F(" V after"));
+    if (arm_reads) {
+        Serial.print(F("  Pyro pack:  ")); Serial.print(pack_before, 2);
+        Serial.print(F(" V before -> "));  Serial.print(pack_min, 2); Serial.println(F(" V min during (sag = current flowing)"));
+    } else {
+        Serial.println(F("  Pyro pack sag: not available — ARM_SENSE isn't reading"));
+    }
+
+    if (sense_min > 0.5f * sense_before) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Sense node never dropped — the MOSFET didn't switch on. Check the gate drive "
+                 "from pin %d (a Teensy underside pad), the MOSFET, and PYRO PWR", fire_pin);
+        fail(msg);
+    } else if (!cont_after) {
+        pass(is_main ? "PYRO1 FIRED — MOSFET switched and the e-match burned open"
+                     : "PYRO2 FIRED — MOSFET switched and the e-match burned open");
+    } else {
+        info("MOSFET switched, but the load is still intact. Expected for a bulb/resistor load — did "
+             "it light or heat? An e-match still intact didn't ignite: check its all-fire current "
+             "against the pack and wiring");
+    }
+    info("Fired flags cleared — EEPROM left as an unflown board");
+}
+
+// ============================================================
 //  TEST H — Barometer Lift-Height Test
 //  Captures a baseline pressure, prompts you to physically lift the
 //  barometer, then 2.5 s later averages a second reading while you hold
@@ -1379,12 +2269,15 @@ static void print_menu() {
     Serial.println(F("║  5 - SD Card (detect → stage → CSV)      ║"));
     Serial.println(F("║  6 - Logger round-trip (RAM → SD CSV)    ║"));
     Serial.println(F("║  7 - Run ALL tests in sequence            ║"));
+    Serial.println(F("║  8 - SD diagnostics (when 5 fails)       ║"));
     Serial.println(F("║  S - Servo sweep (X and Y axes)          ║"));
+    Serial.println(F("║  I - IMU tilt -> gimbal response         ║"));
     Serial.println(F("║  L - LED test (GREEN/WHITE/RED)           ║"));
     Serial.println(F("║  B - Buzzer patterns                      ║"));
     Serial.println(F("║  H - Barometer lift-height test          ║"));
     Serial.println(F("║  M - Magnetometer calibration (~50 s)    ║"));
     Serial.println(F("║  C - Pyro continuity (LED visual aid)    ║"));
+    Serial.println(F("║  F - Pyro FIRE test (bench load only)    ║"));
     Serial.println(F("║  A - ARM_SENSE readout (pin 24)          ║"));
     Serial.println(F("║  U - USB log dump (no SD needed)         ║"));
     Serial.println(F("║  R - Reprint this menu                   ║"));
@@ -1434,12 +2327,15 @@ void loop() {
         case '5': test_sd();              break;
         case '6': test_logger_roundtrip(); break;
         case '7': run_all();              break;
+        case '8': test_sd_diag();         break;
         case 'S': case 's': test_servos(); break;
+        case 'I': case 'i': test_tilt_response(); break;
         case 'L': case 'l': test_leds();   break;
         case 'B': case 'b': test_buzzer(); break;
         case 'H': case 'h': test_baro_lift_height(); break;
         case 'M': case 'm': test_mag_calibrate(); break;
         case 'C': case 'c': test_pyro_continuity(); break;
+        case 'F': case 'f': test_pyro_fire(); break;
         case 'A': case 'a': test_arm_sense(); break;
         case 'U': case 'u': test_usb_dump(); break;
         case 'R': case 'r': print_menu(); break;

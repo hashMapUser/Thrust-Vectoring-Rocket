@@ -169,8 +169,13 @@ void mahrs_tick(const LSM6DSOX_Data *imu, const mag_data *mag) {
 // ATTITUDE READOUT
 // --------------------------------------------------------
 
-// Wrapper that renames filter Euler angles to rocket-meaningful labels.
-// VERIFY THESE MAPPINGS ON THE BENCH BEFORE TRUSTING IN FLIGHT.
+// Rocket-meaningful angles, built to have no singularity short of upside
+// down. Euler angles (madgwick_get_euler) gimbal-lock at a 90° tip about
+// one axis: there the other tip angle and spin jumped by up to ~150° per
+// frame with the vehicle lying on the bench, and Euler "spin" stopped
+// seeing a roll about the airframe at all. Near upright these match the
+// Euler angles they replaced to within ~0.1° — exactly, for a tilt about
+// one axis — so the PID's inputs are unchanged where it flies.
 typedef struct {
     float tip_a;     // tip-over angle about body Y (rotation about filter-Y axis)
     float tip_b;     // tip-over angle about body Z (rotation about filter-X axis)
@@ -178,16 +183,30 @@ typedef struct {
 } RocketAttitude;
 
 void mahrs_get_attitude(RocketAttitude *out) {
-    EulerAngles e;
-    madgwick_get_euler(&mahrs, &e);
+    float q0 = mahrs.q0, q1 = mahrs.q1, q2 = mahrs.q2, q3 = mahrs.q3;
 
-    // Filter-frame Euler maps onto rocket-frame as follows:
-    //   filter roll  (rotation about filter X = body Z)   -> tip about body Z
-    //   filter pitch (rotation about filter Y = -body Y)  -> tip about body Y (sign-flipped)
-    //   filter yaw   (rotation about filter Z = body X)   -> spin about longitudinal axis
-    out->tip_b = e.roll;
-    out->tip_a = -e.pitch;   // negate because body Y = -filter Y
-    out->spin  = e.yaw;
+    // "Down" in the filter's sensor frame — the bottom row of R(q).
+    float gx = 2.0f*(q1*q3 - q0*q2);
+    float gy = 2.0f*(q2*q3 + q0*q1);
+    float gz = 1.0f - 2.0f*(q1*q1 + q2*q2);
+
+    // Tip: the tilt from vertical as a vector — angle times direction —
+    // along the two body axes. Its length is the true tilt at any angle.
+    //   filter X = body Z -> tip_b;  filter Y = -body Y -> tip_a (same signs
+    //   as the Euler roll / -pitch these replace).
+    float s    = sqrtf(gx*gx + gy*gy);                // sin(tilt)
+    float tilt = atan2f(s, gz);                       // 0 upright .. pi inverted
+    float k    = (s > 1e-6f) ? tilt / s : 1.0f;       // -> 1 near upright
+    out->tip_a = k * gx * RAD_TO_DEG;
+    out->tip_b = k * gy * RAD_TO_DEG;
+
+    // Spin: the twist about the airframe's own axis (filter Z) — the
+    // swing-twist split of the attitude. Equals Euler yaw near upright, and
+    // keeps tracking a roll about the airframe when it's lying down.
+    float spin = 2.0f * atan2f(q3, q0);
+    if (spin >  (float)M_PI) spin -= 2.0f * (float)M_PI;
+    if (spin < -(float)M_PI) spin += 2.0f * (float)M_PI;
+    out->spin = spin * RAD_TO_DEG;
 }
 
 // Upward specific force [g] in the earth frame: the body-frame accel turned
