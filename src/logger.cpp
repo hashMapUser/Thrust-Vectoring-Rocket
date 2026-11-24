@@ -316,6 +316,23 @@ static bool flog_close() {
         flog_mark(offsetof(FlashLogHeader, complete), FLOG_COMPLETE);
         _fl_state = FL_CLOSED;
     }
+    // Every page up to the write position should hold records — an empty
+    // one would end the log early when it's read back.
+    {
+        uint32_t empty = 0, first_empty = 0;
+        for (uint32_t a = FLOG_DATA_START; a < _fl_write; a += FLASH_PAGE_SIZE) {
+            uint32_t ts;
+            flash_read(a, (uint8_t *)&ts, sizeof(ts));
+            if (ts == FLOG_EMPTY_TS) { if (!empty) first_empty = a; empty++; }
+            if (_keepalive && ((a >> 8) & 0x3F) == 0) _keepalive();
+        }
+        if (empty) {
+            Serial.print("[LOGGER] WARNING: ");
+            Serial.print(empty);
+            Serial.print(" flash log page(s) didn't program, first at 0x");
+            Serial.println(first_empty, HEX);
+        }
+    }
     Serial.print("[LOGGER] Flash log closed: ");
     Serial.print(_fl_records);
     Serial.print(" records");
@@ -328,11 +345,16 @@ static bool flog_close() {
     return _fl_records > 0;
 }
 
-// Every record in the flash log, as CSV rows. Returns how many.
+// Every record in the flash log, as CSV rows. Returns how many. When this
+// session wrote the log, its end is known (_fl_write) and a page that
+// didn't program is just skipped; otherwise (a log from an earlier boot)
+// the first page with no records is taken as the end.
 static uint32_t flog_write_csv(Print &out) {
     static uint8_t page[FLASH_PAGE_SIZE];
+    const bool     end_known = (_fl_state == FL_CLOSED && _fl_write > FLOG_DATA_START);
+    const uint32_t end       = end_known ? _fl_write : FLOG_END;
     uint32_t n = 0;
-    for (uint32_t addr = FLOG_DATA_START; addr < FLOG_END; addr += FLASH_PAGE_SIZE) {
+    for (uint32_t addr = FLOG_DATA_START; addr < end; addr += FLASH_PAGE_SIZE) {
         flash_read(addr, page, FLOG_RECS_PER_PAGE * sizeof(LogRecord));
         bool any = false;
         for (uint16_t i = 0; i < FLOG_RECS_PER_PAGE; i++) {
@@ -344,7 +366,7 @@ static uint32_t flog_write_csv(Print &out) {
             n++;
             if (_keepalive) _keepalive();
         }
-        if (!any) break;   // first empty page: end of the log
+        if (!any && !end_known) break;   // first empty page: end of the log
     }
     return n;
 }

@@ -118,7 +118,7 @@ START_RETRY_S = 2.0     # resend the start command after this long without frame
 
 def read_firmware_config():
     """PID gains and limits from include/pid.h and servo_driver.h."""
-    cfg = dict(kp=0.34, ki=0.215, kd=0.05, ilim=8.5, lim_p=7.0, lim_y=10.0,
+    cfg = dict(kp=0.8, ki=0.215, kd=0.10, dalpha=0.5, ilim=8.5, lim_p=7.0, lim_y=10.0,
                src="built-in defaults")
     inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "include")
 
@@ -130,7 +130,7 @@ def read_firmware_config():
         with open(os.path.join(inc, "pid.h"), encoding="utf-8", errors="replace") as fh:
             t = fh.read()
         cfg.update(kp=grab(t, "PID_DEFAULT_KP", cfg["kp"]), ki=grab(t, "PID_DEFAULT_KI", cfg["ki"]),
-                   kd=grab(t, "PID_DEFAULT_KD", cfg["kd"]),
+                   kd=grab(t, "PID_DEFAULT_KD", cfg["kd"]), dalpha=grab(t, "PID_D_FILTER_ALPHA", cfg["dalpha"]),
                    ilim=grab(t, "PID_INTEGRAL_LIMIT", cfg["ilim"]), src="include/pid.h")
     except OSError:
         pass
@@ -403,8 +403,10 @@ class PathEstimator:
 class PidReplay:
     """Re-runs pid_update() from src/pid.cpp to split the output into P, I and D."""
 
-    def __init__(self, kp, ki, kd, lim, ilim):
+    def __init__(self, kp, ki, kd, lim, ilim, dalpha=1.0):
         self.kp, self.ki, self.kd, self.lim, self.ilim = kp, ki, kd, lim, ilim
+        self.dalpha = dalpha
+        self.d_filt = 0.0
         self.active = False
         self.integral = self.prev_err = 0.0
         self.first = True
@@ -414,13 +416,15 @@ class PidReplay:
             self.active = False
             return math.nan, math.nan, math.nan
         if not self.active:                  # rising edge: pid_reset()
-            self.integral = self.prev_err = 0.0
+            self.integral = self.prev_err = self.d_filt = 0.0
             self.first = True
         self.active = True
         e = -measured                        # setpoint is 0
         p = self.kp * e
         self.integral = max(-self.ilim, min(self.ilim, self.integral + self.ki * e * dt))
-        d = 0.0 if self.first else self.kd * (e - self.prev_err) / dt
+        if not self.first:
+            self.d_filt = self.dalpha * (e - self.prev_err) / dt + (1 - self.dalpha) * self.d_filt
+        d = self.kd * self.d_filt
         self.first = False
         self.prev_err = e
         return p, self.integral, d
@@ -514,8 +518,8 @@ class LiveDisplay:
         self.tab = Table(COLS)
         self.path = PathEstimator()
         c = self.cfg
-        self.pid_pitch = PidReplay(c["kp"], c["ki"], c["kd"], c["lim_p"], min(c["ilim"], c["lim_p"]))
-        self.pid_yaw = PidReplay(c["kp"], c["ki"], c["kd"], c["lim_y"], min(c["ilim"], c["lim_y"]))
+        self.pid_pitch = PidReplay(c["kp"], c["ki"], c["kd"], c["lim_p"], min(c["ilim"], c["lim_p"]), c["dalpha"])
+        self.pid_yaw = PidReplay(c["kp"], c["ki"], c["kd"], c["lim_y"], min(c["ilim"], c["lim_y"]), c["dalpha"])
         self.t_first = self.last_t = self.last_raw_ms = None
         self.t_offset_ms = 0.0
         self.dt_nominal = 0.024
@@ -832,8 +836,8 @@ def simulate_flight(rate_hz, cfg, seed=7):
             return 25.0
         return 13.5 if tb < burn_s - 0.25 else 13.5 * (burn_s - tb) / 0.25
 
-    pid_p = PidReplay(cfg["kp"], cfg["ki"], cfg["kd"], cfg["lim_p"], min(cfg["ilim"], cfg["lim_p"]))
-    pid_y = PidReplay(cfg["kp"], cfg["ki"], cfg["kd"], cfg["lim_y"], min(cfg["ilim"], cfg["lim_y"]))
+    pid_p = PidReplay(cfg["kp"], cfg["ki"], cfg["kd"], cfg["lim_p"], min(cfg["ilim"], cfg["lim_p"]), cfg["dalpha"])
+    pid_y = PidReplay(cfg["kp"], cfg["ki"], cfg["kd"], cfg["lim_y"], min(cfg["ilim"], cfg["lim_y"]), cfg["dalpha"])
     out = []
     h = v = 0.0
     state, t_apogee, t_land = IDLE, None, None

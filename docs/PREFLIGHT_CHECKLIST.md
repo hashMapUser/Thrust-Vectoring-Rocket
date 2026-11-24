@@ -8,8 +8,16 @@ Print this and tick it off. **A box you can't tick is a no-go.** Steps in *itali
 
 ### Firmware and gains
 - [ ] The commit you'll fly is tagged (e.g. `git tag flight-1`), so you know exactly which firmware and gains flew.
-- [ ] PID gains in `include/pid.h` match the values tuned in `tvc_sim` with the **measured** liftoff mass, CG and moment of inertia.
-- [ ] The loaded rocket weighs within 50 g of `mass` in `tvc_sim`.
+- [ ] `tvc_sim` matches the rocket as built:
+  - [ ] `mass` within 50 g of the loaded rocket on a scale (currently 0.775 kg, motor included).
+  - [ ] `MOI` from CAD **with the loaded motor in the model** (currently 0.01481 kg·m²).
+  - [ ] Per-axis `lever` in `AXES` = gimbal pivot to CG for that axis (currently pitch 140.6 mm, yaw 182.6 mm). Confirm which CAD arm drives which servo: X arm → pin 5 (yaw), Z arm → pin 6 (pitch).
+  - [ ] `distanceCPToCOM` = (nose tip → CG) − CP depth in the nose. No fins, so the CP is the nose cone's: parabolic 130 mm → 65 mm from the tip. Currently 300.47 − 65 = 235.5 mm. Redo it if the CG moves (battery, ballast).
+  - [ ] `rocketCrossSectionalArea` matches the 82.55 mm OD (0.005352 m²).
+  - [ ] `servoSecPer60` from the servo datasheet (0.12 s is an estimate). The pitch nozzle is the slow one, so this matters.
+- [ ] PID gains in `include/pid.h` re-tuned in `tvc_sim` after the items above. Current gains: Kp 0.8 / Ki 0.215 / Kd 0.10, D filter 0.5, tuned with the CAD MOI, lever arms and CP (235 mm ahead of the CG). Still to confirm: servo speed from the datasheet. The old gains (0.34 / 0.215 / 0.05) tip the rocket over in simulation.
+- [ ] `alpha` in `tvc_sim` equals `PID_D_FILTER_ALPHA` in `include/pid.h`.
+- [ ] The tuned gains hold in the stress cases: MOI ±20%, sensor noise ×4, servo 2× slower, 3° nozzle slop, CP ±50%, both axes, several noise seeds.
 
 ### Bench tests — on the flight board (`pio run -e bench -t upload`)
 - [ ] **1, 2, 3**: baro, IMU and magnetometer all PASS.
@@ -38,6 +46,15 @@ For each scenario:
 - [ ] 7 IMU fails — PASS (up to ~2 min)
 - [ ] 8 Watchdog reset — PASS (the USB port drops once mid-run)
 - [ ] Each run's `FLIGHT_XXX.CSV` plots sensibly in `tools/flight_plot.m`.
+- [ ] Flash logging, checked in the serial output during the runs:
+  - [ ] Every boot shows `[FLASH] GD25Q128 found`, **not** `JEDEC mismatch`.
+  - [ ] Scenario 1 shows `Flash log recording` at liftoff, then `Wrote N records from flash to FLIGHT_XXX.CSV` at landing.
+  - [ ] Scenario 8 shows `Flash log continuing after the reset`.
+  - [ ] The next boot with an SD card copies that flight from flash, and its CSV covers both sides of the reset.
+
+### Power
+- [ ] Servos run from the flight battery's supply, not USB. They hold centre at idle with no buzz or twitch.
+- [ ] Arming-switch voltage reads about 2.7 V with a charged pack (the arming message shows `pack=` about 8.4 V, not about 4 V).
 
 ### Flight firmware back on, ready to pack
 - [ ] **Flight firmware uploaded**: `pio run -e flight -t upload`. *Not* `bench` or `flight_sim`.

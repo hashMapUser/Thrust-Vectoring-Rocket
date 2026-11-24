@@ -31,8 +31,10 @@
 #define LOG_FLASH_SIZE      0x400000u
 
 // Records from before liftoff confirmation copied into the flash log too,
-// so it includes the pad and the launch trigger: 5 s at 125 Hz.
-#define LOG_FLASH_PRELAUNCH_RECORDS  625
+// so it includes the pad and the launch trigger (at most 1 s before
+// confirmation): 2 s at 125 Hz. Small enough to drain into flash within
+// ~2 s, so a reset early in the boost loses none of it.
+#define LOG_FLASH_PRELAUNCH_RECORDS  250
 
 // Blocks erased in the background once the switch arms the pad, so liftoff
 // doesn't start with erases (only when the previous flight is safe on SD).

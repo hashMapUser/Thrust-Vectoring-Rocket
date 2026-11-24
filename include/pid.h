@@ -6,15 +6,19 @@
 // --------------------------------------------------------
 // DEFAULT GAINS
 // --------------------------------------------------------
-// These are starting points only — MUST be tuned on a thrust stand.
-// Do not fly with untuned gains.
-//
-// Tuning order: P first (increase until oscillation, halve it),
-// then D (add damping), then I last (remove steady-state error).
+// One set for both axes, tuned in tvc_sim for the 775 g build: CAD MOI
+// 0.0148 kg*m^2, pivot-to-CG 141 mm pitch / 183 mm yaw, CP 235 mm ahead of
+// the CG (finless, nose cone only), 82.55 mm OD. The servo speed in
+// tvc_sim is still an estimate — re-check once it's known.
 
-#define PID_DEFAULT_KP   0.34f   // proportional gain
+#define PID_DEFAULT_KP   0.8f    // proportional gain
 #define PID_DEFAULT_KI   0.215f  // integral gain
-#define PID_DEFAULT_KD   0.05f   // derivative gain
+#define PID_DEFAULT_KD   0.10f   // derivative gain
+
+// Derivative low-pass, applied once per update (every 8 ms):
+// d = ALPHA * new + (1 - ALPHA) * d. 1 = no filter. 0.5 keeps attitude
+// noise from making the slow pitch servo chase the D term.
+#define PID_D_FILTER_ALPHA  0.5f
 
 // The output limit is set per controller in pid_init() — each axis gets
 // its full servo travel, SERVO_*_MAX_ANGLE_DEG from servo_driver.h.
@@ -34,6 +38,7 @@ typedef struct {
     float integral;
     float prev_error;
     float prev_output;
+    float d_filt;           // low-passed error rate [deg/s]
 
     float out_limit;        // output clamped to ±out_limit [deg]
     float integral_limit;   // integral clamped to ±integral_limit [deg]

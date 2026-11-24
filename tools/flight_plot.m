@@ -88,7 +88,7 @@ function cfg = read_firmware_config()
 % Gains and limits as the firmware defines them, so the P/I/D rebuild uses
 % the same numbers. Falls back to these values if the script isn't in the
 % repo's tools/ folder.
-cfg = struct('kp', 0.34, 'ki', 0.215, 'kd', 0.05, 'ilim', 8.5, ...
+cfg = struct('kp', 0.8, 'ki', 0.215, 'kd', 0.10, 'dalpha', 0.5, 'ilim', 8.5, ...
              'lim_p', 7, 'lim_y', 10, 'src', 'built-in defaults');
 inc = fullfile(fileparts(mfilename('fullpath')), '..', 'include');
 pidFile   = fullfile(inc, 'pid.h');
@@ -98,6 +98,7 @@ if isfile(pidFile)
     cfg.kp   = define_value(txt, 'PID_DEFAULT_KP', cfg.kp);
     cfg.ki   = define_value(txt, 'PID_DEFAULT_KI', cfg.ki);
     cfg.kd   = define_value(txt, 'PID_DEFAULT_KD', cfg.kd);
+    cfg.dalpha = define_value(txt, 'PID_D_FILTER_ALPHA', cfg.dalpha);
     cfg.ilim = define_value(txt, 'PID_INTEGRAL_LIMIT', cfg.ilim);
     cfg.src  = 'include/pid.h';
 end
@@ -209,37 +210,36 @@ d.servo_p = T.servo_pitch_us;
 d.servo_y = T.servo_yaw_us;
 nonzero = @(x) ~isnan(x) & x ~= 0;
 d.tvc = d.state == 2 | nonzero(d.pid_p) | nonzero(d.pid_y);
-d.pitch = pid_replay(d.tip_a, d.tvc, dt, cfg.kp, cfg.ki, cfg.kd, cfg.lim_p, min(cfg.ilim, cfg.lim_p));
-d.yaw   = pid_replay(d.tip_b, d.tvc, dt, cfg.kp, cfg.ki, cfg.kd, cfg.lim_y, min(cfg.ilim, cfg.lim_y));
+d.pitch = pid_replay(d.tip_a, d.tvc, dt, cfg.kp, cfg.ki, cfg.kd, cfg.dalpha, cfg.lim_p, min(cfg.ilim, cfg.lim_p));
+d.yaw   = pid_replay(d.tip_b, d.tvc, dt, cfg.kp, cfg.ki, cfg.kd, cfg.dalpha, cfg.lim_y, min(cfg.ilim, cfg.lim_y));
 
 d.events = find_events(d);
 end
 
-function r = pid_replay(meas, active, dt, kp, ki, kd, lim, ilim)
+function r = pid_replay(meas, active, dt, kp, ki, kd, dalpha, lim, ilim)
 % Re-runs pid_update() from src/pid.cpp on the logged tilt. The firmware
 % resets both controllers when TVC switches on and outputs exactly 0 while
 % it's off, so "active" is: POWERED, or a non-zero logged output.
 n = numel(meas);
 r.P = nan(n, 1);  r.I = r.P;  r.D = r.P;  r.out = r.P;
-integ = 0;  prevErr = 0;  first = true;  was = false;
+integ = 0;  prevErr = 0;  dfilt = 0;  first = true;  was = false;
 for k = 1:n
     if ~active(k) || isnan(meas(k))
         was = false;
         continue
     end
     if ~was                               % rising edge: pid_reset()
-        integ = 0;  prevErr = 0;  first = true;
+        integ = 0;  prevErr = 0;  dfilt = 0;  first = true;
     end
     was = true;
     e = -meas(k);                         % setpoint is 0
     r.P(k) = kp * e;
     integ  = min(max(integ + ki * e * dt(k), -ilim), ilim);
     r.I(k) = integ;
-    if first
-        r.D(k) = 0;
-    else
-        r.D(k) = kd * (e - prevErr) / dt(k);
+    if ~first
+        dfilt = dalpha * (e - prevErr) / dt(k) + (1 - dalpha) * dfilt;
     end
+    r.D(k) = kd * dfilt;
     first = false;
     prevErr = e;
     r.out(k) = min(max(r.P(k) + r.I(k) + r.D(k), -lim), lim);

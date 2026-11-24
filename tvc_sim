@@ -35,11 +35,11 @@ import matplotlib.pyplot as plt
 # --- PID gains (what you're tuning) ---
 # One set for both axes, as in the firmware (PID_DEFAULT_* in include/pid.h).
 # Units: degrees of nozzle per degree of tilt.
-kp = 0.34
+kp = 0.8
 ki = 0.215
-kd = 0.05
-alpha = 1.0                         # Derivative low-pass filter (0..1, 1 = no filter).
-                                    # The firmware has no D filter — keep 1.0 to match it.
+kd = 0.10
+alpha = 0.5                         # Derivative low-pass filter (0..1, 1 = no filter).
+                                    # PID_D_FILTER_ALPHA in include/pid.h — keep them equal.
 integralLimit = 8.5                 # deg     PID_INTEGRAL_LIMIT in pid.h; capped per axis
                                     #         at that axis's nozzle limit, as pid_init() does
 
@@ -47,26 +47,28 @@ integralLimit = 8.5                 # deg     PID_INTEGRAL_LIMIT in pid.h; cappe
 # mass/MOI/lever-arms below are the LOADED (liftoff) values. Propellant
 # burn-off during the flight is modeled separately below (propellantMass /
 # propellantCgOffsetAftOfCOM) rather than by editing these directly.
-mass = 0.900                        # kg      (liftoff mass, incl. propellant)
-MOI = 0.04937645                    # kg*m^2  (pitch moment of inertia, liftoff)
-distanceTVCToCOM = 0.185            # m       (lever arm, nozzle -> CoM, liftoff)
-distanceCPToCOM = 0.2467            # m       (|distance| between CP and CoM, liftoff)
-                                    # 9.71 in fwd of CoM, static margin = -3.24 cal (unstable by design)
+mass = 0.775                        # kg      (liftoff mass, incl. propellant — weighed 775 g assembled with motor)
+MOI = 0.014813                      # kg*m^2  (pitch/yaw MOI about the CG, liftoff — CAD Lxx/Lzz 14.81e6 g*mm^2)
+# Gimbal pivot -> CoM distance (the TVC lever arm) is per axis — see AXES below.
+distanceCPToCOM = 0.23547           # m       (|distance| between CP and CoM, liftoff)
+                                    # No fins, so the CP is the nose cone's (Barrowman): parabolic,
+                                    # 130 mm long -> CP 65 mm aft of the nose tip. Nose tip -> CG
+                                    # is 300.47 mm (CAD), so CP is 235.47 mm forward of the CG.
 isAerodynamicallyUnstable = True    # True = CP fwd of CoM (destabilizing), False = CP aft (stabilizing)
 C_N_alpha = 2.0                     # 1/rad   (normal force slope; ~2 for slender rockets)
-rocketCrossSectionalArea = 0.006207 # m^2     (pi * (3 in / 2)^2 ~ 3" airframe)
+rocketCrossSectionalArea = 0.005352 # m^2     (pi * (82.55 mm / 2)^2, 3.25" OD airframe)
 dragCoefficient = 0.45              # C_d
 
 # Propellant burn-off: ~60 g of the F15's mass leaves during the burn, and
 # it sits aft of the vehicle CG (down near the nozzle), so the combined CG
 # moves forward as it depletes — this shrinks distanceCPToCOM (less
-# destabilizing moment arm) and grows distanceTVCToCOM (more TVC leverage)
+# destabilizing moment arm) and grows the TVC lever arms (more leverage)
 # over the burn. propellantCgOffsetAftOfCOM is an ESTIMATE (typical motor
 # placement for this airframe) — replace with a measured value from the
 # mass model if/when one exists; it only scales the size of this effect,
 # the direction is correct either way.
 propellantMass = 0.060              # kg (Estes F15 propellant weight, certified)
-propellantCgOffsetAftOfCOM = 0.10   # m  ESTIMATE — verify against the mass model
+propellantCgOffsetAftOfCOM = 0.15   # m  ESTIMATE — the motor sits in the gimbal, 141-183 mm aft of the CG
 
 # --- TVC axes ---
 # Nozzle deflection at full servo travel (measured 2026-11-20) and the servo
@@ -74,9 +76,11 @@ propellantCgOffsetAftOfCOM = 0.10   # m  ESTIMATE — verify against the mass mo
 # include/servo_driver.h. The nozzle limit is also the firmware's PID output
 # limit. span_us / limit is the linkage (us per nozzle degree), which with
 # the servo speed below sets how fast the nozzle can move on that axis.
+# lever is that axis's gimbal pivot -> CoM distance at liftoff (CAD): the two
+# gimbal rings pivot at different heights, so the axes get different leverage.
 AXES = {
-    "pitch": dict(limit=7.0,  span_us=510),   # nozzle along Z, servo on pin 6
-    "yaw":   dict(limit=10.0, span_us=215),   # nozzle along X, servo on pin 5
+    "pitch": dict(limit=7.0,  span_us=510, lever=0.14061),   # nozzle along Z, servo on pin 6 (Z arm)
+    "yaw":   dict(limit=10.0, span_us=215, lever=0.18261),   # nozzle along X, servo on pin 5 (X arm)
 }
 
 # --- Servo / actuator ---
@@ -213,12 +217,12 @@ def run(axis):
 
     # --- Solve the fixed dry-airframe CG and propellant CG positions
     # (both measured as a distance from the nozzle, "forward" = larger)
-    # that combine to the configured liftoff distanceTVCToCOM, given
+    # that combine to this axis's liftoff lever arm, given
     # propellant sits propellantCgOffsetAftOfCOM behind the liftoff CG.
     # Both positions are then fixed for the whole flight; only how much
     # propellant mass remains at the propellant position changes.
     dryMass = mass - propellantMass
-    x_combined_liftoff = distanceTVCToCOM
+    x_combined_liftoff = AXES[axis]["lever"]
     x_propellant = x_combined_liftoff - propellantCgOffsetAftOfCOM
     x_dry = (x_combined_liftoff * mass - propellantMass * x_propellant) / dryMass
 

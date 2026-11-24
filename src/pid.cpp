@@ -19,6 +19,7 @@ void pid_reset(PIDController *pid) {
     pid->integral   = 0.0f;
     pid->prev_error = 0.0f;
     pid->prev_output = 0.0f;
+    pid->d_filt     = 0.0f;
     pid->first_run  = true;
 }
 
@@ -42,12 +43,13 @@ float pid_update(PIDController *pid, float setpoint, float measured, float dt) {
     float i_term   = pid->integral;
 
     // ── DERIVATIVE ──
-    // Works out to kd * (change in error) / dt. The TVC setpoint is always
-    // 0, so that's the same as -kd * (rate of the measured tilt).
-    float d_term = 0.0f;
+    // kd * (rate of change of the error), low-passed by PID_D_FILTER_ALPHA.
+    // The TVC setpoint is always 0, so that's -kd * (rate of the measured tilt).
     if (!pid->first_run) {
-        d_term = -pid->kd * (measured - (setpoint - pid->prev_error)) / dt;
+        float rate = (error - pid->prev_error) / dt;
+        pid->d_filt = PID_D_FILTER_ALPHA * rate + (1.0f - PID_D_FILTER_ALPHA) * pid->d_filt;
     }
+    float d_term = pid->kd * pid->d_filt;
     pid->first_run  = false;
     pid->prev_error = error;
 

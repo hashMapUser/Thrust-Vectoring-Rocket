@@ -10,22 +10,22 @@
 // Scenarios — the menu in the simulation build, in this order
 // --------------------------------------------------------
 const SimScenario SIM_SCENARIOS[] = {
-    { "Nominal",       "F-15, 0.90 kg: launch, burnout, apogee, main, landing",
+    { "Nominal",       "F-15, 0.775 kg (as built): launch, burnout, apogee, main, landing",
+      0.775f, 1.00f, 12.0f, SIM_FAULT_NONE,      0.0f },
+    { "Heavy",         "0.90 kg (+125 g): same sequence, lower apogee",
       0.90f, 1.00f, 12.0f, SIM_FAULT_NONE,      0.0f },
-    { "Heavy",         "1.00 kg: same sequence, lower apogee",
-      1.00f, 1.00f, 12.0f, SIM_FAULT_NONE,      0.0f },
     { "Weak motor",    "thrust -15%: same sequence, lower apogee",
-      0.90f, 0.85f, 12.0f, SIM_FAULT_NONE,      0.0f },
+      0.775f, 0.85f, 12.0f, SIM_FAULT_NONE,      0.0f },
     { "Calm descent",  "chute barely swings: landing must not be called mid-air",
-      0.90f, 1.00f,  1.0f, SIM_FAULT_NONE,      0.0f },
+      0.775f, 1.00f,  1.0f, SIM_FAULT_NONE,      0.0f },
     { "Pad bump",      "2.2 g knock for 150 ms, no ignition: no launch, no fire",
-      0.90f, 1.00f, 12.0f, SIM_FAULT_PAD_BUMP,  0.0f },
+      0.775f, 1.00f, 12.0f, SIM_FAULT_PAD_BUMP,  0.0f },
     { "Baro fails",    "baro dead from T+1 s: apogee by velocity/timeout, landing by fallback",
-      0.90f, 1.00f, 12.0f, SIM_FAULT_BARO_DEAD, 1.0f },
+      0.775f, 1.00f, 12.0f, SIM_FAULT_BARO_DEAD, 1.0f },
     { "IMU fails",     "IMU dead from T+2 s: TVC off, apogee by baro/timeout, landing by fallback",
-      0.90f, 1.00f, 12.0f, SIM_FAULT_IMU_DEAD,  2.0f },
+      0.775f, 1.00f, 12.0f, SIM_FAULT_IMU_DEAD,  2.0f },
     { "Watchdog reset","firmware hangs at T+3 s: reboot, resume, chute still fires",
-      0.90f, 1.00f, 12.0f, SIM_FAULT_WDT_RESET, 3.0f },
+      0.775f, 1.00f, 12.0f, SIM_FAULT_WDT_RESET, 3.0f },
 };
 const int SIM_SCENARIO_COUNT = sizeof(SIM_SCENARIOS) / sizeof(SIM_SCENARIOS[0]);
 
@@ -36,7 +36,7 @@ static const float G          = 9.80665f;
 static const float PI_F       = 3.14159265f;
 static const float DEG        = PI_F / 180.0f;
 static const float K_BODY     = 0.5f * 1.225f * 0.45f * 0.0062f;   // rho Cd A / 2 — 3" airframe
-static const float K_CHUTE    = 0.84f * 9.80665f / (4.5f * 4.5f);   // 4.5 m/s under the main at burnout mass
+static const float K_CHUTE    = 0.715f * 9.80665f / (4.5f * 4.5f);  // 4.5 m/s under the main at burnout mass (775 g - 60 g)
 static const float INFLATE_S  = 0.6f;
 static const float PROP_KG    = 0.060f;
 static const float SITE_ELEV  = 150.0f;                             // m above sea level
