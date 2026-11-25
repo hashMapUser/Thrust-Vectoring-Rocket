@@ -18,37 +18,67 @@
 // STATE TRANSITION THRESHOLDS
 // --------------------------------------------------------
 
-// G2 — Launch detection, sized for this motor/airframe (F-15 @ 0.9 kg:
-// peak accel reading ~2.9 g, sustained ~1.6 g). Threshold sits between the
-// pad-rest ceiling (1.10 g) and the worst-case peak (~2.45 g, weak motor).
-// Only needs to hold for a short bump-rejection window — the altitude gain
-// check below is what actually confirms a real launch.
-#define LAUNCH_ACCEL_THRESHOLD_G   1.8f
-#define LAUNCH_ACCEL_MS            100    // accel must hold this long (bump rejection)
+// G1 — Arming settle. The arming switch (SW401) is closed with the rocket
+// already on the rail; launch detection is armed only once the switch has
+// stayed closed this long, so the crew walking away, the igniter going in
+// and the rail being touched can't count. Opening the switch disarms it,
+// and the next close starts the wait again.
+#define ARM_SETTLE_MS              30000
+//
+// The same window calibrates the accelerometer bias (main_control_loop.cpp):
+// the rocket starts and ends it at rest, so the true vertical accel averages
+// to exactly 1 g over it even if it was handled partway through — whatever
+// is left over is sensor bias.
 
-// G2b — Altitude confirmation: a real launch must also show altitude gain,
-// not just an accel spike (rules out a bump/knock while sitting on the pad).
-#define LAUNCH_ALT_DELTA_M         2.0f    // m AGL gain required, measured from the launch baseline (pad_rest_baseline_alt_m)
-#define LAUNCH_CONFIRM_MS          1000    // total window (from accel latch start) to see that gain
+// G2 — Launch detection: a large AND sustained acceleration along the
+// airframe. The reading is low-pass filtered first (LAUNCH_ACCEL_TAU_MS)
+// so motor vibration, which shakes single 125 Hz samples by a g or more,
+// can't break the hold. It must then stay above the threshold for the
+// whole of LAUNCH_CONFIRM_MS — a knock is over long before that; only a
+// burning motor keeps it up.
+//
+// Threshold vs the certified F-15 curve: its lowest sustained thrust
+// (~13.0 N, late in the burn) is 1.71 g at 0.775 kg and 1.47 g at 0.90 kg,
+// and the thrust spike carries it well above that through the first 0.9 s.
+// 1.5 g is therefore held for practically the whole burn at the as-built
+// mass, and through the first ~2.8 s even 125 g heavy — far longer than
+// the hold. Well above the 1 g a rocket sitting on the rail reads.
+#define LAUNCH_ACCEL_THRESHOLD_G   1.5f
+#define LAUNCH_ACCEL_TAU_MS        40     // low-pass time constant on the launch accel
+#define LAUNCH_CONFIRM_MS          500    // filtered accel must stay above LAUNCH_RELEASE_G this long
+
+// Once latched, the hold is only broken if the filtered accel falls back
+// below this — not the trigger threshold — so vibration riding on a
+// marginal thrust level (heavy rocket, late in the spike) doesn't cancel a
+// real launch. Still well above the 1 g at rest, so a knock that has
+// passed is caught. Checked offline against the F-15 curve with up to
+// 1.5 g of vibration noise: a big gain in confirmations, no extra knocks.
+#define LAUNCH_RELEASE_G           1.2f
+
+// G2b — Climb backstop: a launch the accel trigger missed (odd motor, an
+// accelerometer problem, ignition during the 30 s settle) still shows up
+// as the barometer climbing fast. Measured on the raw baro altitude —
+// independent of the accelerometer, and frozen (not drifting) if the baro
+// dies — against a reference that follows the pad slowly
+// (LAUNCH_CLIMB_REF_TAU_MS), so carrying the rocket uphill or a slow
+// weather change never builds up 8 m: a steady 2 m/s climb lags only 6 m.
+// The F-15 gets 8 m clear of the reference at T+1.5 s (as built) to
+// T+2.0 s (125 g heavy and 15% weak), still in the burn. Runs in IDLE and
+// ARMED at all times, the settle included.
+#define LAUNCH_CLIMB_M             8.0f
+#define LAUNCH_CLIMB_HOLD_MS       100     // must hold this long (one wild baro sample isn't a climb)
+#define LAUNCH_CLIMB_REF_TAU_MS    3000
+
+// G2c — Unarmed failsafe: if the motor lights with SW401 open, the same
+// launch detection (G2 accel trigger, G2b climb) runs in IDLE too, with no
+// settle wait, so the rocket still steers, logs and runs its recovery
+// sequence. The open switch has cut PYRO PWR, so the main charge can't
+// actually fire. A rocket on the pad reads 1 g, which never passes
+// burnout (BURNOUT_ACCEL_THRESHOLD_G), so a false trigger on the ground
+// sits in POWERED with nothing fired — reboot to clear it.
 
 // POWERED → COAST: motor burnout
 #define BURNOUT_ACCEL_THRESHOLD_G  0.5f
-
-// G1 — Pad-rest precondition (must latch before launch detection is armed)
-#define PAD_REST_MS                2000   // ms of continuous pad-rest
-#define PAD_REST_ACCEL_LOW_G       0.90f
-#define PAD_REST_ACCEL_HIGH_G      1.10f
-#define PAD_REST_GYRO_DPS          5.0f
-#define PAD_REST_ACCEL_UP_G        0.85f  // vehicle must be vertical
-
-// Once latched, pad rest is only dropped after a disturbance lasts this
-// long. A launch passes through "not at rest" too: thrust ramps the
-// accelerometer through 1.1-1.8 g for ~120 ms (F-15) before it crosses
-// LAUNCH_ACCEL_THRESHOLD_G, and ignition shakes the gyro. Dropping the
-// latch on the first such tick disarmed launch detection for good — found
-// by the bench simulation. Handling the rocket lasts longer than this; a
-// knock that does pass the threshold is still rejected by the altitude check.
-#define PAD_REST_LOSS_MS           500
 
 // G3 — Flight-proof velocity latch. All simulated cases (weak motor to
 // heavy) peak between 16 and 24 m/s, so 25 was unreachable — set below
@@ -97,7 +127,7 @@
 
 typedef enum {
     STATE_IDLE          = 0,   // on the pad, disarmed (SW401 open)
-    STATE_ARMED         = 1,   // on the pad, armed (SW401 closed) — see fsm_set_armed()
+    STATE_ARMED         = 1,   // on the pad, armed (SW401 closed) — launch detection after ARM_SETTLE_MS, see fsm_set_armed()
     STATE_POWERED       = 2,
     STATE_COAST         = 3,
     STATE_APOGEE        = 4,
@@ -132,14 +162,21 @@ typedef struct {
     bool     main_fired;
     bool     tvc_enabled;
 
-    // G1 — pad-rest latch (evaluated in IDLE; once true, gates launch
-    // detection directly — no arm step in between)
-    bool     pad_rest_satisfied;
-    uint32_t pad_rest_start_ms;
-    bool     pad_rest_unsettled;       // latched, but disturbed since pad_rest_unsettled_ms
-    uint32_t pad_rest_unsettled_ms;
-    float    pad_rest_baseline_alt_m;  // launch baseline: the armed ground reference once captured, else the altitude snapshot at pad-rest latch
-    bool     baseline_from_arm;        // set by fsm_set_launch_baseline(); pad-rest latches stop overwriting the baseline
+    // G1 — set once SW401 has been closed for ARM_SETTLE_MS; the accel
+    // trigger runs in ARMED only while this is true. Cleared on disarm.
+    bool     launch_armed;
+
+    // Any launch trigger (accel latch or climb) since the last arming
+    // edge — tells the logger the flash log must not be recycled.
+    bool     launch_seen;
+
+    // G2 — low-pass filtered accel_up_g, the signal launch detection uses.
+    float    launch_accel_g;
+    uint32_t last_update_ms;    // previous fsm_update() call, for the filters' dt
+
+    // G2b — slowly tracking pad altitude (raw baro) and the climb timer.
+    float    climb_ref_m;       // NAN = re-seed from the next baro reading
+    uint32_t climb_since_ms;    // 0 = not above LAUNCH_CLIMB_M
 
     // Fault flags. imu_fault latches on an invalid IMU reading: TVC goes
     // off, and so does velocity-based apogee (the velocity is integrated
@@ -161,6 +198,8 @@ void fsm_init(FlightSM *fsm);
 /**
  * Update state machine. Call every loop iteration.
  * @param altitude_m  Estimated altitude AGL [m] — used for the apogee baro-drop backstop.
+ * @param baro_alt_m  Raw barometric altitude AGL [m], last sample held (NAN before the
+ *                    first) — used only by the G2b climb backstop on the pad.
  */
 void fsm_update(FlightSM *fsm,
                 float accel_up_g,
@@ -168,33 +207,25 @@ void fsm_update(FlightSM *fsm,
                 float accel_mag_g,
                 float gyro_rate_dps,
                 float altitude_m,
+                float baro_alt_m,
                 bool  imu_valid);
+
+/**
+ * Re-seed the G2b climb reference from the next baro reading. Call when
+ * the altitude reference is re-zeroed on the pad (the SW401 ground
+ * capture), which steps the baro altitude and would look like a climb.
+ */
+void fsm_reset_climb_ref(FlightSM *fsm);
 
 /**
  * Reflect the arming switch (SW401) into the FSM. Only transitions
  * IDLE <-> ARMED — a no-op once launch detection has latched or flight
- * has begun. The switch is a hardware interlock (it cuts PYRO PWR); this
- * is display/logging only and must never gate whether a pyro can fire —
- * see main_control_loop.cpp's arming-switch handling for the full policy.
+ * has begun. Entering ARMED starts the ARM_SETTLE_MS wait, after which
+ * launch detection is live; going back to IDLE cancels it. The switch is
+ * also a hardware interlock (it cuts PYRO PWR) — see
+ * main_control_loop.cpp's arming-switch handling for the full policy.
  */
 void fsm_set_armed(FlightSM *fsm, bool armed);
-
-/**
- * Lock the launch baseline to the ground reference captured after the
- * SW401 arming edge (ALT_GROUND_SAMPLES averaged readings). Later pad-rest
- * latches keep it instead of taking a fresh single-tick snapshot, until
- * the switch is opened again. Only call while still on the pad.
- * @param altitude_m  Estimated altitude at the new reference (0 right after alt_set_ground()).
- */
-void fsm_set_launch_baseline(FlightSM *fsm, float altitude_m);
-
-/**
- * Replace the pad-rest altitude snapshot — call after alt_calibrate_finish()
- * re-syncs the altitude estimate on the pad-rest latch, so the baseline
- * matches the re-synced altitude rather than the pre-calibration one.
- * No-op once the armed ground reference is locked (fsm_set_launch_baseline()).
- */
-void fsm_set_pad_rest_baseline(FlightSM *fsm, float altitude_m);
 
 /**
  * Pick a flight back up after a mid-flight watchdog reset (see

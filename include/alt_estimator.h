@@ -88,7 +88,7 @@
  *   // -- on the pad: --
  *   alt_calibrate_reset(&est);                // when the vehicle comes to rest upright
  *   alt_calibrate_sample(&est, accel_z_g);    // every tick while it stays that way
- *   alt_calibrate_finish(&est);               // once enough samples (pad-rest latch)
+ *   alt_calibrate_finish(&est);               // at the end of the arming settle window
  */
 typedef struct {
     // ---- filter state ----
