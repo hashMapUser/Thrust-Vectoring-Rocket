@@ -71,6 +71,16 @@ static const Step PAT_LOCATOR[] = {
     { false, 500 },
 };
 
+/* LAUNCH_READY: one long tone, then hold silent — the 30 s arming settle
+ * is over and launch detection is live. A short gap first so it stands
+ * apart from the armed chirps it interrupts. The caller switches back to
+ * the armed pattern once it's done (BUZZ_LAUNCH_READY_MS). */
+static const Step PAT_LAUNCH_READY[] = {
+    { false, 200    },
+    { true,  1500   },
+    { false, 0xFFFF },
+};
+
 /* Silent: off indefinitely */
 static const Step PAT_SILENT[] = {
     { false, 0xFFFF },
@@ -92,6 +102,7 @@ static const Pattern PATTERNS[BUZZ_PATTERN_COUNT] = {
     PAT(PAT_ARMED),         /* BUZZ_ARMED         */
     PAT(PAT_CONT_OPEN),     /* BUZZ_CONT_OPEN     */
     PAT(PAT_LOCATOR),       /* BUZZ_LOCATOR       */
+    PAT(PAT_LAUNCH_READY),  /* BUZZ_LAUNCH_READY  */
 };
 
 /* ------------------------------------------------------------------ */
