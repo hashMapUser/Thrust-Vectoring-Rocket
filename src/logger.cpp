@@ -34,6 +34,16 @@
 //                          logger_finalize() (landing) — from flash when it
 //                          holds the flight, otherwise from the RAM buffer.
 //                       3. At boot, a flight left in flash but not on the card.
+//                       4. When SW401 is opened (logger_save_to_sd()) — the
+//                          flash log so far, to its own FLIGHT_XXX.CSV.
+//
+//  Dates           : files on the card are dated from the Teensy's RTC,
+//                     set over USB (logger_clock_command(), sent by the
+//                     tools in tools/). A log copied from flash is dated
+//                     when it started recording — kept in its header, so
+//                     even a copy made at a later boot gets the flight's
+//                     date. With the clock not set, files get SdFat's
+//                     default date and the .LOG lines no date.
 //
 //  Flash log layout (from LOG_FLASH_BASE)
 //  --------------------------------------
@@ -108,6 +118,7 @@ typedef struct {
     uint16_t records_per_page;
     uint32_t complete;           // FLOG_COMPLETE once logger_finalize() closed it out
     uint32_t saved;              // FLOG_SAVED once it's on the SD card
+    uint32_t start_time;         // RTC (local time, Unix-style seconds) when it started; erased = unknown
 } FlashLogHeader;
 
 typedef enum {
@@ -128,6 +139,55 @@ static bool          _fl_unsaved     = false;  // flash holds a log that isn't o
 static bool          _fl_has_old     = false;  // the log holds data from before this recording began
 static bool          _fl_wrap_ok     = false;  // logger_allow_wrap(): may start over when full
 static uint16_t      _fl_unflashed   = 0;      // records stored since the flash last recorded (none of them in it)
+
+// ============================================================
+//  Wall clock (Teensy RTC)
+// ============================================================
+
+// With its backup supply lost the RTC restarts at 2019, so anything
+// before 2025 means "not set".
+#define CLOCK_VALID_AFTER 1735689600u   // 2025-01-01 00:00
+
+static bool clock_valid(uint32_t t) {
+    return t >= CLOCK_VALID_AFTER && t != 0xFFFFFFFFu;
+}
+
+typedef struct { uint16_t year; uint8_t month, day, hour, minute, second; } CivilTime;
+
+static CivilTime civil_time(uint32_t t) {
+    CivilTime c;
+    uint32_t days = t / 86400, secs = t % 86400;
+    c.hour = secs / 3600; c.minute = (secs / 60) % 60; c.second = secs % 60;
+    // Days since 1970-01-01 to y/m/d (H. Hinnant's civil_from_days).
+    int32_t  z   = (int32_t)days + 719468;
+    int32_t  era = z / 146097;
+    uint32_t doe = (uint32_t)(z - era * 146097);
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp  = (5 * doy + 2) / 153;
+    c.day   = doy - (153 * mp + 2) / 5 + 1;
+    c.month = mp < 10 ? mp + 3 : mp - 9;
+    c.year  = yoe + era * 400 + (c.month <= 2);
+    return c;
+}
+
+static void print_time(Print &out, uint32_t t) {
+    CivilTime c = civil_time(t);
+    char s[24];
+    snprintf(s, sizeof(s), "%04u-%02u-%02u %02u:%02u:%02u",
+             c.year, c.month, c.day, c.hour, c.minute, c.second);
+    out.print(s);
+}
+
+// SdFat's date callback: stamps every file created or written.
+static void sd_datetime(uint16_t *date, uint16_t *time, uint8_t *ms10) {
+    uint32_t t = rtc_get();
+    *ms10 = 0;
+    if (!clock_valid(t)) { *date = FS_DATE(2000, 1, 1); *time = 0; return; }
+    CivilTime c = civil_time(t);
+    *date = FS_DATE(c.year, c.month, c.day);
+    *time = FS_TIME(c.hour, c.minute, c.second);
+}
 
 // ============================================================
 //  Pick the next free FLIGHT_XXX.CSV / .LOG slot
@@ -259,6 +319,7 @@ static void flog_service(bool flush) {
         h.magic            = FLOG_MAGIC;
         h.record_size      = sizeof(LogRecord);
         h.records_per_page = FLOG_RECS_PER_PAGE;
+        if (clock_valid(rtc_get())) h.start_time = rtc_get();
         flash_page_program_start(LOG_FLASH_BASE, (const uint8_t *)&h, sizeof(h));
         _fl_header_due = false;
         return;
@@ -434,12 +495,22 @@ static uint32_t flog_write_csv(Print &out) {
 // Copy the flash log to `name` on the SD card and mark it saved.
 static bool flog_copy_to_sd(const char *name) {
     if (!flog_wait(3000)) return false;
+    FlashLogHeader h;
+    flog_read_header(&h);
     FsFile f = _sd.open(name, O_WRONLY | O_CREAT | O_TRUNC);
     if (!f) return false;
     f.print(CSV_HEADER);
     uint32_t n = flog_write_csv(f);
     f.sync();
     bool ok = !f.getWriteError();
+    // Date the file when the log started. If the clock isn't set now
+    // (e.g. a copy at a later boot with no RTC backup), its modified date
+    // too — otherwise that one is now.
+    if (ok && clock_valid(h.start_time)) {
+        CivilTime c = civil_time(h.start_time);
+        uint8_t flags = T_CREATE | (clock_valid(rtc_get()) ? 0 : (T_WRITE | T_ACCESS));
+        f.timestamp(flags, c.year, c.month, c.day, c.hour, c.minute, c.second);
+    }
     f.close();
     if (!ok) return false;
     flog_mark(offsetof(FlashLogHeader, saved), FLOG_SAVED);
@@ -447,7 +518,13 @@ static bool flog_copy_to_sd(const char *name) {
     Serial.print("[LOGGER] Wrote ");
     Serial.print(n);
     Serial.print(" records from flash to ");
-    Serial.println(name);
+    Serial.print(name);
+    if (clock_valid(h.start_time)) {
+        Serial.print(" (recorded ");
+        print_time(Serial, h.start_time);
+        Serial.print(")");
+    }
+    Serial.println();
     return true;
 }
 
@@ -497,6 +574,15 @@ static void ram_reset() {
 
 bool logger_init() {
     ram_reset();
+    FsDateTime::setCallback(sd_datetime);
+    if (clock_valid(rtc_get())) {
+        Serial.print("[CLOCK] ");
+        print_time(Serial, rtc_get());
+        Serial.println(" — SD files will be dated.");
+    } else {
+        Serial.println("[CLOCK] Not set — SD files won't be dated. Set it over USB: "
+                       "python tools/set_clock.py --port COMx");
+    }
     flog_bring_up();
 
     pinMode(PIN_SD_CS, OUTPUT);
@@ -587,6 +673,7 @@ void logger_checkpoint(FlightState state, float altitude_m) {
         return;
     }
     f.print("T=");     f.print(millis());
+    if (clock_valid(rtc_get())) { f.print("  "); print_time(f, rtc_get()); }
     f.print("  ");      f.print(STATE_NAMES[(int)state]);
     f.print("  ALT=");  f.print(altitude_m, 1);
     f.println(" m");
@@ -646,6 +733,51 @@ void logger_finalize() {
     Serial.print(_count);
     Serial.print(" records to ");
     Serial.println(_csv_name);
+}
+
+bool logger_save_to_sd() {
+    if (_fl_state == FL_RECORDING) flog_pause();
+    if (_fl_state != FL_IDLE && _fl_state != FL_CLOSED) return false;   // no flash, or it failed
+    if (!_fl_unsaved || _fl_records == 0) return false;                  // nothing new in it
+    if (!_sd_ready) {
+        Serial.println("[LOGGER] No SD card this session — the flash log stays in flash "
+                       "(boot with a card in, or send U).");
+        return false;
+    }
+    Serial.print("[LOGGER] SW401 opened — copying the flash log to ");
+    Serial.print(_csv_name);
+    Serial.println(" (the loop is paused until it's done)...");
+    if (!flog_copy_to_sd(_csv_name)) {
+        Serial.println("[LOGGER] Copy failed — the log stays in flash (boot with a card in, or send U).");
+        return false;
+    }
+    find_filenames();                       // the next log gets the next slot
+    if (_fl_state == FL_CLOSED) _fl_state = FL_IDLE;   // a full region can start fresh at the next arming
+    return true;
+}
+
+void logger_clock_command() {
+    // The digits arrive with the C; allow a little time for a slow link.
+    char     buf[16];
+    uint8_t  n  = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 50) {
+        if (!Serial.available()) continue;
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') break;
+        if (c < '0' || c > '9' || n >= sizeof(buf) - 1) { n = 0; break; }
+        buf[n++] = c;
+    }
+    buf[n] = 0;
+    uint32_t t = n ? strtoul(buf, nullptr, 10) : 0;
+    if (!clock_valid(t)) {
+        Serial.println("[CLOCK] Bad time — send C<local time as Unix seconds>, e.g. via tools/set_clock.py.");
+        return;
+    }
+    rtc_set(t);
+    Serial.print("[CLOCK] Set to ");
+    print_time(Serial, t);
+    Serial.println(".");
 }
 
 void logger_usb_dump() {

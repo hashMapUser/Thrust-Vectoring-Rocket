@@ -148,6 +148,27 @@ void logger_checkpoint(FlightState state, float altitude_m);
 void logger_finalize();
 
 /**
+ * Copy the flash log to the next FLIGHT_XXX.CSV on the SD card now, if it
+ * holds one that isn't on the card yet — called when SW401 is opened.
+ * Pauses the recording first (the next arming then starts a new log).
+ * Blocks, feeding the watchdog, for as long as the copy takes (seconds;
+ * about a minute for a full 14 MB region), so only call it with the
+ * rocket on the ground. No card this session: the log stays in flash for
+ * the next boot. True if a file was written.
+ */
+bool logger_save_to_sd();
+
+/**
+ * Serial command C: read the digits after it (local time as Unix-style
+ * seconds, ended by a newline) and set the Teensy's RTC, which dates the
+ * SD files and the .LOG lines. Sent by tools/set_clock.py, and by
+ * flash_dump.py and flight_live.py when they connect. The RTC keeps time
+ * while the board is powered, and through power-off only with a coin cell
+ * on the Teensy's VBAT pad.
+ */
+void logger_clock_command();
+
+/**
  * Stream the flight as CSV directly over USB serial, between
  * "-----BEGIN FLIGHT CSV-----" / "-----END FLIGHT CSV-----" markers — the
  * flight in flash if there is one, otherwise the RAM ring buffer.
