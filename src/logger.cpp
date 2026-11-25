@@ -7,17 +7,24 @@
 //                     LOG_RAM_CAPACITY records (~32 s at 125 Hz), and is
 //                     the queue that feeds the flash.
 //
-//  GD25Q128 flash   : from liftoff confirmation — plus the
+//  GD25Q128 flash   : from the SW401 arming edge (or liftoff, if it flew
+//                     with the switch open) — plus the
 //                     LOG_FLASH_PRELAUNCH_RECORDS before it — every record
 //                     is streamed into the flight-log region. At most one
 //                     non-blocking flash operation per loop tick (program
 //                     one page, or start one block erase), so the control
 //                     loop never waits on the chip. Blocks are erased just
-//                     ahead of the write position, or in advance on the pad
-//                     once the switch arms. Flash survives a reset and a
-//                     power loss: after a watchdog reset the log carries on
-//                     where it stopped, and a flight that never reached the
-//                     SD card is copied there at the next boot.
+//                     ahead of the write position. Flash survives a reset
+//                     and a power loss: after a watchdog reset the log
+//                     carries on where it stopped, and a log that never
+//                     reached the SD card is copied there at the next boot.
+//
+//                     A log not yet on the card is never erased: disarming
+//                     pauses it, and the next arming, an unarmed liftoff or
+//                     a watchdog resume append to it. The one exception is
+//                     this recording's own quiet pad wait: if the region
+//                     fills while armed with no launch trigger seen, the
+//                     log starts over (LOG_FLASH_RESTART_RECORDS).
 //
 //  SD card          : Written at three points —
 //                       1. A checkpoint text line on every FSM state
@@ -93,6 +100,7 @@ static_assert(FLASH_PAGE_SIZE / sizeof(LogRecord) >= 1, "a LogRecord must fit in
 static_assert(LOG_FLASH_BASE % FLASH_BLOCK_SIZE == 0 && LOG_FLASH_SIZE % FLASH_BLOCK_SIZE == 0,
               "the flash log region must be whole 64 KB blocks");
 static_assert(LOG_FLASH_PRELAUNCH_RECORDS < LOG_RAM_CAPACITY, "pre-launch records must fit in the RAM ring");
+static_assert(LOG_FLASH_RESTART_RECORDS + 500 < LOG_RAM_CAPACITY, "restart records must leave the flash room to catch up");
 
 typedef struct {
     uint32_t magic;              // FLOG_MAGIC once recording starts
@@ -112,12 +120,14 @@ typedef enum {
 static FlashLogState _fl_state       = FL_OFF;
 static uint32_t      _fl_write       = 0;      // next page to program
 static uint32_t      _fl_erased_to   = 0;      // everything from _fl_write up to here is erased
-static uint32_t      _fl_preerase_to = 0;      // pad pre-erase target
 static bool          _fl_header_due  = false;
 static uint16_t      _fl_backlog     = 0;      // records in the RAM ring not yet in flash
 static uint32_t      _fl_records     = 0;      // records written to flash this flight
 static uint32_t      _fl_dropped     = 0;      // records that left the ring before reaching flash
-static bool          _fl_unsaved     = false;  // flash holds a flight that isn't on the SD card
+static bool          _fl_unsaved     = false;  // flash holds a log that isn't on the SD card
+static bool          _fl_has_old     = false;  // the log holds data from before this recording began
+static bool          _fl_wrap_ok     = false;  // logger_allow_wrap(): may start over when full
+static uint16_t      _fl_unflashed   = 0;      // records stored since the flash last recorded (none of them in it)
 
 // ============================================================
 //  Pick the next free FLIGHT_XXX.CSV / .LOG slot
@@ -193,13 +203,17 @@ static void flog_mark(size_t offset, uint32_t value) {
     flog_wait(500);
 }
 
-// Find the chip and see what the log region holds.
+// Find the chip and see what the log region holds. For a log not yet on
+// the card, find where it ends (the first page with no records) so it can
+// be appended to later without scanning in the flight loop. Feeds the
+// watchdog — the scan can take ~0.5 s on a full region.
 static void flog_bring_up() {
-    _fl_state       = FL_OFF;
-    _fl_unsaved     = false;
-    _fl_erased_to   = LOG_FLASH_BASE;   // nothing known to be erased yet
-    _fl_preerase_to = LOG_FLASH_BASE;
-    _fl_backlog     = 0;
+    _fl_state     = FL_OFF;
+    _fl_unsaved   = false;
+    _fl_write     = FLOG_DATA_START;
+    _fl_erased_to = LOG_FLASH_BASE;   // nothing known to be erased yet
+    _fl_backlog   = 0;
+    _fl_records   = 0;
     if (!flash_init()) {
         Serial.println("[LOGGER] Flash not responding — the flight log is RAM only.");
         return;
@@ -208,23 +222,30 @@ static void flog_bring_up() {
     flog_read_header(&h);
     _fl_unsaved = flog_header_valid(h) && h.saved != FLOG_SAVED;
     _fl_state   = FL_IDLE;
+    if (!_fl_unsaved) return;
+
+    uint32_t addr = FLOG_DATA_START;
+    for (; addr < FLOG_END; addr += FLASH_PAGE_SIZE) {
+        uint32_t ts;
+        flash_read(addr, (uint8_t *)&ts, sizeof(ts));
+        if (ts == FLOG_EMPTY_TS) break;
+        if (_keepalive && ((addr >> 8) & 0xFF) == 0) _keepalive();
+    }
+    _fl_write   = addr;
+    // The rest of this block is still erased; anything past it is unknown.
+    _fl_erased_to = LOG_FLASH_BASE + ((addr - LOG_FLASH_BASE) / FLASH_BLOCK_SIZE + 1) * FLASH_BLOCK_SIZE;
+    if (_fl_erased_to > FLOG_END) _fl_erased_to = FLOG_END;
+    _fl_records = (addr - FLOG_DATA_START) / FLASH_PAGE_SIZE * FLOG_RECS_PER_PAGE;
 }
+
+static void flog_begin_fresh(uint16_t seed);
 
 // One non-blocking flash step: erase ahead, write the header, or program
 // one page of records from the RAM backlog. Does nothing while the chip is
 // still busy with the previous step. flush: write a part-filled last page.
 static void flog_service(bool flush) {
-    bool preerasing = (_fl_state == FL_IDLE && _fl_erased_to < _fl_preerase_to);
-    if (_fl_state != FL_RECORDING && !preerasing) return;
+    if (_fl_state != FL_RECORDING) return;
     if (flash_busy()) return;
-
-    if (preerasing) {
-        flash_erase_block_start(_fl_erased_to);
-        _fl_erased_to += FLASH_BLOCK_SIZE;
-        if (_fl_erased_to >= _fl_preerase_to)
-            Serial.println("[LOGGER] Flash log pre-erased — ready for liftoff.");
-        return;
-    }
 
     // Recording: keep a whole erased block ahead of the write position.
     if (_fl_erased_to < FLOG_END && _fl_erased_to < _fl_write + FLASH_BLOCK_SIZE) {
@@ -247,8 +268,14 @@ static void flog_service(bool flush) {
     // Leave an erased page after this one — it marks the end of the log.
     if (_fl_write + 2 * FLASH_PAGE_SIZE > _fl_erased_to) {
         if (_fl_erased_to >= FLOG_END) {
-            _fl_state = FL_CLOSED;
-            Serial.println("[LOGGER] Flash log region full — later records are in RAM only.");
+            if (_fl_wrap_ok && !_fl_has_old) {
+                Serial.println("[LOGGER] Flash log full during a quiet pad wait — starting it over "
+                               "with the last 20 s.");
+                flog_begin_fresh(LOG_FLASH_RESTART_RECORDS);
+            } else {
+                _fl_state = FL_CLOSED;
+                Serial.println("[LOGGER] Flash log region full — later records are in RAM only.");
+            }
         }
         return;
     }
@@ -265,53 +292,86 @@ static void flog_service(bool flush) {
     _fl_records += n;
 }
 
-// ARMED: erase the start of the region in the background, so liftoff
-// begins with plain page writes. Only when the old flight is safe on SD.
-static void flog_preerase() {
-    if (_fl_state != FL_IDLE) return;
-    if (_fl_unsaved) {
-        Serial.println("[LOGGER] Flash holds a flight that isn't on the SD card yet — it will be "
-                       "overwritten at liftoff. Send U now to dump it over USB.");
-        return;
-    }
-    _fl_preerase_to = LOG_FLASH_BASE + LOG_FLASH_PREERASE_BYTES;
+// Start a new log at the start of the region: block 0 (the old header
+// with it) is erased first, then the header goes down and the records
+// follow. `seed` records from the RAM ring go in first — at least the
+// backlog still waiting.
+static void flog_begin_fresh(uint16_t seed) {
+    uint16_t backlog = _count < seed ? _count : seed;
+    if (backlog < _fl_backlog) backlog = _fl_backlog;
+    _fl_write      = FLOG_DATA_START;
+    _fl_erased_to  = LOG_FLASH_BASE;
+    _fl_header_due = true;
+    _fl_backlog    = backlog;
+    _fl_records    = 0;
+    _fl_dropped    = 0;
+    _fl_has_old    = false;
+    _fl_unsaved    = true;               // this log, until it's on the card
+    _fl_state      = FL_RECORDING;
 }
 
-// POWERED: start recording, beginning with the records from just before
-// liftoff that are still in the RAM ring.
-static void flog_start() {
+// Start recording. A log already in flash but not on the SD card is
+// appended to, never erased; otherwise a new log starts. The end of an
+// existing log is already known (flog_bring_up() or the last recording),
+// so this never blocks.
+static void flog_open(uint16_t seed) {
     if (_fl_state != FL_IDLE) return;
-    if (_fl_unsaved)
-        Serial.println("[LOGGER] WARNING: overwriting a flight in flash that never reached the SD card.");
-    _fl_unsaved     = true;              // this flight, until it's on the card
-    _fl_preerase_to = _fl_erased_to;     // stop any pre-erase still running
-    _fl_write       = FLOG_DATA_START;
-    _fl_header_due  = true;
-    _fl_backlog     = _count < LOG_FLASH_PRELAUNCH_RECORDS ? _count : LOG_FLASH_PRELAUNCH_RECORDS;
-    _fl_records     = 0;
-    _fl_dropped     = 0;
-    _fl_state       = FL_RECORDING;
+    if (_fl_unsaved) {
+        // Only records the log doesn't already have — after a pause the
+        // newest ones in the ring may already be in flash.
+        if (seed > _fl_unflashed) seed = _fl_unflashed;
+        _fl_header_due = false;
+        _fl_backlog    = _count < seed ? _count : seed;
+        _fl_dropped    = 0;
+        _fl_has_old    = true;
+        _fl_state      = FL_RECORDING;
+        Serial.print("[LOGGER] Flash log recording — appending to the log already in flash "
+                     "(not on an SD card yet), after ");
+        Serial.print(_fl_records);
+        Serial.println(" records.");
+        return;
+    }
+    flog_begin_fresh(seed);
     Serial.print("[LOGGER] Flash log recording, starting ");
     Serial.print(_fl_backlog);
-    Serial.println(" records before liftoff.");
+    Serial.println(" records back.");
+}
+
+// Write out the backlog. Blocks, feeding the watchdog. False if the flash
+// stopped responding (the log is then given up — RAM only).
+static bool flog_flush() {
+    uint32_t t0 = millis();
+    while (_fl_state == FL_RECORDING && (_fl_backlog > 0 || _fl_header_due)) {
+        flog_service(true);
+        if (_keepalive) _keepalive();
+        if (millis() - t0 > 5000) {
+            Serial.println("[LOGGER] Flash stopped responding — the flight log is RAM only.");
+            _fl_state = FL_OFF;
+            return false;
+        }
+    }
+    return flog_wait(500);
+}
+
+// Disarmed on the pad: write out what's waiting and stop. The log stays
+// in flash; the next recording appends to it.
+static void flog_pause() {
+    if (_fl_state != FL_RECORDING) return;
+    if (!flog_flush()) return;
+    if (_fl_state == FL_RECORDING) _fl_state = FL_IDLE;
+    Serial.print("[LOGGER] Flash log paused: ");
+    Serial.print(_fl_records);
+    Serial.println(" records kept in flash.");
 }
 
 // Landing: write out the backlog and mark the flight complete. Blocks,
 // feeding the watchdog. Returns true if flash holds this flight.
 static bool flog_close() {
     if (_fl_state == FL_CLOSED) return _fl_records > 0;   // region filled up in flight
+    if (_fl_state == FL_IDLE)   return _fl_unsaved && _fl_records > 0;   // paused, e.g. disarmed
     if (_fl_state != FL_RECORDING) return false;
 
-    uint32_t t0 = millis();
-    while (_fl_state == FL_RECORDING && (_fl_backlog > 0 || _fl_header_due)) {
-        flog_service(true);
-        if (_keepalive) _keepalive();
-        if (millis() - t0 > 5000) {
-            Serial.println("[LOGGER] Flash stopped responding — closing out from the RAM buffer.");
-            _fl_state = FL_OFF;
-            return false;
-        }
-    }
+    if (!flog_flush()) return false;
     if (_fl_state == FL_RECORDING) {
         flog_mark(offsetof(FlashLogHeader, complete), FLOG_COMPLETE);
         _fl_state = FL_CLOSED;
@@ -351,7 +411,7 @@ static bool flog_close() {
 // the first page with no records is taken as the end.
 static uint32_t flog_write_csv(Print &out) {
     static uint8_t page[FLASH_PAGE_SIZE];
-    const bool     end_known = (_fl_state == FL_CLOSED && _fl_write > FLOG_DATA_START);
+    const bool     end_known = (_fl_state != FL_OFF && _fl_write > FLOG_DATA_START);
     const uint32_t end       = end_known ? _fl_write : FLOG_END;
     uint32_t n = 0;
     for (uint32_t addr = FLOG_DATA_START; addr < end; addr += FLASH_PAGE_SIZE) {
@@ -475,35 +535,15 @@ void logger_resume() {
     _sd_ready = false;
     flog_bring_up();
     if (_fl_state == FL_OFF) return;
+    bool appending = _fl_unsaved;
+    flog_open(0);
+    if (appending)
+        Serial.println("[LOGGER] Flash log continuing after the reset. SD card skipped — "
+                       "it's copied at the next boot.");
+}
 
-    FlashLogHeader h;
-    flog_read_header(&h);
-    if (!flog_header_valid(h) || h.complete == FLOG_COMPLETE) {
-        // No flight in progress in flash (the reset came before its header
-        // went down) — start one now; we're in the air.
-        flog_start();
-        return;
-    }
-
-    // Carry on after the last page written: the first page with no records.
-    uint32_t addr = FLOG_DATA_START;
-    for (; addr < FLOG_END; addr += FLASH_PAGE_SIZE) {
-        uint32_t ts;
-        flash_read(addr, (uint8_t *)&ts, sizeof(ts));
-        if (ts == FLOG_EMPTY_TS) break;
-    }
-    _fl_write      = addr;
-    // The rest of this block is still erased; anything past it is unknown.
-    _fl_erased_to  = LOG_FLASH_BASE + ((addr - LOG_FLASH_BASE) / FLASH_BLOCK_SIZE + 1) * FLASH_BLOCK_SIZE;
-    if (_fl_erased_to > FLOG_END) _fl_erased_to = FLOG_END;
-    _fl_header_due = false;
-    _fl_records    = (addr - FLOG_DATA_START) / FLASH_PAGE_SIZE * FLOG_RECS_PER_PAGE;
-    _fl_dropped    = 0;
-    _fl_unsaved    = true;
-    _fl_state      = FL_RECORDING;
-    Serial.print("[LOGGER] Flash log continuing after the reset (");
-    Serial.print(_fl_records);
-    Serial.println(" records before it). SD card skipped — it's copied at the next boot.");
+void logger_allow_wrap(bool allowed) {
+    _fl_wrap_ok = allowed;
 }
 
 void logger_write(const LogRecord *rec) {
@@ -520,6 +560,9 @@ void logger_write(const LogRecord *rec) {
     if (_fl_state == FL_RECORDING) {
         if (_fl_backlog < LOG_RAM_CAPACITY - 1) _fl_backlog++;
         else _fl_dropped++;   // flash fell a whole ring behind: the oldest unwritten record is gone
+        _fl_unflashed = 0;
+    } else if (_fl_unflashed < 0xFFFF) {
+        _fl_unflashed++;
     }
     flog_service(false);
 }
@@ -532,8 +575,9 @@ void logger_checkpoint(FlightState state, float altitude_m) {
     Serial.print(" m  records=");
     Serial.println(_count);
 
-    if (state == STATE_ARMED)   flog_preerase();
-    if (state == STATE_POWERED) flog_start();
+    if (state == STATE_ARMED)   flog_open(LOG_FLASH_PRELAUNCH_RECORDS);
+    if (state == STATE_IDLE)    flog_pause();                          // disarmed on the pad
+    if (state == STATE_POWERED) flog_open(LOG_FLASH_PRELAUNCH_RECORDS); // flew with SW401 open
 
     if (!_sd_ready) return;
 
@@ -605,7 +649,13 @@ void logger_finalize() {
 }
 
 void logger_usb_dump() {
+    bool was_recording = (_fl_state == FL_RECORDING);
+    if (was_recording) {
+        Serial.println("[LOGGER] Pausing the flash log for the dump — the flight loop is blocked until it's done.");
+        flog_pause();
+    }
     dump_csv_over_serial(flog_has_flight());
+    if (was_recording) flog_open(0);
 }
 
 uint16_t logger_record_count() { return _count; }
